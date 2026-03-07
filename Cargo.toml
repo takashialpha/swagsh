@@ -1,21 +1,16 @@
 [package]
-name = "core_shell"
+name = "swagsh"
 version = "0.3.0"
 edition = "2024"
-description = "A fast, POSIX-like shell written in Rust"
+description = "A sleek, high-performance POSIX-compatible shell built in Rust for speed and reliability. Name inspired by 'swag' slang for stylish flair."
 authors = ["takashialpha <takashialpha@protonmail.com>"]
 license = "Apache-2.0"
 
-[dependencies] # review that
-clap = { version = "4.5.37", features = ["derive", "env"] }
-rustyline = "15.0.0"
-shell-words = "1.1.0"
-libc = "0.2.172"
-ctrlc = "3.4.6"
-lazy_static = "1.5.0"
-atty = "0.2.14"
-serde = { version = "1.0.219", features = ["derive"] }
-toml = "0.8.20"
+[dependencies]
+clap = { version = "4.5.60", features = ["derive", "env"] }
+libc = "0.2.182"
+serde = { version = "1.0.228", features = ["derive"] }
+app_base = { git = "https://github.com/takashialpha/app_base.git" }
 
 [profile.release]
 strip = true

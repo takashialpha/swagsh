@@ -1,67 +1,12 @@
-mod builtin;
-mod coresh_file;
-mod env;
-mod formatting;
-mod run;
-mod script;
-mod shell;
-
-use crate::run::{execute, parse};
-use crate::script::run_script;
-use crate::shell::Shell;
-use clap::{Arg, Command};
-
-const VERSION: &str = "0.3.0";
+use app_base::run;
+use clap::Parser;
+use swagsh::{app, cli::Cli};
 
 fn main() {
-    // Avoids exit by SIGINT
-    ctrlc::set_handler(|| {}).expect("Error: failed to set ctrl-c handler");
+    let cli = Cli::parse();
 
-    // Clap CLI argument parsing
-    let matches = Command::new("Core Shell")
-        .version(VERSION)
-        .author("takashialpha <takashialpha@protonmail.com>")
-        .about("A fast, minimal POSIX-like shell written in Rust.")
-        .arg(
-            Arg::new("license")
-                .long("license")
-                .help("Displays the license information")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("command")
-                .short('c')
-                .long("command")
-                .help("Run a single command and exit, e.g. -c \"echo hello\"")
-                .num_args(1),
-        )
-        .arg(
-            Arg::new("script")
-                .value_name("SCRIPT")
-                .help("Path to a shell script to execute")
-                .value_parser(clap::value_parser!(std::path::PathBuf)),
-        )
-        .get_matches();
-
-    // script flag behavior
-    if let Some(path) = matches.get_one::<std::path::PathBuf>("script") {
-        run_script(path);
-        return;
+    if let Err(e) = run(app::SwagSH, None, cli) {
+        eprintln!("{}", e);
+        std::process::exit(1);
     }
-
-    // license flag behavior
-    if matches.get_flag("license") {
-        println!("Core Shell is licensed under the Apache-2.0");
-        return;
-    }
-
-    // command flag behavior
-    if let Some(cmd) = matches.get_one::<String>("command") {
-        if let Some((name, args)) = parse(cmd.to_string()) {
-            execute(&name, &args);
-        }
-        return;
-    }
-
-    Shell::init();
 }
