@@ -7,7 +7,7 @@ use app_base::{
 pub struct SwagSH;
 
 impl App for SwagSH {
-    type Config = ();
+    type Config = (); // implement config
     type Cli = Cli;
 
     fn privilege() -> Privilege {
