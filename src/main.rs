@@ -1,12 +1,9 @@
-use app_base::run;
+use anyhow::Result;
 use clap::Parser;
-use swagsh::{app, cli::Cli};
+use swagsh::cli::Cli;
 
-fn main() {
+fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    if let Err(e) = run(app::SwagSH, None, cli) {
-        eprintln!("{}", e);
-        std::process::exit(1);
-    }
+    println!("{:?}", cli);
+    Ok(())
 }

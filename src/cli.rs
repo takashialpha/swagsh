@@ -1,5 +1,4 @@
 use crate::APP_NAME;
-use app_base::app::ConfigPath;
 use clap::Parser;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -14,7 +13,7 @@ use std::path::PathBuf;
 for speed, reliability, and modern system integration."
 )]
 pub struct Cli {
-    /// Do not read configuration files
+    /// Do not read configuration files: maybe change to personalized cfg path instead
     #[arg(short = 'N', long = "no-config")]
     pub no_config: bool,
 
@@ -42,16 +41,6 @@ pub struct Cli {
     /// Arguments passed to the script
     #[arg(value_name = "ARGS")]
     pub args: Vec<String>,
-}
-
-impl ConfigPath for Cli {
-    fn config_path(&self) -> Option<PathBuf> {
-        if self.no_config {
-            return None;
-        }
-
-        dirs::config_dir().map(|p| p.join(APP_NAME).join("config.toml"))
-    }
 }
 
 impl Cli {
