@@ -9,6 +9,10 @@ license = "Apache-2.0"
 [dependencies]
 clap = { version = "4.6.0", features = ["derive", "env"] }
 anyhow = "1.0.102"
+rustyline = "17.0.2"
+signal-hook = "0.4.3"
+nix = { version = "0.31.2", features = ["process", "signal", "term"] }
+libc = "0.2.183"
 
 [profile.release]
 strip = true

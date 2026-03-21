@@ -1,7 +1,6 @@
 const APP_NAME: &str = "swagsh";
 
 use clap::Parser;
-use std::io::IsTerminal;
 use std::path::PathBuf;
 
 /// Command line interface for the shell.
@@ -14,7 +13,7 @@ use std::path::PathBuf;
 for speed, reliability, and modern system integration."
 )]
 pub struct Cli {
-    /// Do not read configuration files: maybe change to personalized cfg path instead
+    /// Do not read configuration files
     #[arg(short = 'N', long = "no-config")]
     pub no_config: bool,
 
@@ -45,14 +44,6 @@ pub struct Cli {
 }
 
 impl Cli {
-    /// Determine whether the shell should run interactively.
-    pub fn interactive(&self) -> bool {
-        std::io::stdin().is_terminal()
-            && std::io::stdout().is_terminal()
-            && self.script.is_none()
-            && self.command.is_none()
-    }
-
     /// Detect whether the shell was started as a login shell.
     /// This happens when argv[0] starts with `-`, which is how
     /// system login programs traditionally launch shells.
