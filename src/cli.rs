@@ -1,4 +1,5 @@
-use crate::APP_NAME;
+const APP_NAME: &str = "swagsh";
+
 use clap::Parser;
 use std::io::IsTerminal;
 use std::path::PathBuf;
