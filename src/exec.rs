@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::os::fd::{BorrowedFd, IntoRawFd};
@@ -21,7 +20,6 @@ use crate::env::Env;
 // Helpers — nix 0.31 API shims
 // ---------------------------------------------------------------------------
 
-/// `tcsetpgrp` in nix 0.31 requires `AsFd`. We always pass stdin (fd 0).
 #[inline]
 fn tcsetpgrp_stdin(pgid: Pid) -> nix::Result<()> {
     // SAFETY: fd 0 is always valid for the lifetime of the shell process.
@@ -29,7 +27,6 @@ fn tcsetpgrp_stdin(pgid: Pid) -> nix::Result<()> {
     tcsetpgrp(borrowed, pgid)
 }
 
-/// `dup2(old, new)` — nix 0.31 gated this behind `fs` feature; use libc directly.
 #[inline]
 fn dup2_raw(oldfd: RawFd, newfd: RawFd) -> nix::Result<()> {
     // SAFETY: raw fd integers, same contract as POSIX dup2.
@@ -41,7 +38,6 @@ fn dup2_raw(oldfd: RawFd, newfd: RawFd) -> nix::Result<()> {
     }
 }
 
-/// `close(fd)` via libc — nix 0.31 `close` takes `OwnedFd`; we work with raw ints.
 #[inline]
 fn close_raw(fd: RawFd) -> nix::Result<()> {
     let ret = unsafe { libc::close(fd) };
@@ -52,25 +48,21 @@ fn close_raw(fd: RawFd) -> nix::Result<()> {
     }
 }
 
-/// `pipe()` returning `(RawFd, RawFd)` — nix 0.31 returns `(OwnedFd, OwnedFd)`.
 fn raw_pipe() -> nix::Result<(RawFd, RawFd)> {
     let (r, w) = pipe()?;
     Ok((r.into_raw_fd(), w.into_raw_fd()))
 }
 
-/// `read(fd, buf)` — nix 0.31 `read` takes `AsFd`.
 fn read_raw(fd: RawFd, buf: &mut [u8]) -> nix::Result<usize> {
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     nix::unistd::read(borrowed, buf)
 }
 
-/// `write(fd, buf)` — nix 0.31 `write` takes `AsFd`.
 fn write_raw(fd: RawFd, buf: &[u8]) -> nix::Result<usize> {
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     nix::unistd::write(borrowed, buf)
 }
 
-/// Open a file for writing (create/truncate), returning a `RawFd`.
 fn open_write(path: &std::path::Path, append: bool) -> Result<RawFd> {
     let mut opts = OpenOptions::new();
     opts.write(true).create(true);
@@ -79,19 +71,16 @@ fn open_write(path: &std::path::Path, append: bool) -> Result<RawFd> {
     } else {
         opts.truncate(true);
     }
-    // Use mode 0o644 for newly created files.
     opts.mode(0o644);
     let f = opts.open(path)?;
     Ok(f.into_raw_fd())
 }
 
-/// Open a file for reading, returning a `RawFd`.
 fn open_read(path: &std::path::Path) -> Result<RawFd> {
     let f = OpenOptions::new().read(true).open(path)?;
     Ok(f.into_raw_fd())
 }
 
-/// Save an fd by duplicating it above fd 9 (out of user-visible range).
 fn dup_save(fd: RawFd) -> nix::Result<RawFd> {
     let ret = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
     if ret == -1 {
@@ -204,17 +193,54 @@ impl JobTable {
 }
 
 // ---------------------------------------------------------------------------
-// Executor
+// Builtin dispatch — static sorted table, O(log n) binary search.
+// Zero heap allocation, zero hashing, fits in a single cache line.
+// INVARIANT: entries must remain sorted by name for binary_search to work.
 // ---------------------------------------------------------------------------
 
 type BuiltinFn = fn(&mut Executor, &[&str]) -> Result<ExitStatus>;
+
+static BUILTINS: &[(&str, BuiltinFn)] = &[
+    (".", builtin_source),
+    (":", builtin_colon),
+    ("bg", builtin_bg),
+    ("break", builtin_break),
+    ("cd", builtin_cd),
+    ("continue", builtin_continue),
+    ("echo", builtin_echo),
+    ("exec", builtin_exec),
+    ("exit", builtin_exit),
+    ("export", builtin_export),
+    ("false", builtin_false),
+    ("fg", builtin_fg),
+    ("jobs", builtin_jobs),
+    ("kill", builtin_kill),
+    ("printf", builtin_printf),
+    ("pwd", builtin_pwd),
+    ("set", builtin_set),
+    ("source", builtin_source),
+    ("true", builtin_true),
+    ("unset", builtin_unset),
+];
+
+/// O(log n) builtin lookup — no allocation, no hashing, ~5 comparisons max.
+#[inline]
+fn lookup_builtin(name: &str) -> Option<BuiltinFn> {
+    BUILTINS
+        .binary_search_by_key(&name, |&(k, _)| k)
+        .ok()
+        .map(|i| BUILTINS[i].1)
+}
+
+// ---------------------------------------------------------------------------
+// Executor
+// ---------------------------------------------------------------------------
 
 pub struct Executor {
     pub env: Env,
     pub jobs: JobTable,
     pub shell_pgid: Pid,
     pub last_status: ExitStatus,
-    builtins: HashMap<&'static str, BuiltinFn>,
 }
 
 impl Executor {
@@ -229,29 +255,11 @@ impl Executor {
             let _ = signal(Signal::SIGTSTP, SigHandler::SigIgn);
         }
 
-        let mut builtins: HashMap<&'static str, BuiltinFn> = HashMap::new();
-        builtins.insert("cd", builtin_cd);
-        builtins.insert("pwd", builtin_pwd);
-        builtins.insert("echo", builtin_echo);
-        builtins.insert("printf", builtin_printf);
-        builtins.insert("export", builtin_export);
-        builtins.insert("unset", builtin_unset);
-        builtins.insert("set", builtin_set);
-        builtins.insert("source", builtin_source);
-        builtins.insert(".", builtin_source);
-        builtins.insert("exec", builtin_exec);
-        builtins.insert("exit", builtin_exit);
-        builtins.insert("jobs", builtin_jobs);
-        builtins.insert("fg", builtin_fg);
-        builtins.insert("bg", builtin_bg);
-        builtins.insert("kill", builtin_kill);
-
         Ok(Self {
             env,
             jobs: JobTable::default(),
             shell_pgid,
             last_status: ExitStatus::SUCCESS,
-            builtins,
         })
     }
 
@@ -485,10 +493,22 @@ impl Executor {
             return 0;
         }
 
-        let name = &words[0];
-        let args: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+        // Strip and apply leading assignments (we are in a child — all
+        // assignments are permanent for this process).
+        let assign_count = words.iter().take_while(|w| is_assignment(w)).count();
+        let (assignments, cmd_words) = words.split_at(assign_count);
+        for a in assignments {
+            let (k, v) = a.split_once('=').unwrap();
+            self.env.export(k, v);
+        }
+        if cmd_words.is_empty() {
+            return 0;
+        }
 
-        if let Some(f) = self.builtins.get(name.as_str()).copied() {
+        let name = &cmd_words[0];
+        let args: Vec<&str> = cmd_words.iter().map(|s| s.as_str()).collect();
+
+        if let Some(f) = lookup_builtin(name.as_str()) {
             return match f(self, &args[1..]) {
                 Ok(s) => s.0,
                 Err(e) => {
@@ -498,7 +518,7 @@ impl Executor {
             };
         }
 
-        match self.do_exec(&words) {
+        match self.do_exec(cmd_words) {
             Ok(_) => unreachable!(),
             Err(e) => {
                 eprintln!("swagsh: {e}");
@@ -538,38 +558,101 @@ impl Executor {
 
     fn run_simple(&mut self, sc: &SimpleCmd) -> Result<ExitStatus> {
         let words = self.expand_words(&sc.words)?;
-        if words.is_empty() {
+
+        // Split leading NAME=VALUE assignments from the actual command.
+        let assign_count = words.iter().take_while(|w| is_assignment(w)).count();
+        let (assignments, cmd_words) = words.split_at(assign_count);
+
+        // ── No command — pure assignment statement ──────────────────────────
+        if cmd_words.is_empty() {
+            let saved = self.save_fds(&[0, 1, 2])?;
             self.apply_redirects(&sc.redirects)?;
+            self.restore_fds(saved)?;
+            for assign in assignments {
+                let (name, value) = assign.split_once('=').unwrap();
+                self.env.set(name, value);
+            }
             return Ok(ExitStatus::SUCCESS);
         }
 
-        let name = words[0].clone();
-        let args: Vec<String> = words[1..].to_vec();
+        let name = cmd_words[0].clone();
+        let args: Vec<String> = cmd_words[1..].to_vec();
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let special = is_special_builtin(&name);
 
-        if let Some(f) = self.builtins.get(name.as_str()).copied() {
-            let saved = self.save_fds(&[0, 1, 2])?;
+        // ── Builtin ─────────────────────────────────────────────────────────
+        if let Some(f) = lookup_builtin(name.as_str()) {
+            let saved_vars: Vec<(String, Option<String>)> = if !special {
+                assignments
+                    .iter()
+                    .map(|a| {
+                        let (k, v) = a.split_once('=').unwrap();
+                        let old = self.env.get(k);
+                        self.env.set(k, v);
+                        (k.to_owned(), old)
+                    })
+                    .collect()
+            } else {
+                for a in assignments {
+                    let (k, v) = a.split_once('=').unwrap();
+                    self.env.set(k, v);
+                }
+                vec![]
+            };
+
+            let saved_fds = self.save_fds(&[0, 1, 2])?;
             self.apply_redirects(&sc.redirects)?;
             let result = f(self, &arg_refs);
-            self.restore_fds(saved)?;
+            self.restore_fds(saved_fds)?;
+
+            for (k, old) in saved_vars {
+                match old {
+                    Some(v) => self.env.set(&k, v),
+                    None => self.env.unset(&k),
+                }
+            }
             return result;
         }
 
+        // ── Shell function ───────────────────────────────────────────────────
         if let Some(body) = self.env.get_function(&name).cloned() {
+            let saved_vars: Vec<(String, Option<String>)> = assignments
+                .iter()
+                .map(|a| {
+                    let (k, v) = a.split_once('=').unwrap();
+                    let old = self.env.get(k);
+                    self.env.set(k, v);
+                    (k.to_owned(), old)
+                })
+                .collect();
+
             let old_args = self.env.positional_args().to_vec();
             self.env.set_positional_args(args);
-            let saved = self.save_fds(&[0, 1, 2])?;
+            let saved_fds = self.save_fds(&[0, 1, 2])?;
             self.apply_redirects(&sc.redirects)?;
             let status = self.run_command(&body, None, None)?;
-            self.restore_fds(saved)?;
+            self.restore_fds(saved_fds)?;
             self.env.set_positional_args(old_args);
+
+            for (k, old) in saved_vars {
+                match old {
+                    Some(v) => self.env.set(&k, v),
+                    None => self.env.unset(&k),
+                }
+            }
             return Ok(status);
         }
 
-        self.run_external(sc, &words)
+        // ── External command ─────────────────────────────────────────────────
+        self.run_external_with_assignments(sc, cmd_words, assignments)
     }
 
-    fn run_external(&mut self, sc: &SimpleCmd, words: &[String]) -> Result<ExitStatus> {
+    fn run_external_with_assignments(
+        &mut self,
+        sc: &SimpleCmd,
+        words: &[String],
+        assignments: &[String],
+    ) -> Result<ExitStatus> {
         match unsafe { fork()? } {
             ForkResult::Child => {
                 unsafe {
@@ -582,6 +665,11 @@ impl Executor {
                 let _ = sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None);
                 let my_pid = getpid();
                 let _ = setpgid(my_pid, my_pid);
+                // Export assignments into the child's environment.
+                for a in assignments {
+                    let (k, v) = a.split_once('=').unwrap();
+                    self.env.export(k, v);
+                }
                 if let Err(e) = self.apply_redirects(&sc.redirects) {
                     eprintln!("swagsh: {e}");
                     std::process::exit(1);
@@ -995,6 +1083,26 @@ impl Executor {
 // Built-ins
 // ---------------------------------------------------------------------------
 
+fn builtin_colon(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
+    Ok(ExitStatus::SUCCESS)
+}
+
+fn builtin_true(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
+    Ok(ExitStatus::SUCCESS)
+}
+
+fn builtin_false(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
+    Ok(ExitStatus::FAILURE)
+}
+
+fn builtin_break(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
+    Err(anyhow::anyhow!("__break__"))
+}
+
+fn builtin_continue(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
+    Err(anyhow::anyhow!("__continue__"))
+}
+
 fn builtin_cd(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
     let target = match args.first() {
         Some(&"-") => exec.env.get("OLDPWD").unwrap_or_else(|| "/".into()),
@@ -1360,6 +1468,41 @@ fn parse_signal_name(s: &str) -> Option<Signal> {
         "USR2" | "SIGUSR2" => Some(Signal::SIGUSR2),
         _ => None,
     }
+}
+
+/// Return true if `word` is a bare variable assignment `NAME=VALUE`
+/// where NAME is a valid identifier (POSIX §2.9.1).
+#[inline]
+fn is_assignment(word: &str) -> bool {
+    let Some(eq) = word.find('=') else {
+        return false;
+    };
+    let name = &word[..eq];
+    !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_')
+            .unwrap_or(false)
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// POSIX special builtins — assignments before these persist in the shell env.
+#[inline]
+fn is_special_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "." | ":"
+            | "break"
+            | "continue"
+            | "exec"
+            | "exit"
+            | "export"
+            | "return"
+            | "set"
+            | "source"
+            | "unset"
+    )
 }
 
 fn is_break(e: &anyhow::Error) -> bool {
