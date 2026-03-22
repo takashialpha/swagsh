@@ -289,18 +289,101 @@ impl Parser {
             Token::LBrace => self.parse_brace_group(),
             Token::LParen => self.parse_subshell(),
             Token::Function => self.parse_function_def(),
+            Token::Word(w) if w == "[[" => self.parse_double_bracket(),
             Token::Word(_) if self.is_function_def_ahead() => self.parse_function_def(),
             _ => self.parse_simple_cmd().map(Command::Simple),
         }
+    }
+
+    /// Parse `[[ expr ]]` — collect all tokens until `]]` as word arguments,
+    /// converting operators like `&&`, `||`, `!`, `(`, `)` to string words
+    /// so the builtin evaluator receives them intact.
+    fn parse_double_bracket(&mut self) -> ParseResult<Command> {
+        // Consume the opening `[[`
+        self.advance();
+        let mut words: Vec<crate::ast::Word> = vec![crate::ast::Word::Literal("[[".into())];
+
+        loop {
+            let tok = self.peek().clone();
+            match &tok {
+                Token::Eof => return Err(self.err("unexpected EOF inside [[ ]]")),
+                Token::Newline => {
+                    self.advance();
+                    continue;
+                }
+                Token::Word(w) if w == "]]" => {
+                    self.advance();
+                    words.push(crate::ast::Word::Literal("]]".into()));
+                    break;
+                }
+                // Operators that normally parse as structural tokens —
+                // emit them as string words so the test evaluator sees them.
+                Token::AndAnd => {
+                    self.advance();
+                    words.push(crate::ast::Word::Literal("&&".into()));
+                }
+                Token::OrOr => {
+                    self.advance();
+                    words.push(crate::ast::Word::Literal("||".into()));
+                }
+                Token::Bang => {
+                    self.advance();
+                    // Peek: if next token starts with '=', combine into "!="
+                    if matches!(self.peek(), Token::Word(w) if w == "=") {
+                        self.advance();
+                        words.push(crate::ast::Word::Literal("!=".into()));
+                    } else {
+                        words.push(crate::ast::Word::Literal("!".into()));
+                    }
+                }
+                Token::LParen => {
+                    self.advance();
+                    words.push(crate::ast::Word::Literal("(".into()));
+                }
+                Token::RParen => {
+                    self.advance();
+                    words.push(crate::ast::Word::Literal(")".into()));
+                }
+                Token::Redir(rt) => {
+                    // < and > inside [[ are string comparisons, not redirections.
+                    // Also handle >= and <= which arrive as Append(>>) or similar.
+                    use crate::lexer::RedirKind;
+                    let s = match rt.kind {
+                        RedirKind::Out => ">",
+                        RedirKind::In => "<",
+                        RedirKind::Append => ">>",
+                        _ => ">",
+                    };
+                    self.advance();
+                    // Peek: > followed by = should be ">=" (not a real redir op,
+                    // but handle defensively).
+                    words.push(crate::ast::Word::Literal(s.into()));
+                }
+                Token::Word(w) => {
+                    let word = self.parse_word_str(w)?;
+                    self.advance();
+                    words.push(word);
+                }
+                _ => {
+                    self.advance();
+                } // skip anything else
+            }
+        }
+
+        Ok(Command::Simple(crate::ast::SimpleCmd {
+            words,
+            redirects: vec![],
+        }))
     }
 
     /// Peek ahead to check for `name ()` function definition syntax.
     fn is_function_def_ahead(&self) -> bool {
         // current token is Word, next non-whitespace should be `(`
         if let Token::Word(_) = self.peek()
-            && self.pos + 1 < self.tokens.len() {
-                return matches!(self.tokens[self.pos + 1].token, Token::LParen);
-            }
+            && self.pos + 1 < self.tokens.len()
+        {
+            return matches!(self.tokens[self.pos + 1].token, Token::LParen);
+        }
         false
     }
 
@@ -319,10 +402,7 @@ impl Parser {
                         words.push(self.parse_word_str(&w)?);
                     }
                 }
-                Token::Redir(_) => {
-                    redirects.push(self.parse_redirect()?);
-                }
-                Token::HereString(_) | Token::HereDoc { .. } => {
+                Token::Redir(_) | Token::HereString(_) => {
                     redirects.push(self.parse_redirect()?);
                 }
                 _ => break,
@@ -409,15 +489,6 @@ impl Parser {
                 fd: 0,
                 target: Word::Literal(s),
             }),
-
-            Token::HereDoc { delimiter, .. } => {
-                // Body is collected by the executor at runtime (deferred).
-                Ok(Redirect {
-                    kind: RedirectKind::In,
-                    fd: 0,
-                    target: Word::Literal(format!("<<{delimiter}")),
-                })
-            }
 
             other => Err(self.err(format!("expected redirection, got `{other}`"))),
         }
@@ -548,7 +619,9 @@ impl Parser {
                 match self.advance().clone() {
                     Token::Word(p) => patterns.push(self.parse_word_str(&p)?),
                     other => {
-                        return Err(self.err(format!("expected pattern in case arm, got `{other}`")));
+                        return Err(
+                            self.err(format!("expected pattern in case arm, got `{other}`"))
+                        );
                     }
                 }
                 if !self.eat(&Token::Pipe) {

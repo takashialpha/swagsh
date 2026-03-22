@@ -3,64 +3,52 @@ use ahash::AHashSet;
 
 use crate::ast::Command;
 
-// ---------------------------------------------------------------------------
-// Env — the shell's variable and function store
-// ---------------------------------------------------------------------------
-
-/// Uses `AHashMap` (non-cryptographic, ~2× faster than `std::HashMap` for
-/// short string keys) for both the variable store and the exported set.
 #[derive(Debug, Clone)]
 pub struct Env {
     vars: AHashMap<String, String>,
     exported: AHashSet<String>,
     functions: AHashMap<String, Command>,
+    aliases: AHashMap<String, String>,
     positional: Vec<String>,
 }
 
 impl Env {
-    /// Build an `Env` pre-populated from the process environment.
-    /// Pre-allocates to avoid rehash growth steps during population.
     pub fn from_process() -> Self {
         let raw: Vec<(String, String)> = std::env::vars().collect();
         let cap = raw.len() + 8;
-
         let mut vars = AHashMap::with_capacity(cap);
         let mut exported = AHashSet::with_capacity(cap);
-
         for (k, v) in raw {
             exported.insert(k.clone());
             vars.insert(k, v);
         }
-
         vars.entry("PATH".into())
             .or_insert_with(|| "/usr/local/bin:/usr/bin:/bin".into());
         vars.entry("HOME".into())
             .or_insert_with(|| std::env::var("HOME").unwrap_or_else(|_| "/".into()));
         vars.entry("IFS".into()).or_insert_with(|| " \t\n".into());
-
         if let Ok(cwd) = std::env::current_dir() {
             let s = cwd.to_string_lossy().into_owned();
             vars.insert("PWD".into(), s);
             exported.insert("PWD".into());
         }
-
         Self {
             vars,
             exported,
             functions: AHashMap::new(),
+            aliases: AHashMap::new(),
             positional: Vec::new(),
         }
     }
 
     // ------------------------------------------------------------------
-    // Variable access
+    // Variables
     // ------------------------------------------------------------------
 
     #[inline]
     pub fn get(&self, name: &str) -> Option<String> {
         self.vars.get(name).cloned()
     }
-
     #[inline]
     pub fn get_or_empty(&self, name: &str) -> String {
         self.vars.get(name).cloned().unwrap_or_default()
@@ -118,15 +106,38 @@ impl Env {
     }
 
     // ------------------------------------------------------------------
-    // Shell functions
+    // Functions
     // ------------------------------------------------------------------
 
     pub fn define_function(&mut self, name: String, body: Command) {
         self.functions.insert(name, body);
     }
-
     pub fn get_function(&self, name: &str) -> Option<&Command> {
         self.functions.get(name)
+    }
+
+    // ------------------------------------------------------------------
+    // Aliases
+    // ------------------------------------------------------------------
+
+    pub fn set_alias(&mut self, name: String, value: String) {
+        self.aliases.insert(name, value);
+    }
+    pub fn get_alias(&self, name: &str) -> Option<String> {
+        self.aliases.get(name).cloned()
+    }
+    pub fn remove_alias(&mut self, name: &str) {
+        self.aliases.remove(name);
+    }
+    pub fn clear_aliases(&mut self) {
+        self.aliases.clear();
+    }
+    pub fn all_aliases(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.aliases.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+    /// All alias names — used by tab completion.
+    pub fn alias_names(&self) -> impl Iterator<Item = &str> {
+        self.aliases.keys().map(|k| k.as_str())
     }
 
     // ------------------------------------------------------------------
@@ -137,7 +148,6 @@ impl Env {
     pub fn positional_args(&self) -> &[String] {
         &self.positional
     }
-
     pub fn set_positional_args(&mut self, args: Vec<String>) {
         self.positional = args;
     }

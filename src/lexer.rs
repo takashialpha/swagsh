@@ -24,7 +24,6 @@ pub enum Token {
     // Redirections
     Redir(RedirToken),
     // Here-documents & here-strings
-    HereDoc { delimiter: String, strip_tabs: bool },
     HereString(String),
     // Reserved words
     If,
@@ -350,10 +349,47 @@ impl<'src> Lexer<'src> {
         if delim.is_empty() {
             return Err(self.err("empty here-doc delimiter"));
         }
-        Ok(Token::HereDoc {
-            delimiter: delim,
-            strip_tabs,
-        })
+
+        // Consume the remainder of the current line up to and including the newline.
+        while let Some(b) = self.peek() {
+            if b == b'\n' {
+                self.advance();
+                break;
+            }
+            self.advance();
+        }
+
+        // Collect body lines until a line equal to the delimiter is found.
+        let mut body = String::new();
+        loop {
+            let mut line = String::new();
+            loop {
+                match self.peek() {
+                    // EOF before delimiter — return partial body.
+                    None => return Ok(Token::HereString(body)),
+                    Some(b'\n') => {
+                        self.advance();
+                        break;
+                    }
+                    Some(b) => {
+                        line.push(b as char);
+                        self.advance();
+                    }
+                }
+            }
+            let check = if strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line.as_str()
+            };
+            if check == delim {
+                break;
+            }
+            body.push_str(check);
+            body.push('\n');
+        }
+
+        Ok(Token::HereString(body))
     }
 
     // ------------------------------------------------------------------
@@ -567,17 +603,38 @@ impl<'src> Lexer<'src> {
             }
             Some(b'<') => return self.lex_redir(None),
             Some(b'>') => return self.lex_redir(None),
+            // [[ and ]] are emitted as Word tokens so they hit the builtin table.
+            Some(b'[') => {
+                self.advance();
+                return Ok(if self.peek() == Some(b'[') {
+                    self.advance();
+                    Token::Word("[[".into())
+                } else {
+                    Token::Word("[".into())
+                });
+            }
+            Some(b']') => {
+                self.advance();
+                return Ok(if self.peek() == Some(b']') {
+                    self.advance();
+                    Token::Word("]]".into())
+                } else {
+                    Token::Word("]".into())
+                });
+            }
             _ => {}
         }
 
         let mut buf = String::new();
         self.lex_word_into(&mut buf)?;
 
-        if !buf.is_empty() && buf.chars().all(|c| c.is_ascii_digit())
-            && matches!(self.peek(), Some(b'<') | Some(b'>')) {
-                let fd: u32 = buf.parse().unwrap_or(u32::MAX);
-                return self.lex_redir(Some(fd));
-            }
+        if !buf.is_empty()
+            && buf.chars().all(|c| c.is_ascii_digit())
+            && matches!(self.peek(), Some(b'<') | Some(b'>'))
+        {
+            let fd: u32 = buf.parse().unwrap_or(u32::MAX);
+            return self.lex_redir(Some(fd));
+        }
 
         Ok(match buf.as_str() {
             "if" => Token::If,

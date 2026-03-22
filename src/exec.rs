@@ -1,7 +1,7 @@
 use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::os::fd::{BorrowedFd, IntoRawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 
@@ -22,14 +22,12 @@ use crate::env::Env;
 
 #[inline]
 fn tcsetpgrp_stdin(pgid: Pid) -> nix::Result<()> {
-    // SAFETY: fd 0 is always valid for the lifetime of the shell process.
     let borrowed = unsafe { BorrowedFd::borrow_raw(0) };
     tcsetpgrp(borrowed, pgid)
 }
 
 #[inline]
 fn dup2_raw(oldfd: RawFd, newfd: RawFd) -> nix::Result<()> {
-    // SAFETY: raw fd integers, same contract as POSIX dup2.
     let ret = unsafe { libc::dup2(oldfd, newfd) };
     if ret == -1 {
         Err(nix::errno::Errno::last())
@@ -72,13 +70,11 @@ fn open_write(path: &std::path::Path, append: bool) -> Result<RawFd> {
         opts.truncate(true);
     }
     opts.mode(0o644);
-    let f = opts.open(path)?;
-    Ok(f.into_raw_fd())
+    Ok(opts.open(path)?.into_raw_fd())
 }
 
 fn open_read(path: &std::path::Path) -> Result<RawFd> {
-    let f = OpenOptions::new().read(true).open(path)?;
-    Ok(f.into_raw_fd())
+    Ok(OpenOptions::new().read(true).open(path)?.into_raw_fd())
 }
 
 fn dup_save(fd: RawFd) -> nix::Result<RawFd> {
@@ -91,7 +87,7 @@ fn dup_save(fd: RawFd) -> nix::Result<RawFd> {
 }
 
 // ---------------------------------------------------------------------------
-// Exit status newtype
+// Exit status
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +96,6 @@ pub struct ExitStatus(pub i32);
 impl ExitStatus {
     pub const SUCCESS: Self = Self(0);
     pub const FAILURE: Self = Self(1);
-
     #[inline]
     pub fn is_success(self) -> bool {
         self.0 == 0
@@ -146,19 +141,15 @@ impl JobTable {
         });
         id
     }
-
     fn remove(&mut self, id: usize) {
         self.jobs.retain(|j| j.id != id);
     }
-
     fn by_pgid_mut(&mut self, pgid: Pid) -> Option<&mut Job> {
         self.jobs.iter_mut().find(|j| j.pgid == pgid)
     }
-
     pub fn iter(&self) -> impl Iterator<Item = &Job> {
         self.jobs.iter()
     }
-
     pub fn reap_nonblocking(&mut self) {
         loop {
             match waitpid(
@@ -174,7 +165,6 @@ impl JobTable {
             }
         }
     }
-
     fn mark_pid_done(&mut self, pid: Pid, status: ExitStatus) {
         for job in &mut self.jobs {
             if job.pids.contains(&pid) {
@@ -182,7 +172,6 @@ impl JobTable {
             }
         }
     }
-
     fn mark_pid_stopped(&mut self, pid: Pid) {
         for job in &mut self.jobs {
             if job.pids.contains(&pid) {
@@ -193,16 +182,20 @@ impl JobTable {
 }
 
 // ---------------------------------------------------------------------------
-// Builtin dispatch — static sorted table, O(log n) binary search.
-// Zero heap allocation, zero hashing, fits in a single cache line.
-// INVARIANT: entries must remain sorted by name for binary_search to work.
+// Builtin dispatch — static sorted table, O(log n) binary search
+// INVARIANT: entries must stay sorted by name.
 // ---------------------------------------------------------------------------
 
 type BuiltinFn = fn(&mut Executor, &[&str]) -> Result<ExitStatus>;
 
-static BUILTINS: &[(&str, BuiltinFn)] = &[
+pub static BUILTINS: &[(&str, BuiltinFn)] = &[
+    // INVARIANT: must be in strict lexicographic (byte) order for binary_search.
+    // Verify with: entries.is_sorted_by_key(|(k,_)| k)
     (".", builtin_source),
     (":", builtin_colon),
+    ("[", builtin_bracket),
+    ("[[", builtin_double_bracket),
+    ("alias", builtin_alias),
     ("bg", builtin_bg),
     ("break", builtin_break),
     ("cd", builtin_cd),
@@ -217,13 +210,16 @@ static BUILTINS: &[(&str, BuiltinFn)] = &[
     ("kill", builtin_kill),
     ("printf", builtin_printf),
     ("pwd", builtin_pwd),
+    ("read", builtin_read),
     ("set", builtin_set),
+    ("shift", builtin_shift),
     ("source", builtin_source),
+    ("test", builtin_test),
     ("true", builtin_true),
+    ("unalias", builtin_unalias),
     ("unset", builtin_unset),
 ];
 
-/// O(log n) builtin lookup — no allocation, no hashing, ~5 comparisons max.
 #[inline]
 fn lookup_builtin(name: &str) -> Option<BuiltinFn> {
     BUILTINS
@@ -241,18 +237,22 @@ pub struct Executor {
     pub jobs: JobTable,
     pub shell_pgid: Pid,
     pub last_status: ExitStatus,
+    /// True when running interactively — controls job control and alias expansion.
+    pub interactive: bool,
 }
 
 impl Executor {
-    pub fn new(env: Env) -> Result<Self> {
+    pub fn new(env: Env, interactive: bool) -> Result<Self> {
         let shell_pgid = getpid();
-        let _ = setpgid(shell_pgid, shell_pgid);
-        let _ = tcsetpgrp_stdin(shell_pgid);
 
-        unsafe {
-            let _ = signal(Signal::SIGTTOU, SigHandler::SigIgn);
-            let _ = signal(Signal::SIGTTIN, SigHandler::SigIgn);
-            let _ = signal(Signal::SIGTSTP, SigHandler::SigIgn);
+        if interactive {
+            let _ = setpgid(shell_pgid, shell_pgid);
+            let _ = tcsetpgrp_stdin(shell_pgid);
+            unsafe {
+                let _ = signal(Signal::SIGTTOU, SigHandler::SigIgn);
+                let _ = signal(Signal::SIGTTIN, SigHandler::SigIgn);
+                let _ = signal(Signal::SIGTSTP, SigHandler::SigIgn);
+            }
         }
 
         Ok(Self {
@@ -260,6 +260,7 @@ impl Executor {
             jobs: JobTable::default(),
             shell_pgid,
             last_status: ExitStatus::SUCCESS,
+            interactive,
         })
     }
 
@@ -281,16 +282,13 @@ impl Executor {
 
     fn run_and_or(&mut self, aol: &AndOrList) -> Result<ExitStatus> {
         let mut status = ExitStatus::SUCCESS;
-
         for (i, item) in aol.items.iter().enumerate() {
             let is_last = i == aol.items.len() - 1;
-
-            if aol.is_async && is_last {
-                status = self.run_pipeline_async(&item.command)?;
+            status = if aol.is_async && is_last {
+                self.run_pipeline_async(&item.command)?
             } else {
-                status = self.run_pipeline(&item.command)?;
-            }
-
+                self.run_pipeline(&item.command)?
+            };
             match item.op {
                 None => {}
                 Some(AndOrOp::And) if !status.is_success() => break,
@@ -298,7 +296,6 @@ impl Executor {
                 _ => {}
             }
         }
-
         self.last_status = status;
         Ok(status)
     }
@@ -337,8 +334,8 @@ impl Executor {
 
             let pid = self.fork_command(cmd, prev_read, pipe_write, pgid)?;
 
-            if let Some(existing_pgid) = pgid {
-                let _ = setpgid(pid, existing_pgid);
+            if let Some(existing) = pgid {
+                let _ = setpgid(pid, existing);
             } else {
                 pgid = Some(pid);
                 let _ = setpgid(pid, pid);
@@ -355,14 +352,18 @@ impl Executor {
         }
 
         let pgid = pgid.unwrap();
-        let _ = tcsetpgrp_stdin(pgid);
+        if self.interactive {
+            let _ = tcsetpgrp_stdin(pgid);
+        }
 
         let mut last_status = ExitStatus::SUCCESS;
         for pid in &pids {
             last_status = self.wait_for_pid(*pid)?;
         }
 
-        let _ = tcsetpgrp_stdin(self.shell_pgid);
+        if self.interactive {
+            let _ = tcsetpgrp_stdin(self.shell_pgid);
+        }
 
         if pipeline.negated {
             last_status = if last_status.is_success() {
@@ -371,7 +372,6 @@ impl Executor {
                 ExitStatus::SUCCESS
             };
         }
-
         Ok(last_status)
     }
 
@@ -397,8 +397,8 @@ impl Executor {
 
             let pid = self.fork_command(cmd, prev_read, pipe_write, pgid)?;
 
-            if let Some(existing_pgid) = pgid {
-                let _ = setpgid(pid, existing_pgid);
+            if let Some(existing) = pgid {
+                let _ = setpgid(pid, existing);
             } else {
                 pgid = Some(pid);
                 let _ = setpgid(pid, pid);
@@ -417,7 +417,6 @@ impl Executor {
         let pgid = pgid.unwrap();
         let job_id = self.jobs.add(pgid, pids, cmd_str);
         eprintln!("[{job_id}] {pgid}");
-
         Ok(ExitStatus::SUCCESS)
     }
 
@@ -442,11 +441,9 @@ impl Executor {
                     let _ = signal(Signal::SIGQUIT, SigHandler::SigDfl);
                 }
                 let _ = sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None);
-
                 let my_pid = getpid();
                 let group = pgid.unwrap_or(my_pid);
                 let _ = setpgid(my_pid, group);
-
                 if let Some(fd) = stdin_override {
                     let _ = dup2_raw(fd, 0);
                     let _ = close_raw(fd);
@@ -455,7 +452,6 @@ impl Executor {
                     let _ = dup2_raw(fd, 1);
                     let _ = close_raw(fd);
                 }
-
                 let status = self.exec_command_in_child(cmd);
                 std::process::exit(status);
             }
@@ -493,8 +489,6 @@ impl Executor {
             return 0;
         }
 
-        // Strip and apply leading assignments (we are in a child — all
-        // assignments are permanent for this process).
         let assign_count = words.iter().take_while(|w| is_assignment(w)).count();
         let (assignments, cmd_words) = words.split_at(assign_count);
         for a in assignments {
@@ -505,11 +499,27 @@ impl Executor {
             return 0;
         }
 
-        let name = &cmd_words[0];
-        let args: Vec<&str> = cmd_words.iter().map(|s| s.as_str()).collect();
+        // Alias expansion — same logic as run_simple, needed for pipeline stages.
+        let raw = &cmd_words[0];
+        let (name, expanded_args): (String, Vec<String>) = if let Some(alias_val) =
+            self.env.get_alias(raw)
+        {
+            let mut parts: Vec<String> = alias_val.split_whitespace().map(String::from).collect();
+            let alias_name = if parts.is_empty() {
+                raw.clone()
+            } else {
+                parts.remove(0)
+            };
+            parts.extend_from_slice(&cmd_words[1..]);
+            (alias_name, parts)
+        } else {
+            (raw.clone(), cmd_words[1..].to_vec())
+        };
+
+        let args: Vec<&str> = expanded_args.iter().map(|s| s.as_str()).collect();
 
         if let Some(f) = lookup_builtin(name.as_str()) {
-            return match f(self, &args[1..]) {
+            return match f(self, &args) {
                 Ok(s) => s.0,
                 Err(e) => {
                     eprintln!("swagsh: {e}");
@@ -518,7 +528,10 @@ impl Executor {
             };
         }
 
-        match self.do_exec(cmd_words) {
+        // Build full word list with alias-expanded name.
+        let mut full_words = vec![name];
+        full_words.extend_from_slice(&expanded_args);
+        match self.do_exec(&full_words) {
             Ok(_) => unreachable!(),
             Err(e) => {
                 eprintln!("swagsh: {e}");
@@ -553,17 +566,16 @@ impl Executor {
     }
 
     // ------------------------------------------------------------------
-    // Simple command (parent)
+    // Simple command (parent process)
     // ------------------------------------------------------------------
 
     fn run_simple(&mut self, sc: &SimpleCmd) -> Result<ExitStatus> {
         let words = self.expand_words(&sc.words)?;
 
-        // Split leading NAME=VALUE assignments from the actual command.
         let assign_count = words.iter().take_while(|w| is_assignment(w)).count();
         let (assignments, cmd_words) = words.split_at(assign_count);
 
-        // ── No command — pure assignment statement ──────────────────────────
+        // Pure assignment — no command.
         if cmd_words.is_empty() {
             let saved = self.save_fds(&[0, 1, 2])?;
             self.apply_redirects(&sc.redirects)?;
@@ -575,13 +587,46 @@ impl Executor {
             return Ok(ExitStatus::SUCCESS);
         }
 
-        let name = cmd_words[0].clone();
-        let args: Vec<String> = cmd_words[1..].to_vec();
+        // Alias expansion — active in all execution modes within this session.
+        // Non-recursive: the expanded command name is never re-expanded.
+        let raw = &cmd_words[0];
+        let (name, mut args): (String, Vec<String>) = if let Some(alias_val) =
+            self.env.get_alias(raw)
+        {
+            let mut parts: Vec<String> = alias_val.split_whitespace().map(String::from).collect();
+            let alias_name = if parts.is_empty() {
+                raw.clone()
+            } else {
+                parts.remove(0)
+            };
+            parts.extend_from_slice(&cmd_words[1..]);
+            (alias_name, parts)
+        } else {
+            (raw.clone(), cmd_words[1..].to_vec())
+        };
+        let _ = &mut args;
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let special = is_special_builtin(&name);
 
-        // ── Builtin ─────────────────────────────────────────────────────────
+        // Builtin.
         if let Some(f) = lookup_builtin(name.as_str()) {
+            // alias/unalias: expand each word fully (stripping quotes) but
+            // do NOT IFS-split, so `ll='ls -la'` arrives as one token "ll=ls -la".
+            let no_split_args: Vec<String> = if matches!(name.as_str(), "alias" | "unalias") {
+                sc.words[assign_count + 1..]
+                    .iter()
+                    .map(|w| self.expand_word(w).map(|mut v| v.remove(0)))
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
+
+            let effective_arg_refs: Vec<&str> = if matches!(name.as_str(), "alias" | "unalias") {
+                no_split_args.iter().map(|s| s.as_str()).collect()
+            } else {
+                arg_refs.clone()
+            };
+
             let saved_vars: Vec<(String, Option<String>)> = if !special {
                 assignments
                     .iter()
@@ -602,7 +647,7 @@ impl Executor {
 
             let saved_fds = self.save_fds(&[0, 1, 2])?;
             self.apply_redirects(&sc.redirects)?;
-            let result = f(self, &arg_refs);
+            let result = f(self, &effective_arg_refs);
             self.restore_fds(saved_fds)?;
 
             for (k, old) in saved_vars {
@@ -614,7 +659,7 @@ impl Executor {
             return result;
         }
 
-        // ── Shell function ───────────────────────────────────────────────────
+        // Shell function.
         if let Some(body) = self.env.get_function(&name).cloned() {
             let saved_vars: Vec<(String, Option<String>)> = assignments
                 .iter()
@@ -643,8 +688,12 @@ impl Executor {
             return Ok(status);
         }
 
-        // ── External command ─────────────────────────────────────────────────
-        self.run_external_with_assignments(sc, cmd_words, assignments)
+        // External command.
+        // Rebuild full word list with the (possibly alias-expanded) name.
+        // Use alias-expanded args (not cmd_words[1..]) so alias flags are included.
+        let mut full_words = vec![name];
+        full_words.extend_from_slice(&args);
+        self.run_external_with_assignments(sc, &full_words, assignments)
     }
 
     fn run_external_with_assignments(
@@ -663,9 +712,10 @@ impl Executor {
                     let _ = signal(Signal::SIGQUIT, SigHandler::SigDfl);
                 }
                 let _ = sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None);
-                let my_pid = getpid();
-                let _ = setpgid(my_pid, my_pid);
-                // Export assignments into the child's environment.
+                if self.interactive {
+                    let my_pid = getpid();
+                    let _ = setpgid(my_pid, my_pid);
+                }
                 for a in assignments {
                     let (k, v) = a.split_once('=').unwrap();
                     self.env.export(k, v);
@@ -683,10 +733,14 @@ impl Executor {
                 }
             }
             ForkResult::Parent { child } => {
-                let _ = setpgid(child, child);
-                let _ = tcsetpgrp_stdin(child);
+                if self.interactive {
+                    let _ = setpgid(child, child);
+                    let _ = tcsetpgrp_stdin(child);
+                }
                 let status = self.wait_for_pid(child)?;
-                let _ = tcsetpgrp_stdin(self.shell_pgid);
+                if self.interactive {
+                    let _ = tcsetpgrp_stdin(self.shell_pgid);
+                }
                 Ok(status)
             }
         }
@@ -758,12 +812,7 @@ impl Executor {
         let mut status = ExitStatus::SUCCESS;
         loop {
             let cond = self.run_list(&wc.condition)?;
-            let should_run = if wc.until {
-                !cond.is_success()
-            } else {
-                cond.is_success()
-            };
-            if !should_run {
+            if wc.until == cond.is_success() {
                 break;
             }
             match self.run_list(&wc.body) {
@@ -829,20 +878,17 @@ impl Executor {
         for r in redirects {
             match &r.kind {
                 RedirectKind::Out => {
-                    let path = self.word_to_path(&r.target)?;
-                    let fd = open_write(&path, false)?;
+                    let fd = open_write(&self.word_to_path(&r.target)?, false)?;
                     dup2_raw(fd, r.fd)?;
                     close_raw(fd)?;
                 }
                 RedirectKind::Append => {
-                    let path = self.word_to_path(&r.target)?;
-                    let fd = open_write(&path, true)?;
+                    let fd = open_write(&self.word_to_path(&r.target)?, true)?;
                     dup2_raw(fd, r.fd)?;
                     close_raw(fd)?;
                 }
                 RedirectKind::In => {
-                    let path = self.word_to_path(&r.target)?;
-                    let fd = open_read(&path)?;
+                    let fd = open_read(&self.word_to_path(&r.target)?)?;
                     dup2_raw(fd, r.fd)?;
                     close_raw(fd)?;
                 }
@@ -853,20 +899,19 @@ impl Executor {
                     }
                 }
                 RedirectKind::Both => {
-                    let path = self.word_to_path(&r.target)?;
-                    let fd = open_write(&path, false)?;
+                    let fd = open_write(&self.word_to_path(&r.target)?, false)?;
                     dup2_raw(fd, 1)?;
                     dup2_raw(fd, 2)?;
                     close_raw(fd)?;
                 }
                 RedirectKind::HereString => {
-                    let content = match &r.target {
-                        Word::Literal(s) => format!("{s}\n"),
-                        other => {
-                            let expanded = self.expand_word(other)?;
-                            format!("{}\n", expanded.join(" "))
-                        }
+                    // Always expand — the body may contain $VAR, $(cmd), etc.
+                    let raw = match &r.target {
+                        Word::Literal(s) => s.clone(),
+                        other => self.expand_word_to_string(other)?,
                     };
+                    // Expand each line individually preserving newlines.
+                    let content = expand_heredoc_body(&raw, self)?;
                     let (read_fd, write_fd) = raw_pipe()?;
                     write_raw(write_fd, content.as_bytes())?;
                     close_raw(write_fd)?;
@@ -888,7 +933,7 @@ impl Executor {
     }
 
     // ------------------------------------------------------------------
-    // Fd save/restore for builtins
+    // Fd save/restore
     // ------------------------------------------------------------------
 
     fn save_fds(&self, fds: &[RawFd]) -> Result<Vec<(RawFd, RawFd)>> {
@@ -946,9 +991,16 @@ impl Executor {
         Ok(vec![raw])
     }
 
-    fn expand_word_to_string(&self, word: &Word) -> Result<String> {
+    pub(crate) fn expand_word_to_string(&self, word: &Word) -> Result<String> {
         match word {
-            Word::Literal(s) => Ok(s.clone()),
+            Word::Literal(s) => {
+                // Tilde expansion on bare literals starting with `~`.
+                if s.starts_with('~') {
+                    Ok(expand_tilde(s, &self.env))
+                } else {
+                    Ok(s.clone())
+                }
+            }
             Word::Var(name) => Ok(self.expand_var(name)),
             Word::CmdSub(cmd) => self.expand_cmd_sub(cmd),
             Word::Compound(parts) => {
@@ -1023,6 +1075,12 @@ impl Executor {
         }
     }
 
+    /// Expand a `Command` node as a command substitution — used by the
+    /// heredoc body expander which already has a parsed `Command`.
+    pub(crate) fn expand_cmd_sub_cmd(&mut self, cmd: &Command) -> Result<String> {
+        self.expand_cmd_sub(cmd)
+    }
+
     fn expand_cmd_sub(&self, cmd: &Command) -> Result<String> {
         let (read_fd, write_fd) = raw_pipe()?;
         match unsafe { fork()? } {
@@ -1031,7 +1089,7 @@ impl Executor {
                 dup2_raw(write_fd, 1)?;
                 close_raw(write_fd)?;
                 let mut child_exec =
-                    Executor::new(self.env.clone()).expect("executor init in cmd sub");
+                    Executor::new(self.env.clone(), false).expect("executor init in cmd sub");
                 let status = child_exec
                     .run_command(cmd, None, None)
                     .unwrap_or(ExitStatus::FAILURE);
@@ -1051,10 +1109,9 @@ impl Executor {
                 }
                 close_raw(read_fd)?;
                 let _ = waitpid(child, None);
-                let s = String::from_utf8_lossy(&output)
+                Ok(String::from_utf8_lossy(&output)
                     .trim_end_matches('\n')
-                    .to_owned();
-                Ok(s)
+                    .to_owned())
             }
         }
     }
@@ -1086,55 +1143,83 @@ impl Executor {
 fn builtin_colon(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
     Ok(ExitStatus::SUCCESS)
 }
-
 fn builtin_true(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
     Ok(ExitStatus::SUCCESS)
 }
-
 fn builtin_false(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
     Ok(ExitStatus::FAILURE)
 }
-
 fn builtin_break(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
     Err(anyhow::anyhow!("__break__"))
 }
-
 fn builtin_continue(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
     Err(anyhow::anyhow!("__continue__"))
+}
+
+fn builtin_alias(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
+    if args.is_empty() {
+        let mut pairs: Vec<(&str, &str)> = exec.env.all_aliases().collect();
+        pairs.sort_by_key(|(k, _)| *k);
+        for (k, v) in pairs {
+            println!("alias {k}='{v}'");
+        }
+        return Ok(ExitStatus::SUCCESS);
+    }
+    for arg in args {
+        // An arg like `ll=ls -la` arrives here already with quotes stripped
+        // and the value intact as one string (the lexer consumed the quotes).
+        // Split only on the FIRST `=` — everything after is the value.
+        if let Some((k, v)) = arg.split_once('=') {
+            exec.env.set_alias(k.to_owned(), v.to_owned());
+        } else {
+            match exec.env.get_alias(arg) {
+                Some(v) => println!("alias {arg}='{v}'"),
+                None => {
+                    eprintln!("swagsh: alias: {arg}: not found");
+                    return Ok(ExitStatus::FAILURE);
+                }
+            }
+        }
+    }
+    Ok(ExitStatus::SUCCESS)
+}
+
+fn builtin_unalias(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
+    if args.first() == Some(&"-a") {
+        exec.env.clear_aliases();
+        return Ok(ExitStatus::SUCCESS);
+    }
+    for arg in args {
+        exec.env.remove_alias(arg);
+    }
+    Ok(ExitStatus::SUCCESS)
 }
 
 fn builtin_cd(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
     let target = match args.first() {
         Some(&"-") => exec.env.get("OLDPWD").unwrap_or_else(|| "/".into()),
-        Some(&path) => {
-            if path.starts_with('~') {
-                let home = exec.env.get("HOME").unwrap_or_default();
-                path.replacen('~', &home, 1)
-            } else {
-                path.to_owned()
-            }
-        }
+        Some(&path) => expand_tilde(path, &exec.env),
         None => exec.env.get("HOME").unwrap_or_else(|| "/".into()),
     };
-
     let old = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
-
     std::env::set_current_dir(&target).map_err(|e| anyhow!("cd: {target}: {e}"))?;
-
     exec.env.export("OLDPWD", old);
     let new = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
     exec.env.export("PWD", new);
-
     Ok(ExitStatus::SUCCESS)
 }
 
 fn builtin_pwd(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
-    let cwd = std::env::current_dir().map_err(|e| anyhow!("pwd: {e}"))?;
-    println!("{}", cwd.display());
+    println!(
+        "{}",
+        std::env::current_dir()
+            .map_err(|e| anyhow!("pwd: {e}"))?
+            .display()
+    );
     Ok(ExitStatus::SUCCESS)
 }
 
@@ -1270,8 +1355,7 @@ fn builtin_exec(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
 }
 
 fn builtin_exit(_exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
-    let code: i32 = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-    std::process::exit(code);
+    std::process::exit(args.first().and_then(|s| s.parse().ok()).unwrap_or(0));
 }
 
 fn builtin_jobs(exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
@@ -1305,11 +1389,9 @@ fn builtin_fg(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
         .find(|j| j.id == id)
         .map(|j| (j.pgid, j.command.clone()))
         .ok_or_else(|| anyhow!("fg: no such job: {id}"))?;
-
     eprintln!("{cmd}");
     nix::sys::signal::killpg(pgid, Signal::SIGCONT)?;
     let _ = tcsetpgrp_stdin(pgid);
-
     let status = loop {
         match waitpid(Pid::from_raw(-pgid.as_raw()), Some(WaitPidFlag::WUNTRACED)) {
             Ok(WaitStatus::Exited(_, code)) => break ExitStatus(code),
@@ -1322,7 +1404,6 @@ fn builtin_fg(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
             Err(e) => return Err(anyhow!(e)),
         }
     };
-
     let _ = tcsetpgrp_stdin(exec.shell_pgid);
     exec.jobs.remove(id);
     Ok(status)
@@ -1348,10 +1429,8 @@ fn builtin_kill(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
     if args.is_empty() {
         bail!("kill: usage: kill [-signal] pid|%job");
     }
-
     let mut sig = Signal::SIGTERM;
     let mut targets = args;
-
     if args[0].starts_with('-') {
         let sig_str = args[0].trim_start_matches('-');
         sig = sig_str
@@ -1362,7 +1441,6 @@ fn builtin_kill(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
             .ok_or_else(|| anyhow!("kill: invalid signal: {sig_str}"))?;
         targets = &args[1..];
     }
-
     for target in targets {
         let pid = if let Some(id_str) = target.strip_prefix('%') {
             let id: usize = id_str
@@ -1374,14 +1452,14 @@ fn builtin_kill(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
                 .map(|j| j.pgid)
                 .ok_or_else(|| anyhow!("kill: no such job: {id}"))?
         } else {
-            let raw: i32 = target
-                .parse()
-                .map_err(|_| anyhow!("kill: invalid pid: {target}"))?;
-            Pid::from_raw(raw)
+            Pid::from_raw(
+                target
+                    .parse()
+                    .map_err(|_| anyhow!("kill: invalid pid: {target}"))?,
+            )
         };
         nix::sys::signal::kill(pid, sig)?;
     }
-
     Ok(ExitStatus::SUCCESS)
 }
 
@@ -1389,10 +1467,398 @@ fn builtin_kill(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Tilde expansion — `~` → $HOME, `~user` not supported (uncommon, skip).
+pub fn expand_tilde(s: &str, env: &Env) -> String {
+    if s == "~" {
+        return env.get("HOME").unwrap_or_else(|| "/".into());
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        let home = env.get("HOME").unwrap_or_else(|| "/".into());
+        return format!("{home}/{rest}");
+    }
+    s.to_owned()
+}
+
+/// Glob expansion — handles path prefixes like `src/*.rs`.
+fn glob_expand(pattern: &str) -> Vec<String> {
+    // Split into directory prefix and filename pattern.
+    let (dir, file_pat) = match pattern.rfind('/') {
+        Some(pos) => (&pattern[..pos], &pattern[pos + 1..]),
+        None => (".", pattern),
+    };
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    let mut results: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|name| glob_match(file_pat, name))
+        .map(|name| {
+            if dir == "." {
+                name
+            } else {
+                format!("{dir}/{name}")
+            }
+        })
+        .collect();
+    results.sort();
+    results
+}
+
+/// Expand variables and command substitutions inside a heredoc body.
+/// Each `$VAR` / `$(cmd)` in the raw string is expanded; the overall
+/// newline structure is preserved.
+fn expand_heredoc_body(body: &str, exec: &Executor) -> Result<String> {
+    // Parse the body as a double-quoted-like word so the existing
+    // expand_word machinery handles $VAR and $() correctly.
+    use crate::parser::parse;
+    // Wrap in a no-op echo to get expansion, then discard the command.
+    // Simpler: just do a lightweight variable substitution inline.
+    let mut result = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            let mut var = String::new();
+            match chars.peek().copied() {
+                Some('{') => {
+                    chars.next();
+                    for ch in chars.by_ref() {
+                        if ch == '}' {
+                            break;
+                        }
+                        var.push(ch);
+                    }
+                    result.push_str(&exec.expand_var(&var));
+                }
+                Some('(') => {
+                    // Command substitution — collect balanced parens.
+                    chars.next();
+                    let mut depth = 1usize;
+                    let mut cmd_src = String::new();
+                    for ch in chars.by_ref() {
+                        if ch == '(' {
+                            depth += 1;
+                        } else if ch == ')' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        cmd_src.push(ch);
+                    }
+                    if let Ok(program) = parse(&cmd_src) {
+                        // Run in a sub-executor with the same env.
+                        let mut sub = Executor::new(exec.env.clone(), false)
+                            .unwrap_or_else(|_| panic!("sub executor"));
+                        // Capture stdout via expand_cmd_sub path — reuse the AST.
+                        if let Some(aol) = program.body.into_iter().next()
+                            && let Some(item) = aol.items.into_iter().next()
+                            && let Some(cmd) = item.command.commands.into_iter().next()
+                            && let Ok(s) = sub.expand_cmd_sub_cmd(&cmd)
+                        {
+                            result.push_str(&s);
+                        }
+                    }
+                }
+                Some(c2) if c2.is_ascii_alphanumeric() || c2 == '_' || "@*#?-$!".contains(c2) => {
+                    if "@*#?-$!".contains(c2) {
+                        chars.next();
+                        result.push_str(&exec.expand_var(&c2.to_string()));
+                    } else {
+                        // Collect the full identifier using while-let to avoid
+                        // mixing for-loop borrows with peek().
+                        while matches!(chars.peek(), Some(ch) if ch.is_ascii_alphanumeric() || *ch == '_')
+                        {
+                            var.push(chars.next().unwrap());
+                        }
+                        result.push_str(&exec.expand_var(&var));
+                    }
+                }
+                _ => result.push('$'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    // Ensure trailing newline.
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    Ok(result)
+}
+
+fn builtin_bracket(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
+    // [ expr ] — last arg must be ]
+    if args.last() != Some(&"]") {
+        bail!("[: missing closing ]");
+    }
+    builtin_test(exec, &args[..args.len() - 1])
+}
+
+fn builtin_double_bracket(_exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
+    // args includes the trailing "]]" — strip it.
+    if args.last() != Some(&"]]") {
+        bail!("[[: missing closing ]]");
+    }
+    let inner = &args[..args.len() - 1];
+    let result = eval_double_bracket(inner).unwrap_or(false);
+    Ok(if result {
+        ExitStatus::SUCCESS
+    } else {
+        ExitStatus::FAILURE
+    })
+}
+
+/// Evaluate `[[ ]]` expressions — like eval_test but handles `&&` and `||`
+/// as infix operators (they arrive as string tokens from the parser).
+fn eval_double_bracket(args: &[&str]) -> Option<bool> {
+    // Split on top-level || first (lowest precedence).
+    let mut depth = 0usize;
+    for (i, &tok) in args.iter().enumerate() {
+        match tok {
+            "(" => depth += 1,
+            ")" => depth = depth.saturating_sub(1),
+            "||" if depth == 0 => {
+                let lhs = eval_double_bracket(&args[..i]).unwrap_or(false);
+                if lhs {
+                    return Some(true);
+                }
+                return eval_double_bracket(&args[i + 1..]);
+            }
+            _ => {}
+        }
+    }
+    // Split on top-level &&.
+    depth = 0;
+    for (i, &tok) in args.iter().enumerate() {
+        match tok {
+            "(" => depth += 1,
+            ")" => depth = depth.saturating_sub(1),
+            "&&" if depth == 0 => {
+                let lhs = eval_double_bracket(&args[..i]).unwrap_or(false);
+                if !lhs {
+                    return Some(false);
+                }
+                return eval_double_bracket(&args[i + 1..]);
+            }
+            _ => {}
+        }
+    }
+    // No &&/|| at top level — fall through to standard test evaluator.
+    eval_test(args)
+}
+
+fn builtin_test(_exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
+    let result = eval_test(args).unwrap_or(false);
+    Ok(if result {
+        ExitStatus::SUCCESS
+    } else {
+        ExitStatus::FAILURE
+    })
+}
+
+fn builtin_read(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
+    let var = args.first().copied().unwrap_or("REPLY");
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) => return Ok(ExitStatus::FAILURE), // EOF
+        Ok(_) => {}
+        Err(e) => bail!("read: {e}"),
+    }
+    let line = line.trim_end_matches('\n').trim_end_matches('\r');
+    exec.env.set(var, line);
+    Ok(ExitStatus::SUCCESS)
+}
+
+fn builtin_shift(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
+    let n: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let mut pos = exec.env.positional_args().to_vec();
+    if n > pos.len() {
+        bail!("shift: shift count out of range");
+    }
+    pos.drain(..n);
+    exec.env.set_positional_args(pos);
+    Ok(ExitStatus::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// test / [ / [[ expression evaluator
+// ---------------------------------------------------------------------------
+
+/// Evaluate a test expression given as a slice of string tokens.
+/// Returns `true` for success (exit 0), `false` for failure (exit 1).
+fn eval_test(args: &[&str]) -> Option<bool> {
+    let (result, rest): (bool, &[&str]) = parse_or(args)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(result)
+}
+
+// or-expression: expr (-o expr)*
+fn parse_or<'a>(args: &'a [&'a str]) -> Option<(bool, &'a [&'a str])> {
+    let (mut val, mut rest) = parse_and(args)?;
+    while rest.first() == Some(&"-o") {
+        let (rhs, r2) = parse_and(&rest[1..])?;
+        val = val || rhs;
+        rest = r2;
+    }
+    Some((val, rest))
+}
+
+// and-expression: expr (-a expr)*
+fn parse_and<'a>(args: &'a [&'a str]) -> Option<(bool, &'a [&'a str])> {
+    let (mut val, mut rest) = parse_not(args)?;
+    while rest.first() == Some(&"-a") {
+        let (rhs, r2) = parse_not(&rest[1..])?;
+        val = val && rhs;
+        rest = r2;
+    }
+    Some((val, rest))
+}
+
+// not-expression: ! expr | primary
+fn parse_not<'a>(args: &'a [&'a str]) -> Option<(bool, &'a [&'a str])> {
+    if args.first() == Some(&"!") {
+        let (val, rest) = parse_not(&args[1..])?;
+        return Some((!val, rest));
+    }
+    // parenthesised group for [[ ]]
+    if args.first() == Some(&"(") {
+        let close = args.iter().rposition(|&a| a == ")")?;
+        let inner = &args[1..close];
+        let (val, _) = parse_or(inner)?;
+        return Some((val, &args[close + 1..]));
+    }
+    parse_primary(args)
+}
+
+// primary: unary-op arg | arg binary-op arg | arg
+fn parse_primary<'a>(args: &'a [&'a str]) -> Option<(bool, &'a [&'a str])> {
+    match args {
+        [] => Some((false, &[])),
+
+        // ── Unary file tests ──────────────────────────────────────────────
+        [op, path, rest @ ..]
+            if matches!(
+                *op,
+                "-e" | "-f"
+                    | "-d"
+                    | "-r"
+                    | "-w"
+                    | "-x"
+                    | "-s"
+                    | "-L"
+                    | "-h"
+                    | "-b"
+                    | "-c"
+                    | "-p"
+                    | "-S"
+                    | "-u"
+                    | "-g"
+                    | "-k"
+            ) =>
+        {
+            use std::fs;
+            use std::os::unix::fs::MetadataExt;
+            let p = std::path::Path::new(path);
+            let val = match *op {
+                "-e" => p.exists(),
+                "-f" => p.is_file(),
+                "-d" => p.is_dir(),
+                "-L" | "-h" => p
+                    .symlink_metadata()
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false),
+                "-r" => fs::metadata(p)
+                    .map(|m| {
+                        !m.permissions().readonly()
+                            || unsafe {
+                                libc::access(
+                                    std::ffi::CString::new(*path).unwrap().as_ptr(),
+                                    libc::R_OK,
+                                ) == 0
+                            }
+                    })
+                    .unwrap_or(false),
+                "-w" => unsafe {
+                    !p.exists()
+                        || libc::access(std::ffi::CString::new(*path).unwrap().as_ptr(), libc::W_OK)
+                            == 0
+                },
+                "-x" => unsafe {
+                    libc::access(std::ffi::CString::new(*path).unwrap().as_ptr(), libc::X_OK) == 0
+                },
+                "-s" => fs::metadata(p).map(|m| m.size() > 0).unwrap_or(false),
+                "-b" => fs::metadata(p)
+                    .map(|m| m.file_type().is_block_device())
+                    .unwrap_or(false),
+                "-c" => fs::metadata(p)
+                    .map(|m| m.file_type().is_char_device())
+                    .unwrap_or(false),
+                "-p" => fs::metadata(p)
+                    .map(|m| m.file_type().is_fifo())
+                    .unwrap_or(false),
+                "-S" => fs::metadata(p)
+                    .map(|m| m.file_type().is_socket())
+                    .unwrap_or(false),
+                "-u" => fs::metadata(p)
+                    .map(|m| m.mode() & 0o4000 != 0)
+                    .unwrap_or(false),
+                "-g" => fs::metadata(p)
+                    .map(|m| m.mode() & 0o2000 != 0)
+                    .unwrap_or(false),
+                "-k" => fs::metadata(p)
+                    .map(|m| m.mode() & 0o1000 != 0)
+                    .unwrap_or(false),
+                _ => false,
+            };
+            Some((val, rest))
+        }
+
+        // ── Unary string tests ────────────────────────────────────────────
+        ["-z", s, rest @ ..] => Some((s.is_empty(), rest)),
+        ["-n", s, rest @ ..] => Some((!s.is_empty(), rest)),
+        ["-t", fd_str, rest @ ..] => {
+            let fd: i32 = fd_str.parse().unwrap_or(-1);
+            let val = unsafe { libc::isatty(fd) == 1 };
+            Some((val, rest))
+        }
+
+        // ── Binary string tests ───────────────────────────────────────────
+        [a, "=", b, rest @ ..] => Some((a == b, rest)),
+        [a, "==", b, rest @ ..] => Some((a == b, rest)),
+        [a, "!=", b, rest @ ..] => Some((a != b, rest)),
+        [a, "<", b, rest @ ..] => Some((a < b, rest)),
+        [a, ">", b, rest @ ..] => Some((a > b, rest)),
+
+        // ── Binary integer tests ──────────────────────────────────────────
+        [a, op, b, rest @ ..] if matches!(*op, "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge") => {
+            let ai: i64 = a.parse().unwrap_or(0);
+            let bi: i64 = b.parse().unwrap_or(0);
+            let val = match *op {
+                "-eq" => ai == bi,
+                "-ne" => ai != bi,
+                "-lt" => ai < bi,
+                "-le" => ai <= bi,
+                "-gt" => ai > bi,
+                "-ge" => ai >= bi,
+                _ => false,
+            };
+            Some((val, rest))
+        }
+
+        // ── Bare string (non-empty = true) ────────────────────────────────
+        [s, rest @ ..] => Some((!s.is_empty(), rest)),
+    }
+}
+
 fn glob_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    glob_match_inner(&p, &t)
+    glob_match_inner(
+        &pattern.chars().collect::<Vec<_>>(),
+        &text.chars().collect::<Vec<_>>(),
+    )
 }
 
 fn glob_match_inner(p: &[char], t: &[char]) -> bool {
@@ -1406,19 +1872,6 @@ fn glob_match_inner(p: &[char], t: &[char]) -> bool {
         (Some(&'?'), _) => glob_match_inner(&p[1..], &t[1..]),
         (Some(pc), Some(tc)) => pc == tc && glob_match_inner(&p[1..], &t[1..]),
     }
-}
-
-fn glob_expand(pattern: &str) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(".") else {
-        return vec![];
-    };
-    let mut results: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|name| glob_match(pattern, name))
-        .collect();
-    results.sort();
-    results
 }
 
 fn parse_param_op(s: &str) -> Option<(&str, &str, &str)> {
@@ -1470,8 +1923,6 @@ fn parse_signal_name(s: &str) -> Option<Signal> {
     }
 }
 
-/// Return true if `word` is a bare variable assignment `NAME=VALUE`
-/// where NAME is a valid identifier (POSIX §2.9.1).
 #[inline]
 fn is_assignment(word: &str) -> bool {
     let Some(eq) = word.find('=') else {
@@ -1487,7 +1938,6 @@ fn is_assignment(word: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// POSIX special builtins — assignments before these persist in the shell env.
 #[inline]
 fn is_special_builtin(name: &str) -> bool {
     matches!(
