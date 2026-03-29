@@ -2,7 +2,7 @@
 name = "swagsh"
 version = "0.5.0"
 edition = "2024"
-description = "A sleek, high-performance POSIX-compatible shell built in Rust for speed and reliability. Name inspired by 'swag' slang for stylish flair."
+description = "A sleek, high-performance POSIX-compatible shell. Name inspired by 'swag' slang for stylish flair."
 authors = ["takashialpha <takashialpha@protonmail.com>"]
 license = "Apache-2.0"
 
