@@ -5,6 +5,11 @@ Name inspired by *swag* slang for stylish flair.
 
 ---
 
+[![crates.io](https://img.shields.io/crates/v/swagsh?style=flat-square&color=64b4ff&labelColor=161616)](https://crates.io/crates/swagsh)
+[![AUR](https://img.shields.io/aur/version/swagsh?style=flat-square&color=64b4ff&labelColor=161616)](https://aur.archlinux.org/packages/swagsh)
+[![License](https://img.shields.io/crates/l/audium?style=flat-square&color=64b4ff&labelColor=161616)](LICENSE)
+---
+
 ## Features
 
 - **POSIX + bash-ish** — pipelines, redirections, heredocs, `if`/`for`/`while`/`until`/`case`, functions, subshells, brace groups
