@@ -5,6 +5,7 @@ edition = "2024"
 description = "A sleek, high-performance POSIX-compatible shell. Name inspired by 'swag' slang for stylish flair."
 authors = ["takashialpha <takashialpha@protonmail.com>"]
 license = "Apache-2.0"
+repository = "https://github.com/takashialpha/swagsh"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
@@ -16,10 +17,6 @@ ahash = "0.8"
 
 [profile.release]
 strip = true
-opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
-debug = false
-overflow-checks = false
-incremental = false
