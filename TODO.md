@@ -1,5 +1,8 @@
 # swagsh TODO
 
+## Always
+Maintain AUR and crates.io for distribution.
+
 ## In Progress
 
 ### High Priority (correctness)
