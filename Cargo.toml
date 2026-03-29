@@ -1,18 +1,18 @@
 [package]
 name = "swagsh"
-version = "0.3.0"
+version = "0.5.0"
 edition = "2024"
 description = "A sleek, high-performance POSIX-compatible shell built in Rust for speed and reliability. Name inspired by 'swag' slang for stylish flair."
 authors = ["takashialpha <takashialpha@protonmail.com>"]
 license = "Apache-2.0"
 
 [dependencies]
-clap = { version = "4.6.0", features = ["derive", "env"] }
-anyhow = "1.0.102"
-rustyline = "17.0.2"
-nix = { version = "0.31.2", features = ["process", "signal", "term"] }
-libc = "0.2.183"
-ahash = "0.8.12"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+rustyline = "17"
+nix = { version = "0.31", features = ["process", "signal", "term"] }
+libc = "0.2"
+ahash = "0.8"
 
 [profile.release]
 strip = true
