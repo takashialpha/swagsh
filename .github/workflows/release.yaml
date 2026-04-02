@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # Linux x86_64 (Arch Linux compatible)
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact_name: swagsh-x86_64-unknown-linux-gnu
+            archive_name: swagsh-${{ github.ref_name }}-x86_64-linux.tar.gz
+
+          # macOS Apple Silicon
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: swagsh-aarch64-apple-darwin
+            archive_name: swagsh-${{ github.ref_name }}-aarch64-macos.tar.gz
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare and compress binary
+        run: |
+          mkdir -p artifacts
+          cp target/${{ matrix.target }}/release/swagsh artifacts/${{ matrix.artifact_name }}
+          chmod +x artifacts/${{ matrix.artifact_name }}
+
+          # Create compressed archive with clean name
+          cd artifacts
+          tar -czf ${{ matrix.archive_name }} ${{ matrix.artifact_name }}
+          ls -lh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: artifacts/${{ matrix.archive_name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all built archives
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      - name: Create draft GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: swagsh ${{ github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          files: |
+            artifacts/swagsh-x86_64-unknown-linux-gnu/swagsh-${{ github.ref_name }}-x86_64-linux.tar.gz
+            artifacts/swagsh-aarch64-apple-darwin/swagsh-${{ github.ref_name }}-aarch64-macos.tar.gz
