@@ -1,10 +1,5 @@
 # swagsh TODO
 
-## Always
-Maintain AUR and crates.io for distribution.
-
-## In Progress
-
 ### High Priority (correctness)
 - [ ] `local` builtin — function-scoped variables
 - [ ] `PS2` prompt — continuation prompt for multi-line input in REPL
@@ -94,3 +89,8 @@ Maintain AUR and crates.io for distribution.
 - [ ] `test`/`[` `-a`/`-o` deprecated in POSIX; `[[` `&&`/`||` preferred
 - [ ] Tab completion doesn't complete variable names (`$HO` → `$HOME`)
 - [ ] Tab completion doesn't handle `~user` expansion
+
+### notes
+- try optimizing it the most;
+- try getting rid of raw libc(replace with nix or rustix whenever possible);
+- prettier README with asciinema;
