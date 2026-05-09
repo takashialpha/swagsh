@@ -1,6 +1,6 @@
 # swagsh
 
-**A sleek, high-performance POSIX-compatible shell built in Rust for speed and reliability.**  
+**A sleek, high-performance Linux shell built in Rust for speed and reliability.**  
 Name inspired by *swag* slang for stylish flair.
 
 ---
