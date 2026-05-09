@@ -10,24 +10,6 @@ Name inspired by *swag* slang for stylish flair.
 [![License](https://img.shields.io/crates/l/audium?style=flat-square&color=64b4ff&labelColor=161616)](LICENSE)
 ---
 
-## Features
-
-- **POSIX + bash-ish** — pipelines, redirections, heredocs, `if`/`for`/`while`/`until`/`case`, functions, subshells, brace groups
-- **Builtins** — `cd`, `echo`, `printf`, `export`, `unset`, `set`, `source`/`.`, `exec`, `exit`, `read`, `shift`, `test`/`[`/`[[`, `alias`/`unalias`, `jobs`, `fg`, `bg`, `kill`, `true`, `false`, `:`
-- **Job control** — foreground/background execution, `Ctrl-Z` to stop, `fg`/`bg`/`kill`
-- **Tab completion** — builtins, aliases, and PATH executables on the first word; file completion on arguments
-- **History** — persistent across sessions via `~/.swagsh_history`; `--private` mode disables read/write
-- **Aliases** — `alias`/`unalias`, expanded in all execution contexts including pipeline stages
-- **Variable expansion** — `$VAR`, `${VAR}`, `${VAR:-default}`, `${VAR:=val}`, `${VAR:+alt}`, `${VAR:?err}`, `$?`, `$$`, `$@`, `$*`, `$#`, `$0`–`$9`
-- **Tilde expansion** — `~` and `~/path` everywhere, not just in `cd`
-- **Glob expansion** — `*`, `?`, `[...]` with full path prefix support (`src/*.rs`)
-- **Heredocs** — `<<EOF` and `<<-EOF` with variable expansion in the body
-- **Here-strings** — `<<<word`
-- **POSIX §2.9.1 assignments** — `x=1`, `FOO=bar cmd`, temporary exports before commands
-- **`test`/`[`/`[[`** — file tests, string tests, integer tests, logical operators, `&&`/`||`/`!` in `[[`
-
----
-
 ## Performance
 
 swagsh is within **~16% of dash** on all builtin operations — the irreducible gap is Rust runtime startup vs a bare C binary. It is **~40% faster than bash** on equivalent workloads.
@@ -90,14 +72,25 @@ Full usage reference: [wiki/Usage](https://github.com/takashialpha/swagsh/wiki/U
 
 ---
 
+## TODO
+
+- [ ] Multiline REPL (`PS2`)
+- [ ] `local`, `return`, `eval`, `trap`
+- [ ] Fix `$(...)` + shell expansions
+- [ ] Proper quoting / `$@` semantics
+- [ ] Arithmetic + parameter expansion
+- [ ] `[[ =~ ]]`, `set -e/-u/-x`
+- [ ] Job control (`wait`, `disown`, `SIGCHLD`)
+- [ ] rc/profile sourcing + history UX
+- [ ] PATH cache + fewer `fork()`
+- [ ] Fix heredoc / alias / pipeline quirks
+- [ ] Deeper testing to see what's missing
+- [ ] Optimize it for even better performance
+- [ ] check Code/Syntax correctness further than clippy
+- [ ] Improve UX/UI
+
 ## Wiki
 
 See the [wiki](https://github.com/takashialpha/swagsh/wiki) for:
 - [Usage](https://github.com/takashialpha/swagsh/wiki/Usage) — full command reference and examples
 - [Performance](https://github.com/takashialpha/swagsh/wiki/Performance) — detailed benchmarks vs dash and bash
-
----
-
-## License
-
-Apache-2.0 — see [LICENSE](LICENSE).
