@@ -91,6 +91,6 @@
 - [ ] Tab completion doesn't handle `~user` expansion
 
 ### notes
-- try optimizing it the most;
-- try getting rid of raw libc(replace with nix or rustix whenever possible);
-- prettier README with asciinema;
+- prioritize ui/ux for now;
+- optimizing it and strive for code/syntax use correctess(mainly on main and exec);
+- merge that TODO with readme (make it smaller fr);

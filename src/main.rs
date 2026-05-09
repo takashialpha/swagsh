@@ -7,6 +7,7 @@ mod parser;
 
 use anyhow::Result;
 use clap::Parser as _;
+use rustix::process::getuid;
 
 use cli::Cli;
 use env::Env;
@@ -64,8 +65,6 @@ use rustyline::{Context, Helper};
 
 struct ShellCompleter {
     file: FilenameCompleter,
-    /// Snapshot of builtins + aliases taken at construction; refreshed each
-    /// readline call via the helper's mutable reference to Env.
     builtin_names: Vec<String>,
 }
 
@@ -95,6 +94,7 @@ impl ShellHelper {
             env_ptr: &exec.env as *const Env,
         }
     }
+
     fn env(&self) -> &Env {
         // SAFETY: see field comment above.
         unsafe { &*self.env_ptr }
@@ -125,11 +125,9 @@ impl Completer for ShellHelper {
         let word = &before_cursor[word_start..];
         let is_first_word = !before_cursor[..word_start].contains(|c: char| !c.is_whitespace());
 
-        // First word — complete commands: builtins + aliases + PATH executables
         if is_first_word {
             let mut candidates: Vec<Pair> = Vec::new();
 
-            // Builtins
             for name in &self.completer.builtin_names {
                 if name.starts_with(word) {
                     candidates.push(Pair {
@@ -139,7 +137,6 @@ impl Completer for ShellHelper {
                 }
             }
 
-            // Aliases
             for name in self.env().alias_names() {
                 if name.starts_with(word) {
                     candidates.push(Pair {
@@ -149,22 +146,20 @@ impl Completer for ShellHelper {
                 }
             }
 
-            // PATH executables
             if let Some(path_var) = self.env().get("PATH") {
                 for dir in path_var.split(':') {
                     if let Ok(entries) = std::fs::read_dir(dir) {
                         for entry in entries.filter_map(|e| e.ok()) {
                             let name = entry.file_name().to_string_lossy().to_string();
-                            if name.starts_with(word) {
-                                // Only include executables
-                                if let Ok(meta) = entry.metadata() {
-                                    use std::os::unix::fs::PermissionsExt;
-                                    if meta.permissions().mode() & 0o111 != 0 {
-                                        candidates.push(Pair {
-                                            display: name.clone(),
-                                            replacement: name,
-                                        });
-                                    }
+                            if name.starts_with(word)
+                                && let Ok(meta) = entry.metadata()
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                if meta.permissions().mode() & 0o111 != 0 {
+                                    candidates.push(Pair {
+                                        display: name.clone(),
+                                        replacement: name,
+                                    });
                                 }
                             }
                         }
@@ -172,7 +167,6 @@ impl Completer for ShellHelper {
                 }
             }
 
-            // Deduplicate and sort
             candidates.sort_by(|a, b| a.replacement.cmp(&b.replacement));
             candidates.dedup_by(|a, b| a.replacement == b.replacement);
 
@@ -181,7 +175,6 @@ impl Completer for ShellHelper {
             }
         }
 
-        // Arguments — tilde + file completion
         let tilde_expanded = if word.starts_with('~') {
             Some(expand_tilde(word, self.env()))
         } else {
@@ -205,10 +198,6 @@ impl Completer for ShellHelper {
 
 // ---------------------------------------------------------------------------
 // Interactive REPL
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Heredoc input collector for the interactive REPL
 // ---------------------------------------------------------------------------
 
 fn collect_heredoc_input(
@@ -247,7 +236,6 @@ fn extract_heredoc_delimiters(line: &str) -> Vec<String> {
     let mut delims = Vec::new();
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
-        // A `#` outside quotes starts a comment — nothing after it is syntax.
         if c == '#' {
             break;
         }
@@ -308,7 +296,6 @@ fn run_interactive(mut exec: Executor, cli: &Cli) -> Result<()> {
                     let _ = rl.add_history_entry(line);
                 }
 
-                // Collect heredoc bodies interactively before parsing.
                 let full_input = collect_heredoc_input(line, &mut rl);
 
                 match parser::parse(&full_input) {
@@ -347,22 +334,8 @@ fn run_interactive(mut exec: Executor, cli: &Cli) -> Result<()> {
 fn build_prompt(exec: &Executor) -> String {
     let ps1 = exec.env.get("PS1").unwrap_or_default();
     if ps1.is_empty() {
-        let cwd = std::env::current_dir()
-            .map(|p| {
-                let s = p.to_string_lossy().to_string();
-                let home = exec.env.get_or_empty("HOME");
-                if !home.is_empty() && s.starts_with(&home) {
-                    s.replacen(&home, "~", 1)
-                } else {
-                    s
-                }
-            })
-            .unwrap_or_else(|_| "?".into());
-        let suffix = if unsafe { libc::getuid() } == 0 {
-            "#"
-        } else {
-            "❯"
-        };
+        let cwd = current_dir_display(&exec.env);
+        let suffix = if getuid().is_root() { "#" } else { "❯" };
         format!("{cwd} {suffix} ")
     } else {
         expand_ps1(&ps1, exec)
@@ -378,30 +351,13 @@ fn expand_ps1(ps1: &str, exec: &Executor) -> String {
             continue;
         }
         match chars.next() {
-            Some('w') => {
-                let cwd = std::env::current_dir()
-                    .map(|p| {
-                        let s = p.to_string_lossy().to_string();
-                        let home = exec.env.get_or_empty("HOME");
-                        if !home.is_empty() && s.starts_with(&home) {
-                            s.replacen(&home, "~", 1)
-                        } else {
-                            s
-                        }
-                    })
-                    .unwrap_or_else(|_| "?".into());
-                out.push_str(&cwd);
-            }
+            Some('w') => out.push_str(&current_dir_display(&exec.env)),
             Some('u') => out.push_str(&exec.env.get_or_empty("USER")),
             Some('h') => {
                 let host = exec.env.get_or_empty("HOSTNAME");
                 out.push_str(host.split('.').next().unwrap_or(&host));
             }
-            Some('$') => out.push(if unsafe { libc::getuid() } == 0 {
-                '#'
-            } else {
-                '$'
-            }),
+            Some('$') => out.push(if getuid().is_root() { '#' } else { '$' }),
             Some('n') => out.push('\n'),
             Some(other) => {
                 out.push('\\');
@@ -411,6 +367,21 @@ fn expand_ps1(ps1: &str, exec: &Executor) -> String {
         }
     }
     out
+}
+
+/// Returns the current working directory with `$HOME` collapsed to `~`.
+fn current_dir_display(env: &Env) -> String {
+    std::env::current_dir()
+        .map(|p| {
+            let s = p.to_string_lossy().to_string();
+            let home = env.get_or_empty("HOME");
+            if !home.is_empty() && s.starts_with(&home) {
+                s.replacen(&home, "~", 1)
+            } else {
+                s
+            }
+        })
+        .unwrap_or_else(|_| "?".into())
 }
 
 fn history_file() -> Option<std::path::PathBuf> {

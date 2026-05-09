@@ -1,14 +1,21 @@
 use std::ffi::CString;
-use std::fs::OpenOptions;
-use std::os::fd::{BorrowedFd, IntoRawFd};
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
-use std::os::unix::io::RawFd;
+use std::os::fd::{FromRawFd, IntoRawFd};
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
-use nix::sys::signal::{SigHandler, SigSet, SigmaskHow, Signal, signal, sigprocmask};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Pid, execvp, fork, getpid, pipe, setpgid, tcsetpgrp};
+use rustix::fd::{BorrowedFd, OwnedFd, RawFd};
+use rustix::fs::{self, Access, FileTypeExt, Mode, OFlags};
+use rustix::io::{Errno, dup2, fcntl_dupfd_cloexec, read, write};
+use rustix::pipe::pipe;
+use rustix::process::{
+    Pid, Signal, WaitOptions, getpid, kill_process, kill_process_group, setpgid, wait, waitpgid,
+    waitpid,
+};
+use rustix::runtime::{
+    Fork, How, KERNEL_SIG_DFL, KernelSigSet, KernelSigaction, KernelSigactionFlags, execve,
+    kernel_fork, kernel_sig_ign, kernel_sigaction, kernel_sigprocmask,
+};
+use rustix::termios::{isatty, tcsetpgrp};
 
 use crate::ast::{
     AndOrList, AndOrOp, CaseClause, Command, ForClause, GroupCmd, IfClause, Pipeline, Program,
@@ -17,73 +24,121 @@ use crate::ast::{
 use crate::env::Env;
 
 // ---------------------------------------------------------------------------
-// Helpers — nix 0.31 API shims
+// Helpers — rustix/nix wrappers
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn tcsetpgrp_stdin(pgid: Pid) -> nix::Result<()> {
-    let borrowed = unsafe { BorrowedFd::borrow_raw(0) };
-    tcsetpgrp(borrowed, pgid)
+fn tcsetpgrp_stdin(pgid: Pid) -> rustix::io::Result<()> {
+    tcsetpgrp(std::io::stdin(), pgid)
+}
+
+/// `dup2(oldfd, newfd)` — duplicate `oldfd` onto the specific integer `newfd`.
+///
+/// rustix's `dup2` takes `(src: impl AsFd, dst: &mut OwnedFd)`.  We satisfy
+/// that by wrapping `newfd` in an `OwnedFd` for the call, then immediately
+/// `forget`-ting it so the destructor does not close the fd we just installed.
+#[inline]
+fn dup2_raw(oldfd: RawFd, newfd: RawFd) -> rustix::io::Result<()> {
+    // SAFETY: both fds are valid at every call site.
+    let src = unsafe { BorrowedFd::borrow_raw(oldfd) };
+    let mut dst = unsafe { OwnedFd::from_raw_fd(newfd) };
+    let result = dup2(src, &mut dst);
+    // Do NOT let dst drop — we don't own newfd's lifetime here; the caller
+    // owns that slot (e.g. stdin/stdout/stderr or a pipe end).
+    std::mem::forget(dst);
+    result
 }
 
 #[inline]
-fn dup2_raw(oldfd: RawFd, newfd: RawFd) -> nix::Result<()> {
-    let ret = unsafe { libc::dup2(oldfd, newfd) };
-    if ret == -1 {
-        Err(nix::errno::Errno::last())
-    } else {
-        Ok(())
-    }
+fn close_raw(fd: RawFd) {
+    // SAFETY: transferring ownership to OwnedFd so it closes on drop.
+    let _ = unsafe { OwnedFd::from_raw_fd(fd) };
 }
 
-#[inline]
-fn close_raw(fd: RawFd) -> nix::Result<()> {
-    let ret = unsafe { libc::close(fd) };
-    if ret == -1 {
-        Err(nix::errno::Errno::last())
-    } else {
-        Ok(())
-    }
-}
-
-fn raw_pipe() -> nix::Result<(RawFd, RawFd)> {
+fn raw_pipe() -> rustix::io::Result<(RawFd, RawFd)> {
+    // SAFETY: pipe() is safe; IntoRawFd transfers ownership out of OwnedFd.
     let (r, w) = pipe()?;
     Ok((r.into_raw_fd(), w.into_raw_fd()))
 }
 
-fn read_raw(fd: RawFd, buf: &mut [u8]) -> nix::Result<usize> {
+fn read_raw(fd: RawFd, buf: &mut [u8]) -> rustix::io::Result<usize> {
+    // SAFETY: fd is valid at every call site (open pipe read end).
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    nix::unistd::read(borrowed, buf)
+    read(borrowed, buf)
 }
 
-fn write_raw(fd: RawFd, buf: &[u8]) -> nix::Result<usize> {
+fn write_raw(fd: RawFd, buf: &[u8]) -> rustix::io::Result<usize> {
+    // SAFETY: fd is valid at every call site (open pipe write end).
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    nix::unistd::write(borrowed, buf)
+    write(borrowed, buf)
 }
 
 fn open_write(path: &std::path::Path, append: bool) -> Result<RawFd> {
-    let mut opts = OpenOptions::new();
-    opts.write(true).create(true);
+    let mut opts = OFlags::WRONLY | OFlags::CREATE;
     if append {
-        opts.append(true);
+        opts |= OFlags::APPEND;
     } else {
-        opts.truncate(true);
+        opts |= OFlags::TRUNC;
     }
-    opts.mode(0o644);
-    Ok(opts.open(path)?.into_raw_fd())
+    let fd = fs::open(path, opts, Mode::RWXU | Mode::RGRP | Mode::ROTH)?;
+    Ok(fd.into_raw_fd())
 }
 
 fn open_read(path: &std::path::Path) -> Result<RawFd> {
-    Ok(OpenOptions::new().read(true).open(path)?.into_raw_fd())
+    let fd = fs::open(path, OFlags::RDONLY, Mode::empty())?;
+    Ok(fd.into_raw_fd())
 }
 
-fn dup_save(fd: RawFd) -> nix::Result<RawFd> {
-    let ret = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
-    if ret == -1 {
-        Err(nix::errno::Errno::last())
-    } else {
-        Ok(ret)
+fn dup_save(fd: RawFd) -> rustix::io::Result<RawFd> {
+    // SAFETY: fd is a valid, open descriptor at every call site.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let duped = fcntl_dupfd_cloexec(borrowed, 10)?;
+    Ok(duped.into_raw_fd())
+}
+
+// ---------------------------------------------------------------------------
+// Signal helpers
+// ---------------------------------------------------------------------------
+
+/// Build a `KernelSigaction` that sets a signal to SIG_IGN.
+#[inline]
+fn sig_ign_action() -> KernelSigaction {
+    KernelSigaction {
+        sa_handler_kernel: kernel_sig_ign(),
+        sa_flags: KernelSigactionFlags::empty(),
+        sa_mask: KernelSigSet::empty(),
+        ..Default::default()
     }
+}
+
+/// Build a `KernelSigaction` that restores a signal to SIG_DFL.
+#[inline]
+fn sig_dfl_action() -> KernelSigaction {
+    KernelSigaction {
+        sa_handler_kernel: KERNEL_SIG_DFL,
+        sa_flags: KernelSigactionFlags::empty(),
+        sa_mask: KernelSigSet::empty(),
+        ..Default::default()
+    }
+}
+
+/// Restore the five signals that child processes must reset before exec.
+///
+/// # Safety
+/// Must only be called immediately after `fork`, in the child, before any
+/// allocator or async-signal-unsafe code runs.
+#[inline]
+unsafe fn restore_child_signals() {
+    let dfl = sig_dfl_action();
+    // Errors are silently ignored — we are in a forked child and cannot
+    // meaningfully recover; the exec will simply inherit the parent handler.
+    let _ = unsafe { kernel_sigaction(Signal::TTOU, Some(dfl.clone())) };
+    let _ = unsafe { kernel_sigaction(Signal::TTIN, Some(dfl.clone())) };
+    let _ = unsafe { kernel_sigaction(Signal::TSTP, Some(dfl.clone())) };
+    let _ = unsafe { kernel_sigaction(Signal::INT, Some(dfl.clone())) };
+    let _ = unsafe { kernel_sigaction(Signal::QUIT, Some(dfl)) };
+    // Unblock all signals — the parent may have blocked some.
+    let _ = unsafe { kernel_sigprocmask(How::SETMASK, Some(&KernelSigSet::empty())) };
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +151,7 @@ pub struct ExitStatus(pub i32);
 impl ExitStatus {
     pub const SUCCESS: Self = Self(0);
     pub const FAILURE: Self = Self(1);
+
     #[inline]
     pub fn is_success(self) -> bool {
         self.0 == 0
@@ -141,30 +197,31 @@ impl JobTable {
         });
         id
     }
+
     fn remove(&mut self, id: usize) {
         self.jobs.retain(|j| j.id != id);
     }
+
     fn by_pgid_mut(&mut self, pgid: Pid) -> Option<&mut Job> {
         self.jobs.iter_mut().find(|j| j.pgid == pgid)
     }
+
     pub fn iter(&self) -> impl Iterator<Item = &Job> {
         self.jobs.iter()
     }
+
     pub fn reap_nonblocking(&mut self) {
-        loop {
-            match waitpid(
-                Pid::from_raw(-1),
-                Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED),
-            ) {
-                Ok(WaitStatus::Exited(pid, code)) => self.mark_pid_done(pid, ExitStatus(code)),
-                Ok(WaitStatus::Signaled(pid, sig, _)) => {
-                    self.mark_pid_done(pid, ExitStatus(128 + sig as i32))
-                }
-                Ok(WaitStatus::Stopped(pid, _)) => self.mark_pid_stopped(pid),
-                _ => break,
+        while let Ok(Some((pid, status))) = wait(WaitOptions::NOHANG | WaitOptions::UNTRACED) {
+            if let Some(code) = status.exit_status() {
+                self.mark_pid_done(pid, ExitStatus(code));
+            } else if let Some(sig) = status.terminating_signal() {
+                self.mark_pid_done(pid, ExitStatus(128 + sig));
+            } else if status.stopped() {
+                self.mark_pid_stopped(pid);
             }
         }
     }
+
     fn mark_pid_done(&mut self, pid: Pid, status: ExitStatus) {
         for job in &mut self.jobs {
             if job.pids.contains(&pid) {
@@ -172,6 +229,7 @@ impl JobTable {
             }
         }
     }
+
     fn mark_pid_stopped(&mut self, pid: Pid) {
         for job in &mut self.jobs {
             if job.pids.contains(&pid) {
@@ -182,15 +240,13 @@ impl JobTable {
 }
 
 // ---------------------------------------------------------------------------
-// Builtin dispatch — static sorted table, O(log n) binary search
-// INVARIANT: entries must stay sorted by name.
+// Builtin dispatch — static sorted table, O(log n) binary search.
+// INVARIANT: entries must remain in strict lexicographic order.
 // ---------------------------------------------------------------------------
 
 type BuiltinFn = fn(&mut Executor, &[&str]) -> Result<ExitStatus>;
 
 pub static BUILTINS: &[(&str, BuiltinFn)] = &[
-    // INVARIANT: must be in strict lexicographic (byte) order for binary_search.
-    // Verify with: entries.is_sorted_by_key(|(k,_)| k)
     (".", builtin_source),
     (":", builtin_colon),
     ("[", builtin_bracket),
@@ -237,7 +293,6 @@ pub struct Executor {
     pub jobs: JobTable,
     pub shell_pgid: Pid,
     pub last_status: ExitStatus,
-    /// True when running interactively — controls job control and alias expansion.
     pub interactive: bool,
 }
 
@@ -246,12 +301,15 @@ impl Executor {
         let shell_pgid = getpid();
 
         if interactive {
-            let _ = setpgid(shell_pgid, shell_pgid);
+            let _ = setpgid(Some(shell_pgid), Some(shell_pgid));
             let _ = tcsetpgrp_stdin(shell_pgid);
+            // SAFETY: we are in the main shell process, single-threaded at
+            // startup, and these signals are safe to ignore here.
             unsafe {
-                let _ = signal(Signal::SIGTTOU, SigHandler::SigIgn);
-                let _ = signal(Signal::SIGTTIN, SigHandler::SigIgn);
-                let _ = signal(Signal::SIGTSTP, SigHandler::SigIgn);
+                let ign = sig_ign_action();
+                let _ = kernel_sigaction(Signal::TTOU, Some(ign.clone()));
+                let _ = kernel_sigaction(Signal::TTIN, Some(ign.clone()));
+                let _ = kernel_sigaction(Signal::TSTP, Some(ign));
             }
         }
 
@@ -335,18 +393,18 @@ impl Executor {
             let pid = self.fork_command(cmd, prev_read, pipe_write, pgid)?;
 
             if let Some(existing) = pgid {
-                let _ = setpgid(pid, existing);
+                let _ = setpgid(Some(pid), Some(existing));
             } else {
                 pgid = Some(pid);
-                let _ = setpgid(pid, pid);
+                let _ = setpgid(Some(pid), Some(pid));
             }
 
             pids.push(pid);
             if let Some(fd) = pipe_write {
-                let _ = close_raw(fd);
+                close_raw(fd);
             }
             if let Some(fd) = prev_read {
-                let _ = close_raw(fd);
+                close_raw(fd);
             }
             prev_read = pipe_read;
         }
@@ -398,18 +456,18 @@ impl Executor {
             let pid = self.fork_command(cmd, prev_read, pipe_write, pgid)?;
 
             if let Some(existing) = pgid {
-                let _ = setpgid(pid, existing);
+                let _ = setpgid(Some(pid), Some(existing));
             } else {
                 pgid = Some(pid);
-                let _ = setpgid(pid, pid);
+                let _ = setpgid(Some(pid), Some(pid));
             }
 
             pids.push(pid);
             if let Some(fd) = pipe_write {
-                let _ = close_raw(fd);
+                close_raw(fd);
             }
             if let Some(fd) = prev_read {
-                let _ = close_raw(fd);
+                close_raw(fd);
             }
             prev_read = pipe_read;
         }
@@ -431,31 +489,27 @@ impl Executor {
         stdout_override: Option<RawFd>,
         pgid: Option<Pid>,
     ) -> Result<Pid> {
-        match unsafe { fork()? } {
-            ForkResult::Child => {
-                unsafe {
-                    let _ = signal(Signal::SIGTTOU, SigHandler::SigDfl);
-                    let _ = signal(Signal::SIGTTIN, SigHandler::SigDfl);
-                    let _ = signal(Signal::SIGTSTP, SigHandler::SigDfl);
-                    let _ = signal(Signal::SIGINT, SigHandler::SigDfl);
-                    let _ = signal(Signal::SIGQUIT, SigHandler::SigDfl);
-                }
-                let _ = sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None);
+        // SAFETY: fork is inherently unsafe; we follow the POSIX rules
+        // (async-signal-safe code only in the child until exec).
+        match unsafe { kernel_fork()? } {
+            Fork::Child(_) => {
+                // SAFETY: in child, before any allocations; safe to reset signals.
+                unsafe { restore_child_signals() };
                 let my_pid = getpid();
                 let group = pgid.unwrap_or(my_pid);
-                let _ = setpgid(my_pid, group);
+                let _ = setpgid(Some(my_pid), Some(group));
                 if let Some(fd) = stdin_override {
                     let _ = dup2_raw(fd, 0);
-                    let _ = close_raw(fd);
+                    close_raw(fd);
                 }
                 if let Some(fd) = stdout_override {
                     let _ = dup2_raw(fd, 1);
-                    let _ = close_raw(fd);
+                    close_raw(fd);
                 }
                 let status = self.exec_command_in_child(cmd);
                 std::process::exit(status);
             }
-            ForkResult::Parent { child } => Ok(child),
+            Fork::ParentOf(child) => Ok(child),
         }
     }
 
@@ -499,7 +553,6 @@ impl Executor {
             return 0;
         }
 
-        // Alias expansion — same logic as run_simple, needed for pipeline stages.
         let raw = &cmd_words[0];
         let (name, expanded_args): (String, Vec<String>) = if let Some(alias_val) =
             self.env.get_alias(raw)
@@ -528,7 +581,6 @@ impl Executor {
             };
         }
 
-        // Build full word list with alias-expanded name.
         let mut full_words = vec![name];
         full_words.extend_from_slice(&expanded_args);
         match self.do_exec(&full_words) {
@@ -575,7 +627,6 @@ impl Executor {
         let assign_count = words.iter().take_while(|w| is_assignment(w)).count();
         let (assignments, cmd_words) = words.split_at(assign_count);
 
-        // Pure assignment — no command.
         if cmd_words.is_empty() {
             let saved = self.save_fds(&[0, 1, 2])?;
             self.apply_redirects(&sc.redirects)?;
@@ -587,8 +638,6 @@ impl Executor {
             return Ok(ExitStatus::SUCCESS);
         }
 
-        // Alias expansion — active in all execution modes within this session.
-        // Non-recursive: the expanded command name is never re-expanded.
         let raw = &cmd_words[0];
         let (name, mut args): (String, Vec<String>) = if let Some(alias_val) =
             self.env.get_alias(raw)
@@ -608,10 +657,7 @@ impl Executor {
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let special = is_special_builtin(&name);
 
-        // Builtin.
         if let Some(f) = lookup_builtin(name.as_str()) {
-            // alias/unalias: expand each word fully (stripping quotes) but
-            // do NOT IFS-split, so `ll='ls -la'` arrives as one token "ll=ls -la".
             let no_split_args: Vec<String> = if matches!(name.as_str(), "alias" | "unalias") {
                 sc.words[assign_count + 1..]
                     .iter()
@@ -659,7 +705,6 @@ impl Executor {
             return result;
         }
 
-        // Shell function.
         if let Some(body) = self.env.get_function(&name).cloned() {
             let saved_vars: Vec<(String, Option<String>)> = assignments
                 .iter()
@@ -688,9 +733,6 @@ impl Executor {
             return Ok(status);
         }
 
-        // External command.
-        // Rebuild full word list with the (possibly alias-expanded) name.
-        // Use alias-expanded args (not cmd_words[1..]) so alias flags are included.
         let mut full_words = vec![name];
         full_words.extend_from_slice(&args);
         self.run_external_with_assignments(sc, &full_words, assignments)
@@ -702,19 +744,14 @@ impl Executor {
         words: &[String],
         assignments: &[String],
     ) -> Result<ExitStatus> {
-        match unsafe { fork()? } {
-            ForkResult::Child => {
-                unsafe {
-                    let _ = signal(Signal::SIGTTOU, SigHandler::SigDfl);
-                    let _ = signal(Signal::SIGTTIN, SigHandler::SigDfl);
-                    let _ = signal(Signal::SIGTSTP, SigHandler::SigDfl);
-                    let _ = signal(Signal::SIGINT, SigHandler::SigDfl);
-                    let _ = signal(Signal::SIGQUIT, SigHandler::SigDfl);
-                }
-                let _ = sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None);
+        // SAFETY: fork is inherently unsafe; async-signal-safe code only in child.
+        match unsafe { kernel_fork()? } {
+            Fork::Child(_) => {
+                // SAFETY: in child, before any allocations.
+                unsafe { restore_child_signals() };
                 if self.interactive {
                     let my_pid = getpid();
-                    let _ = setpgid(my_pid, my_pid);
+                    let _ = setpgid(Some(my_pid), Some(my_pid));
                 }
                 for a in assignments {
                     let (k, v) = a.split_once('=').unwrap();
@@ -732,9 +769,9 @@ impl Executor {
                     }
                 }
             }
-            ForkResult::Parent { child } => {
+            Fork::ParentOf(child) => {
                 if self.interactive {
-                    let _ = setpgid(child, child);
+                    let _ = setpgid(Some(child), Some(child));
                     let _ = tcsetpgrp_stdin(child);
                 }
                 let status = self.wait_for_pid(child)?;
@@ -754,13 +791,12 @@ impl Executor {
         if words.is_empty() {
             bail!("exec: no command");
         }
-        let name = CString::new(words[0].as_str()).map_err(|e| anyhow!(e))?;
         let argv: Vec<CString> = words
             .iter()
             .map(|w| CString::new(w.as_str()).map_err(|e| anyhow!(e)))
             .collect::<Result<_>>()?;
-        execvp(&name, &argv).map_err(|e| anyhow!("{}: {}", words[0], e))?;
-        unreachable!()
+        let errno = execvp_path(&argv);
+        bail!("{}: {}", words[0], errno);
     }
 
     // ------------------------------------------------------------------
@@ -851,12 +887,13 @@ impl Executor {
 
     fn run_group(&mut self, gc: &GroupCmd) -> Result<ExitStatus> {
         if gc.subshell {
-            match unsafe { fork()? } {
-                ForkResult::Child => {
+            // SAFETY: fork is inherently unsafe.
+            match unsafe { kernel_fork()? } {
+                Fork::Child(_) => {
                     let status = self.run_list(&gc.body).unwrap_or(ExitStatus::FAILURE);
                     std::process::exit(status.0);
                 }
-                ForkResult::Parent { child } => return self.wait_for_pid(child),
+                Fork::ParentOf(child) => return self.wait_for_pid(child),
             }
         }
         self.run_list(&gc.body)
@@ -880,17 +917,17 @@ impl Executor {
                 RedirectKind::Out => {
                     let fd = open_write(&self.word_to_path(&r.target)?, false)?;
                     dup2_raw(fd, r.fd)?;
-                    close_raw(fd)?;
+                    close_raw(fd);
                 }
                 RedirectKind::Append => {
                     let fd = open_write(&self.word_to_path(&r.target)?, true)?;
                     dup2_raw(fd, r.fd)?;
-                    close_raw(fd)?;
+                    close_raw(fd);
                 }
                 RedirectKind::In => {
                     let fd = open_read(&self.word_to_path(&r.target)?)?;
                     dup2_raw(fd, r.fd)?;
-                    close_raw(fd)?;
+                    close_raw(fd);
                 }
                 RedirectKind::FdOut => {
                     if let Word::Literal(s) = &r.target {
@@ -902,21 +939,19 @@ impl Executor {
                     let fd = open_write(&self.word_to_path(&r.target)?, false)?;
                     dup2_raw(fd, 1)?;
                     dup2_raw(fd, 2)?;
-                    close_raw(fd)?;
+                    close_raw(fd);
                 }
                 RedirectKind::HereString => {
-                    // Always expand — the body may contain $VAR, $(cmd), etc.
                     let raw = match &r.target {
                         Word::Literal(s) => s.clone(),
                         other => self.expand_word_to_string(other)?,
                     };
-                    // Expand each line individually preserving newlines.
                     let content = expand_heredoc_body(&raw, self)?;
                     let (read_fd, write_fd) = raw_pipe()?;
                     write_raw(write_fd, content.as_bytes())?;
-                    close_raw(write_fd)?;
+                    close_raw(write_fd);
                     dup2_raw(read_fd, 0)?;
-                    close_raw(read_fd)?;
+                    close_raw(read_fd);
                 }
             }
         }
@@ -948,7 +983,7 @@ impl Executor {
     fn restore_fds(&self, saved: Vec<(RawFd, RawFd)>) -> Result<()> {
         for (original, saved_fd) in saved {
             dup2_raw(saved_fd, original).map_err(|e| anyhow!(e))?;
-            close_raw(saved_fd).map_err(|e| anyhow!(e))?;
+            close_raw(saved_fd);
         }
         Ok(())
     }
@@ -959,18 +994,23 @@ impl Executor {
 
     fn wait_for_pid(&mut self, pid: Pid) -> Result<ExitStatus> {
         loop {
-            match waitpid(pid, Some(WaitPidFlag::WUNTRACED)) {
-                Ok(WaitStatus::Exited(_, code)) => return Ok(ExitStatus(code)),
-                Ok(WaitStatus::Signaled(_, sig, _)) => return Ok(ExitStatus(128 + sig as i32)),
-                Ok(WaitStatus::Stopped(stopped_pid, _)) => {
-                    if let Some(job) = self.jobs.by_pgid_mut(stopped_pid) {
-                        job.state = JobState::Stopped;
-                        eprintln!("\n[{}]+ Stopped\t{}", job.id, job.command);
+            match waitpid(Some(pid), WaitOptions::UNTRACED) {
+                Ok(Some((_, status))) => {
+                    if let Some(code) = status.exit_status() {
+                        return Ok(ExitStatus(code));
+                    } else if let Some(sig) = status.terminating_signal() {
+                        return Ok(ExitStatus(128 + sig));
+                    } else if status.stopped() {
+                        if let Some(job) = self.jobs.by_pgid_mut(pid) {
+                            job.state = JobState::Stopped;
+                            eprintln!("\n[{}]+ Stopped\t{}", job.id, job.command);
+                        }
+                        return Ok(ExitStatus(130));
                     }
-                    return Ok(ExitStatus(130));
+                    // continued or other — loop
                 }
-                Ok(_) => continue,
-                Err(nix::errno::Errno::EINTR) => continue,
+                Ok(None) => continue, // NOHANG would return None; with UNTRACED this means interrupted
+                Err(e) if e == Errno::INTR => continue,
                 Err(e) => return Err(anyhow!(e)),
             }
         }
@@ -994,7 +1034,6 @@ impl Executor {
     pub(crate) fn expand_word_to_string(&self, word: &Word) -> Result<String> {
         match word {
             Word::Literal(s) => {
-                // Tilde expansion on bare literals starting with `~`.
                 if s.starts_with('~') {
                     Ok(expand_tilde(s, &self.env))
                 } else {
@@ -1075,19 +1114,18 @@ impl Executor {
         }
     }
 
-    /// Expand a `Command` node as a command substitution — used by the
-    /// heredoc body expander which already has a parsed `Command`.
     pub(crate) fn expand_cmd_sub_cmd(&mut self, cmd: &Command) -> Result<String> {
         self.expand_cmd_sub(cmd)
     }
 
     fn expand_cmd_sub(&self, cmd: &Command) -> Result<String> {
         let (read_fd, write_fd) = raw_pipe()?;
-        match unsafe { fork()? } {
-            ForkResult::Child => {
-                close_raw(read_fd)?;
-                dup2_raw(write_fd, 1)?;
-                close_raw(write_fd)?;
+        // SAFETY: fork is inherently unsafe.
+        match unsafe { kernel_fork()? } {
+            Fork::Child(_) => {
+                close_raw(read_fd);
+                let _ = dup2_raw(write_fd, 1);
+                close_raw(write_fd);
                 let mut child_exec =
                     Executor::new(self.env.clone(), false).expect("executor init in cmd sub");
                 let status = child_exec
@@ -1095,20 +1133,20 @@ impl Executor {
                     .unwrap_or(ExitStatus::FAILURE);
                 std::process::exit(status.0);
             }
-            ForkResult::Parent { child } => {
-                close_raw(write_fd)?;
+            Fork::ParentOf(child) => {
+                close_raw(write_fd);
                 let mut output = Vec::new();
                 let mut buf = [0u8; 512];
                 loop {
                     match read_raw(read_fd, &mut buf) {
                         Ok(0) => break,
                         Ok(n) => output.extend_from_slice(&buf[..n]),
-                        Err(nix::errno::Errno::EINTR) => continue,
+                        Err(e) if e == Errno::INTR => continue,
                         Err(e) => return Err(anyhow!(e)),
                     }
                 }
-                close_raw(read_fd)?;
-                let _ = waitpid(child, None);
+                close_raw(read_fd);
+                let _ = waitpid(Some(child), WaitOptions::empty());
                 Ok(String::from_utf8_lossy(&output)
                     .trim_end_matches('\n')
                     .to_owned())
@@ -1166,9 +1204,6 @@ fn builtin_alias(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
         return Ok(ExitStatus::SUCCESS);
     }
     for arg in args {
-        // An arg like `ll=ls -la` arrives here already with quotes stripped
-        // and the value intact as one string (the lexer consumed the quotes).
-        // Split only on the FIRST `=` — everything after is the value.
         if let Some((k, v)) = arg.split_once('=') {
             exec.env.set_alias(k.to_owned(), v.to_owned());
         } else {
@@ -1390,17 +1425,23 @@ fn builtin_fg(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
         .map(|j| (j.pgid, j.command.clone()))
         .ok_or_else(|| anyhow!("fg: no such job: {id}"))?;
     eprintln!("{cmd}");
-    nix::sys::signal::killpg(pgid, Signal::SIGCONT)?;
+    kill_process_group(pgid, Signal::CONT)?;
     let _ = tcsetpgrp_stdin(pgid);
     let status = loop {
-        match waitpid(Pid::from_raw(-pgid.as_raw()), Some(WaitPidFlag::WUNTRACED)) {
-            Ok(WaitStatus::Exited(_, code)) => break ExitStatus(code),
-            Ok(WaitStatus::Signaled(_, sig, _)) => break ExitStatus(128 + sig as i32),
-            Ok(WaitStatus::Stopped(..)) => {
-                let _ = tcsetpgrp_stdin(exec.shell_pgid);
-                break ExitStatus(130);
+        match waitpgid(pgid, WaitOptions::UNTRACED) {
+            Ok(Some((_, ws))) => {
+                if let Some(code) = ws.exit_status() {
+                    break ExitStatus(code);
+                } else if let Some(sig) = ws.terminating_signal() {
+                    break ExitStatus(128 + sig);
+                } else if ws.stopped() {
+                    let _ = tcsetpgrp_stdin(exec.shell_pgid);
+                    break ExitStatus(130);
+                }
+                // continued — keep waiting
             }
-            Ok(_) | Err(nix::errno::Errno::EINTR) => continue,
+            Ok(None) => continue,
+            Err(e) if e == Errno::INTR => continue,
             Err(e) => return Err(anyhow!(e)),
         }
     };
@@ -1420,7 +1461,7 @@ fn builtin_bg(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
         .find(|j| j.id == id)
         .map(|j| j.pgid)
         .ok_or_else(|| anyhow!("bg: no such job: {id}"))?;
-    nix::sys::signal::killpg(pgid, Signal::SIGCONT)?;
+    kill_process_group(pgid, Signal::CONT)?;
     eprintln!("[{id}]+ {pgid} &");
     Ok(ExitStatus::SUCCESS)
 }
@@ -1429,14 +1470,14 @@ fn builtin_kill(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
     if args.is_empty() {
         bail!("kill: usage: kill [-signal] pid|%job");
     }
-    let mut sig = Signal::SIGTERM;
+    let mut sig = Signal::TERM;
     let mut targets = args;
     if args[0].starts_with('-') {
         let sig_str = args[0].trim_start_matches('-');
         sig = sig_str
             .parse::<i32>()
             .ok()
-            .and_then(|n| Signal::try_from(n).ok())
+            .and_then(Signal::from_named_raw)
             .or_else(|| parse_signal_name(sig_str))
             .ok_or_else(|| anyhow!("kill: invalid signal: {sig_str}"))?;
         targets = &args[1..];
@@ -1452,13 +1493,12 @@ fn builtin_kill(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
                 .map(|j| j.pgid)
                 .ok_or_else(|| anyhow!("kill: no such job: {id}"))?
         } else {
-            Pid::from_raw(
-                target
-                    .parse()
-                    .map_err(|_| anyhow!("kill: invalid pid: {target}"))?,
-            )
+            let raw: i32 = target
+                .parse()
+                .map_err(|_| anyhow!("kill: invalid pid: {target}"))?;
+            Pid::from_raw(raw).ok_or_else(|| anyhow!("kill: invalid pid: {target}"))?
         };
-        nix::sys::signal::kill(pid, sig)?;
+        kill_process(pid, sig)?;
     }
     Ok(ExitStatus::SUCCESS)
 }
@@ -1467,7 +1507,69 @@ fn builtin_kill(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Tilde expansion — `~` → $HOME, `~user` not supported (uncommon, skip).
+// ---------------------------------------------------------------------------
+// execvp — PATH-searching exec, built on rustix::runtime::execve.
+//
+// If `argv[0]` contains a `/` it is used as an absolute/relative path directly.
+// Otherwise every directory in `$PATH` is tried in order.  The function only
+// returns on total failure (no candidate succeeded); the last `Errno` is
+// returned so the caller can format an error message.
+// ---------------------------------------------------------------------------
+
+fn execvp_path(argv: &[CString]) -> Errno {
+    // Build the null-terminated argv pointer array that execve expects.
+    // argv_ptrs ends with a null sentinel.
+    let mut argv_ptrs: Vec<*const u8> = argv.iter().map(|s| s.as_ptr().cast::<u8>()).collect();
+    argv_ptrs.push(std::ptr::null());
+
+    // Collect the current environment the same way.
+    let env_cstrings: Vec<CString> = std::env::vars_os()
+        .filter_map(|(k, v)| {
+            let mut kv = k.into_encoded_bytes();
+            kv.push(b'=');
+            kv.extend(v.into_encoded_bytes());
+            CString::new(kv).ok()
+        })
+        .collect();
+    let mut envp_ptrs: Vec<*const u8> = env_cstrings
+        .iter()
+        .map(|s| s.as_ptr().cast::<u8>())
+        .collect();
+    envp_ptrs.push(std::ptr::null());
+
+    let name = &argv[0];
+    let name_bytes = name.to_bytes();
+
+    // If the name contains a slash, exec it directly — no PATH search.
+    if name_bytes.contains(&b'/') {
+        // SAFETY: argv_ptrs and envp_ptrs are null-terminated arrays of valid
+        // pointers into CString data that outlive this call.
+        return unsafe { execve(name, argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
+    }
+
+    // PATH search.
+    let path_var =
+        std::env::var_os("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
+
+    let mut last_err = Errno::NOENT;
+    for dir in std::env::split_paths(&path_var) {
+        let mut full = dir;
+        full.push(std::str::from_utf8(name_bytes).unwrap_or(""));
+        if let Ok(candidate) = CString::new(full.as_os_str().as_encoded_bytes()) {
+            // Temporarily swap argv[0] for the resolved path.
+            argv_ptrs[0] = candidate.as_ptr().cast::<u8>();
+            // SAFETY: same as above.
+            let err = unsafe { execve(&candidate, argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
+            // ENOENT / ENOTDIR → keep searching; anything else → stop.
+            if err != Errno::NOENT && err != Errno::NOTDIR {
+                return err;
+            }
+            last_err = err;
+        }
+    }
+    last_err
+}
+
 pub fn expand_tilde(s: &str, env: &Env) -> String {
     if s == "~" {
         return env.get("HOME").unwrap_or_else(|| "/".into());
@@ -1479,9 +1581,7 @@ pub fn expand_tilde(s: &str, env: &Env) -> String {
     s.to_owned()
 }
 
-/// Glob expansion — handles path prefixes like `src/*.rs`.
 fn glob_expand(pattern: &str) -> Vec<String> {
-    // Split into directory prefix and filename pattern.
     let (dir, file_pat) = match pattern.rfind('/') {
         Some(pos) => (&pattern[..pos], &pattern[pos + 1..]),
         None => (".", pattern),
@@ -1506,15 +1606,8 @@ fn glob_expand(pattern: &str) -> Vec<String> {
     results
 }
 
-/// Expand variables and command substitutions inside a heredoc body.
-/// Each `$VAR` / `$(cmd)` in the raw string is expanded; the overall
-/// newline structure is preserved.
 fn expand_heredoc_body(body: &str, exec: &Executor) -> Result<String> {
-    // Parse the body as a double-quoted-like word so the existing
-    // expand_word machinery handles $VAR and $() correctly.
     use crate::parser::parse;
-    // Wrap in a no-op echo to get expansion, then discard the command.
-    // Simpler: just do a lightweight variable substitution inline.
     let mut result = String::with_capacity(body.len());
     let mut chars = body.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1532,7 +1625,6 @@ fn expand_heredoc_body(body: &str, exec: &Executor) -> Result<String> {
                     result.push_str(&exec.expand_var(&var));
                 }
                 Some('(') => {
-                    // Command substitution — collect balanced parens.
                     chars.next();
                     let mut depth = 1usize;
                     let mut cmd_src = String::new();
@@ -1548,10 +1640,8 @@ fn expand_heredoc_body(body: &str, exec: &Executor) -> Result<String> {
                         cmd_src.push(ch);
                     }
                     if let Ok(program) = parse(&cmd_src) {
-                        // Run in a sub-executor with the same env.
                         let mut sub = Executor::new(exec.env.clone(), false)
                             .unwrap_or_else(|_| panic!("sub executor"));
-                        // Capture stdout via expand_cmd_sub path — reuse the AST.
                         if let Some(aol) = program.body.into_iter().next()
                             && let Some(item) = aol.items.into_iter().next()
                             && let Some(cmd) = item.command.commands.into_iter().next()
@@ -1566,8 +1656,6 @@ fn expand_heredoc_body(body: &str, exec: &Executor) -> Result<String> {
                         chars.next();
                         result.push_str(&exec.expand_var(&c2.to_string()));
                     } else {
-                        // Collect the full identifier using while-let to avoid
-                        // mixing for-loop borrows with peek().
                         while matches!(chars.peek(), Some(ch) if ch.is_ascii_alphanumeric() || *ch == '_')
                         {
                             var.push(chars.next().unwrap());
@@ -1581,7 +1669,6 @@ fn expand_heredoc_body(body: &str, exec: &Executor) -> Result<String> {
             result.push(c);
         }
     }
-    // Ensure trailing newline.
     if !result.ends_with('\n') {
         result.push('\n');
     }
@@ -1589,7 +1676,6 @@ fn expand_heredoc_body(body: &str, exec: &Executor) -> Result<String> {
 }
 
 fn builtin_bracket(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
-    // [ expr ] — last arg must be ]
     if args.last() != Some(&"]") {
         bail!("[: missing closing ]");
     }
@@ -1597,7 +1683,6 @@ fn builtin_bracket(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
 }
 
 fn builtin_double_bracket(_exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
-    // args includes the trailing "]]" — strip it.
     if args.last() != Some(&"]]") {
         bail!("[[: missing closing ]]");
     }
@@ -1610,10 +1695,7 @@ fn builtin_double_bracket(_exec: &mut Executor, args: &[&str]) -> Result<ExitSta
     })
 }
 
-/// Evaluate `[[ ]]` expressions — like eval_test but handles `&&` and `||`
-/// as infix operators (they arrive as string tokens from the parser).
 fn eval_double_bracket(args: &[&str]) -> Option<bool> {
-    // Split on top-level || first (lowest precedence).
     let mut depth = 0usize;
     for (i, &tok) in args.iter().enumerate() {
         match tok {
@@ -1629,7 +1711,6 @@ fn eval_double_bracket(args: &[&str]) -> Option<bool> {
             _ => {}
         }
     }
-    // Split on top-level &&.
     depth = 0;
     for (i, &tok) in args.iter().enumerate() {
         match tok {
@@ -1645,7 +1726,6 @@ fn eval_double_bracket(args: &[&str]) -> Option<bool> {
             _ => {}
         }
     }
-    // No &&/|| at top level — fall through to standard test evaluator.
     eval_test(args)
 }
 
@@ -1662,7 +1742,7 @@ fn builtin_read(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
     let var = args.first().copied().unwrap_or("REPLY");
     let mut line = String::new();
     match std::io::stdin().read_line(&mut line) {
-        Ok(0) => return Ok(ExitStatus::FAILURE), // EOF
+        Ok(0) => return Ok(ExitStatus::FAILURE),
         Ok(_) => {}
         Err(e) => bail!("read: {e}"),
     }
@@ -1686,8 +1766,6 @@ fn builtin_shift(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
 // test / [ / [[ expression evaluator
 // ---------------------------------------------------------------------------
 
-/// Evaluate a test expression given as a slice of string tokens.
-/// Returns `true` for success (exit 0), `false` for failure (exit 1).
 fn eval_test(args: &[&str]) -> Option<bool> {
     let (result, rest): (bool, &[&str]) = parse_or(args)?;
     if !rest.is_empty() {
@@ -1696,7 +1774,6 @@ fn eval_test(args: &[&str]) -> Option<bool> {
     Some(result)
 }
 
-// or-expression: expr (-o expr)*
 fn parse_or<'a>(args: &'a [&'a str]) -> Option<(bool, &'a [&'a str])> {
     let (mut val, mut rest) = parse_and(args)?;
     while rest.first() == Some(&"-o") {
@@ -1707,7 +1784,6 @@ fn parse_or<'a>(args: &'a [&'a str]) -> Option<(bool, &'a [&'a str])> {
     Some((val, rest))
 }
 
-// and-expression: expr (-a expr)*
 fn parse_and<'a>(args: &'a [&'a str]) -> Option<(bool, &'a [&'a str])> {
     let (mut val, mut rest) = parse_not(args)?;
     while rest.first() == Some(&"-a") {
@@ -1718,13 +1794,11 @@ fn parse_and<'a>(args: &'a [&'a str]) -> Option<(bool, &'a [&'a str])> {
     Some((val, rest))
 }
 
-// not-expression: ! expr | primary
 fn parse_not<'a>(args: &'a [&'a str]) -> Option<(bool, &'a [&'a str])> {
     if args.first() == Some(&"!") {
         let (val, rest) = parse_not(&args[1..])?;
         return Some((!val, rest));
     }
-    // parenthesised group for [[ ]]
     if args.first() == Some(&"(") {
         let close = args.iter().rposition(|&a| a == ")")?;
         let inner = &args[1..close];
@@ -1734,12 +1808,10 @@ fn parse_not<'a>(args: &'a [&'a str]) -> Option<(bool, &'a [&'a str])> {
     parse_primary(args)
 }
 
-// primary: unary-op arg | arg binary-op arg | arg
 fn parse_primary<'a>(args: &'a [&'a str]) -> Option<(bool, &'a [&'a str])> {
     match args {
         [] => Some((false, &[])),
 
-        // ── Unary file tests ──────────────────────────────────────────────
         [op, path, rest @ ..]
             if matches!(
                 *op,
@@ -1760,7 +1832,7 @@ fn parse_primary<'a>(args: &'a [&'a str]) -> Option<(bool, &'a [&'a str])> {
                     | "-k"
             ) =>
         {
-            use std::fs;
+            use std::fs as sfs;
             use std::os::unix::fs::MetadataExt;
             let p = std::path::Path::new(path);
             let val = match *op {
@@ -1771,45 +1843,30 @@ fn parse_primary<'a>(args: &'a [&'a str]) -> Option<(bool, &'a [&'a str])> {
                     .symlink_metadata()
                     .map(|m| m.file_type().is_symlink())
                     .unwrap_or(false),
-                "-r" => fs::metadata(p)
-                    .map(|m| {
-                        !m.permissions().readonly()
-                            || unsafe {
-                                libc::access(
-                                    std::ffi::CString::new(*path).unwrap().as_ptr(),
-                                    libc::R_OK,
-                                ) == 0
-                            }
-                    })
-                    .unwrap_or(false),
-                "-w" => unsafe {
-                    !p.exists()
-                        || libc::access(std::ffi::CString::new(*path).unwrap().as_ptr(), libc::W_OK)
-                            == 0
-                },
-                "-x" => unsafe {
-                    libc::access(std::ffi::CString::new(*path).unwrap().as_ptr(), libc::X_OK) == 0
-                },
-                "-s" => fs::metadata(p).map(|m| m.size() > 0).unwrap_or(false),
-                "-b" => fs::metadata(p)
+                // rustix::fs::access — safe, no libc or unsafe needed.
+                "-r" => fs::access(p, Access::READ_OK).is_ok(),
+                "-w" => fs::access(p, Access::WRITE_OK).is_ok(),
+                "-x" => fs::access(p, Access::EXEC_OK).is_ok(),
+                "-s" => sfs::metadata(p).map(|m| m.size() > 0).unwrap_or(false),
+                "-b" => sfs::metadata(p)
                     .map(|m| m.file_type().is_block_device())
                     .unwrap_or(false),
-                "-c" => fs::metadata(p)
+                "-c" => sfs::metadata(p)
                     .map(|m| m.file_type().is_char_device())
                     .unwrap_or(false),
-                "-p" => fs::metadata(p)
+                "-p" => sfs::metadata(p)
                     .map(|m| m.file_type().is_fifo())
                     .unwrap_or(false),
-                "-S" => fs::metadata(p)
+                "-S" => sfs::metadata(p)
                     .map(|m| m.file_type().is_socket())
                     .unwrap_or(false),
-                "-u" => fs::metadata(p)
+                "-u" => sfs::metadata(p)
                     .map(|m| m.mode() & 0o4000 != 0)
                     .unwrap_or(false),
-                "-g" => fs::metadata(p)
+                "-g" => sfs::metadata(p)
                     .map(|m| m.mode() & 0o2000 != 0)
                     .unwrap_or(false),
-                "-k" => fs::metadata(p)
+                "-k" => sfs::metadata(p)
                     .map(|m| m.mode() & 0o1000 != 0)
                     .unwrap_or(false),
                 _ => false,
@@ -1817,23 +1874,28 @@ fn parse_primary<'a>(args: &'a [&'a str]) -> Option<(bool, &'a [&'a str])> {
             Some((val, rest))
         }
 
-        // ── Unary string tests ────────────────────────────────────────────
         ["-z", s, rest @ ..] => Some((s.is_empty(), rest)),
         ["-n", s, rest @ ..] => Some((!s.is_empty(), rest)),
+
+        // -t fd  — test whether fd is a terminal.
         ["-t", fd_str, rest @ ..] => {
-            let fd: i32 = fd_str.parse().unwrap_or(-1);
-            let val = unsafe { libc::isatty(fd) == 1 };
+            let val = fd_str
+                .parse::<RawFd>()
+                .map(|fd| {
+                    // SAFETY: we only borrow the fd for the duration of isatty;
+                    // the descriptor is not closed or otherwise manipulated.
+                    isatty(unsafe { BorrowedFd::borrow_raw(fd) })
+                })
+                .unwrap_or(false);
             Some((val, rest))
         }
 
-        // ── Binary string tests ───────────────────────────────────────────
         [a, "=", b, rest @ ..] => Some((a == b, rest)),
         [a, "==", b, rest @ ..] => Some((a == b, rest)),
         [a, "!=", b, rest @ ..] => Some((a != b, rest)),
         [a, "<", b, rest @ ..] => Some((a < b, rest)),
         [a, ">", b, rest @ ..] => Some((a > b, rest)),
 
-        // ── Binary integer tests ──────────────────────────────────────────
         [a, op, b, rest @ ..] if matches!(*op, "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge") => {
             let ai: i64 = a.parse().unwrap_or(0);
             let bi: i64 = b.parse().unwrap_or(0);
@@ -1849,7 +1911,6 @@ fn parse_primary<'a>(args: &'a [&'a str]) -> Option<(bool, &'a [&'a str])> {
             Some((val, rest))
         }
 
-        // ── Bare string (non-empty = true) ────────────────────────────────
         [s, rest @ ..] => Some((!s.is_empty(), rest)),
     }
 }
@@ -1907,18 +1968,21 @@ fn unescape(s: &str) -> String {
     out
 }
 
+/// Parse a signal name string (e.g. "HUP", "SIGHUP") into a rustix `Signal`.
 fn parse_signal_name(s: &str) -> Option<Signal> {
-    match s.to_uppercase().as_str() {
-        "HUP" | "SIGHUP" => Some(Signal::SIGHUP),
-        "INT" | "SIGINT" => Some(Signal::SIGINT),
-        "QUIT" | "SIGQUIT" => Some(Signal::SIGQUIT),
-        "KILL" | "SIGKILL" => Some(Signal::SIGKILL),
-        "TERM" | "SIGTERM" => Some(Signal::SIGTERM),
-        "STOP" | "SIGSTOP" => Some(Signal::SIGSTOP),
-        "CONT" | "SIGCONT" => Some(Signal::SIGCONT),
-        "TSTP" | "SIGTSTP" => Some(Signal::SIGTSTP),
-        "USR1" | "SIGUSR1" => Some(Signal::SIGUSR1),
-        "USR2" | "SIGUSR2" => Some(Signal::SIGUSR2),
+    let upper = s.to_uppercase();
+    let bare = upper.strip_prefix("SIG").unwrap_or(upper.as_str());
+    match bare {
+        "HUP" => Some(Signal::HUP),
+        "INT" => Some(Signal::INT),
+        "QUIT" => Some(Signal::QUIT),
+        "KILL" => Some(Signal::KILL),
+        "TERM" => Some(Signal::TERM),
+        "STOP" => Some(Signal::STOP),
+        "CONT" => Some(Signal::CONT),
+        "TSTP" => Some(Signal::TSTP),
+        "USR1" => Some(Signal::USR1),
+        "USR2" => Some(Signal::USR2),
         _ => None,
     }
 }
