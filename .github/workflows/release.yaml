@@ -11,22 +11,7 @@ permissions:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        include:
-          # Linux x86_64 (Arch Linux compatible)
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            artifact_name: swagsh-x86_64-unknown-linux-gnu
-            archive_name: swagsh-${{ github.ref_name }}-x86_64-linux.tar.gz
-
-          # macOS Apple Silicon
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: swagsh-aarch64-apple-darwin
-            archive_name: swagsh-${{ github.ref_name }}-aarch64-macos.tar.gz
-
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout code
@@ -35,34 +20,34 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          target: x86_64-unknown-linux-gnu
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target x86_64-unknown-linux-gnu
 
       - name: Prepare and compress binary
         run: |
           mkdir -p artifacts
-          cp target/${{ matrix.target }}/release/swagsh artifacts/${{ matrix.artifact_name }}
-          chmod +x artifacts/${{ matrix.artifact_name }}
-
-          # Create compressed archive with clean name
+          
+          cp target/x86_64-unknown-linux-gnu/release/swagsh artifacts/swagsh
+          chmod +x artifacts/swagsh
+          
           cd artifacts
-          tar -czf ${{ matrix.archive_name }} ${{ matrix.artifact_name }}
+          tar -czf swagsh-${{ github.ref_name }}-x86_64-linux.tar.gz swagsh
           ls -lh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact_name }}
-          path: artifacts/${{ matrix.archive_name }}
+          name: swagsh-x86_64-unknown-linux-gnu
+          path: artifacts/swagsh-${{ github.ref_name }}-x86_64-linux.tar.gz
 
   release:
     needs: build
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download all built archives
+      - name: Download built archive
         uses: actions/download-artifact@v8
         with:
           path: artifacts
@@ -74,6 +59,4 @@ jobs:
           name: swagsh ${{ github.ref_name }}
           draft: true
           generate_release_notes: true
-          files: |
-            artifacts/swagsh-x86_64-unknown-linux-gnu/swagsh-${{ github.ref_name }}-x86_64-linux.tar.gz
-            artifacts/swagsh-aarch64-apple-darwin/swagsh-${{ github.ref_name }}-aarch64-macos.tar.gz
+          files: artifacts/swagsh-x86_64-unknown-linux-gnu/swagsh-${{ github.ref_name }}-x86_64-linux.tar.gz
