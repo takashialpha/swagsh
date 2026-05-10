@@ -74,20 +74,20 @@ Full usage reference: [wiki/Usage](https://github.com/takashialpha/swagsh/wiki/U
 
 ## TODO
 
-- [ ] Multiline REPL (`PS2`)
-- [ ] `local`, `return`, `eval`, `trap`
-- [ ] Fix `$(...)` + shell expansions
-- [ ] Proper quoting / `$@` semantics
-- [ ] Arithmetic + parameter expansion
-- [ ] `[[ =~ ]]`, `set -e/-u/-x`
-- [ ] Job control (`wait`, `disown`, `SIGCHLD`)
-- [ ] rc/profile sourcing + history UX
-- [ ] PATH cache + fewer `fork()`
-- [ ] Fix heredoc / alias / pipeline quirks
-- [ ] Deeper testing to see what's missing
-- [ ] Optimize it for even better performance
-- [ ] check Code/Syntax correctness further than clippy
-- [ ] Improve UX/UI
+- Multiline REPL (`PS2`)
+- `local`, `return`, `eval`, `trap`
+- Fix `$(...)` + shell expansions
+- Proper quoting / `$@` semantics
+- Arithmetic + parameter expansion
+- `[[ =~ ]]`, `set -e/-u/-x`
+- Job control (`wait`, `disown`, `SIGCHLD`)
+- rc/profile sourcing + history UX
+- PATH cache + fewer `fork()`
+- Fix heredoc / alias / pipeline quirks
+- Deeper testing to see what's missing
+- Optimize it for even better performance
+- Check Code/Syntax correctness further than clippy
+- Improve UX/UI
 
 ## Wiki
 
