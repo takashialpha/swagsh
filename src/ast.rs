@@ -161,3 +161,32 @@ pub struct AndOrList {
 pub struct Program {
     pub body: Vec<AndOrList>,
 }
+
+impl Program {
+    /// Collapse a parsed program into a single `Command` for use in `$()` and
+    /// backtick substitutions. A simple single-statement body is unwrapped to
+    /// the inner `Command` directly; anything else becomes a subshell group.
+    pub fn into_command(mut self) -> Command {
+        if self.body.len() == 1
+            && self.body[0].items.len() == 1
+            && !self.body[0].is_async
+        {
+            let pl = self
+                .body
+                .swap_remove(0)
+                .items
+                .swap_remove(0)
+                .command;
+            if pl.commands.len() == 1 {
+                pl.commands.into_iter().next().unwrap()
+            } else {
+                Command::Pipeline(pl)
+            }
+        } else {
+            Command::Group(GroupCmd {
+                body: self.body,
+                subshell: true,
+            })
+        }
+    }
+}

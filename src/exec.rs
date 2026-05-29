@@ -2,7 +2,7 @@ use std::ffi::CString;
 use std::os::fd::{FromRawFd, IntoRawFd};
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow, bail};
+use color_eyre::eyre::{Report, Result, bail, eyre};
 use rustix::fd::{BorrowedFd, OwnedFd, RawFd};
 use rustix::fs::{self, Access, FileTypeExt, Mode, OFlags};
 use rustix::io::{Errno, dup2, fcntl_dupfd_cloexec, read, write};
@@ -80,7 +80,11 @@ fn open_write(path: &std::path::Path, append: bool) -> Result<RawFd> {
     } else {
         opts |= OFlags::TRUNC;
     }
-    let fd = fs::open(path, opts, Mode::RWXU | Mode::RGRP | Mode::ROTH)?;
+    let fd = fs::open(
+        path,
+        opts,
+        Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+    )?;
     Ok(fd.into_raw_fd())
 }
 
@@ -414,6 +418,13 @@ impl Executor {
             let _ = tcsetpgrp_stdin(pgid);
         }
 
+        // Register the foreground pipeline so wait_for_pid can find the job on Ctrl+Z.
+        let job_id = if self.interactive {
+            Some(self.jobs.add(pgid, pids.clone(), format!("pipeline ({n} stages)")))
+        } else {
+            None
+        };
+
         let mut last_status = ExitStatus::SUCCESS;
         for pid in &pids {
             last_status = self.wait_for_pid(*pid)?;
@@ -421,6 +432,10 @@ impl Executor {
 
         if self.interactive {
             let _ = tcsetpgrp_stdin(self.shell_pgid);
+            // Remove the job entry when the pipeline finishes normally (not stopped).
+            if last_status.0 != 130 && let Some(id) = job_id {
+                self.jobs.remove(id);
+            }
         }
 
         if pipeline.negated {
@@ -516,13 +531,14 @@ impl Executor {
     fn exec_command_in_child(&mut self, cmd: &Command) -> i32 {
         match cmd {
             Command::Simple(sc) => self.exec_simple_in_child(sc),
-            Command::Group(g) => match self.run_group(g) {
-                Ok(s) => s.0,
-                Err(_) => 1,
-            },
             other => match self.run_command(other, None, None) {
                 Ok(s) => s.0,
-                Err(_) => 1,
+                Err(e) => {
+                    if !is_break(&e) && !is_continue(&e) {
+                        eprintln!("swagsh: {e}");
+                    }
+                    1
+                }
             },
         }
     }
@@ -692,10 +708,12 @@ impl Executor {
             };
 
             let saved_fds = self.save_fds(&[0, 1, 2])?;
-            self.apply_redirects(&sc.redirects)?;
-            let result = f(self, &effective_arg_refs);
-            self.restore_fds(saved_fds)?;
-
+            let result = if let Err(e) = self.apply_redirects(&sc.redirects) {
+                Err(e)
+            } else {
+                f(self, &effective_arg_refs)
+            };
+            let _ = self.restore_fds(saved_fds);
             for (k, old) in saved_vars {
                 match old {
                     Some(v) => self.env.set(&k, v),
@@ -719,18 +737,20 @@ impl Executor {
             let old_args = self.env.positional_args().to_vec();
             self.env.set_positional_args(args);
             let saved_fds = self.save_fds(&[0, 1, 2])?;
-            self.apply_redirects(&sc.redirects)?;
-            let status = self.run_command(&body, None, None)?;
-            self.restore_fds(saved_fds)?;
+            let result = if let Err(e) = self.apply_redirects(&sc.redirects) {
+                Err(e)
+            } else {
+                self.run_command(&body, None, None)
+            };
+            let _ = self.restore_fds(saved_fds);
             self.env.set_positional_args(old_args);
-
             for (k, old) in saved_vars {
                 match old {
                     Some(v) => self.env.set(&k, v),
                     None => self.env.unset(&k),
                 }
             }
-            return Ok(status);
+            return result;
         }
 
         let mut full_words = vec![name];
@@ -774,9 +794,18 @@ impl Executor {
                     let _ = setpgid(Some(child), Some(child));
                     let _ = tcsetpgrp_stdin(child);
                 }
+                // Register so wait_for_pid can find the job on Ctrl+Z.
+                let job_id = if self.interactive {
+                    Some(self.jobs.add(child, vec![child], words.join(" ")))
+                } else {
+                    None
+                };
                 let status = self.wait_for_pid(child)?;
                 if self.interactive {
                     let _ = tcsetpgrp_stdin(self.shell_pgid);
+                    if status.0 != 130 && let Some(id) = job_id {
+                        self.jobs.remove(id);
+                    }
                 }
                 Ok(status)
             }
@@ -793,7 +822,7 @@ impl Executor {
         }
         let argv: Vec<CString> = words
             .iter()
-            .map(|w| CString::new(w.as_str()).map_err(|e| anyhow!(e)))
+            .map(|w| CString::new(w.as_str()).map_err(|e| eyre!(e)))
             .collect::<Result<_>>()?;
         let errno = execvp_path(&argv);
         bail!("{}: {}", words[0], errno);
@@ -911,7 +940,7 @@ impl Executor {
     // Redirections
     // ------------------------------------------------------------------
 
-    fn apply_redirects(&self, redirects: &[Redirect]) -> Result<()> {
+    fn apply_redirects(&mut self, redirects: &[Redirect]) -> Result<()> {
         for r in redirects {
             match &r.kind {
                 RedirectKind::Out => {
@@ -931,7 +960,7 @@ impl Executor {
                 }
                 RedirectKind::FdOut => {
                     if let Word::Literal(s) = &r.target {
-                        let target_fd: RawFd = s.parse().map_err(|_| anyhow!("invalid fd: {s}"))?;
+                        let target_fd: RawFd = s.parse().map_err(|_| eyre!("invalid fd: {s}"))?;
                         dup2_raw(target_fd, r.fd)?;
                     }
                 }
@@ -948,8 +977,34 @@ impl Executor {
                     };
                     let content = expand_heredoc_body(&raw, self)?;
                     let (read_fd, write_fd) = raw_pipe()?;
-                    write_raw(write_fd, content.as_bytes())?;
-                    close_raw(write_fd);
+                    let bytes = content.as_bytes();
+                    if bytes.len() < 65536 {
+                        // Fits in the pipe buffer — write directly without forking.
+                        let mut written = 0;
+                        while written < bytes.len() {
+                            match write_raw(write_fd, &bytes[written..]) {
+                                Ok(n) => written += n,
+                                Err(_) => break,
+                            }
+                        }
+                        close_raw(write_fd);
+                    } else {
+                        // Too large for the buffer — fork a writer to avoid blocking.
+                        // SAFETY: grandchild only writes to the pipe and exits immediately.
+                        if let Ok(Fork::Child(_)) = unsafe { kernel_fork() } {
+                            close_raw(read_fd);
+                            let mut written = 0;
+                            while written < bytes.len() {
+                                match write_raw(write_fd, &bytes[written..]) {
+                                    Ok(n) => written += n,
+                                    Err(_) => break,
+                                }
+                            }
+                            close_raw(write_fd);
+                            std::process::exit(0);
+                        }
+                        close_raw(write_fd);
+                    }
                     dup2_raw(read_fd, 0)?;
                     close_raw(read_fd);
                 }
@@ -958,12 +1013,12 @@ impl Executor {
         Ok(())
     }
 
-    fn word_to_path(&self, word: &Word) -> Result<PathBuf> {
+    fn word_to_path(&mut self, word: &Word) -> Result<PathBuf> {
         let s = self
             .expand_word(word)?
             .into_iter()
             .next()
-            .ok_or_else(|| anyhow!("empty redirect target"))?;
+            .ok_or_else(|| eyre!("empty redirect target"))?;
         Ok(PathBuf::from(s))
     }
 
@@ -972,17 +1027,22 @@ impl Executor {
     // ------------------------------------------------------------------
 
     fn save_fds(&self, fds: &[RawFd]) -> Result<Vec<(RawFd, RawFd)>> {
-        fds.iter()
-            .map(|&fd| {
-                let saved = dup_save(fd).map_err(|e| anyhow!(e))?;
-                Ok((fd, saved))
-            })
-            .collect()
+        let mut saved = Vec::with_capacity(fds.len());
+        for &fd in fds {
+            match dup_save(fd) {
+                Ok(saved_fd) => saved.push((fd, saved_fd)),
+                Err(e) => {
+                    saved.into_iter().for_each(|(_, s)| close_raw(s));
+                    return Err(eyre!(e));
+                }
+            }
+        }
+        Ok(saved)
     }
 
     fn restore_fds(&self, saved: Vec<(RawFd, RawFd)>) -> Result<()> {
         for (original, saved_fd) in saved {
-            dup2_raw(saved_fd, original).map_err(|e| anyhow!(e))?;
+            dup2_raw(saved_fd, original).map_err(|e| eyre!(e))?;
             close_raw(saved_fd);
         }
         Ok(())
@@ -1011,7 +1071,7 @@ impl Executor {
                 }
                 Ok(None) => continue, // NOHANG would return None; with UNTRACED this means interrupted
                 Err(e) if e == Errno::INTR => continue,
-                Err(e) => return Err(anyhow!(e)),
+                Err(e) => return Err(eyre!(e)),
             }
         }
     }
@@ -1020,7 +1080,7 @@ impl Executor {
     // Word expansion
     // ------------------------------------------------------------------
 
-    pub fn expand_word(&self, word: &Word) -> Result<Vec<String>> {
+    pub fn expand_word(&mut self, word: &Word) -> Result<Vec<String>> {
         let raw = self.expand_word_to_string(word)?;
         if raw.contains('*') || raw.contains('?') || raw.contains('[') {
             let matches = glob_expand(&raw);
@@ -1031,7 +1091,7 @@ impl Executor {
         Ok(vec![raw])
     }
 
-    pub(crate) fn expand_word_to_string(&self, word: &Word) -> Result<String> {
+    pub(crate) fn expand_word_to_string(&mut self, word: &Word) -> Result<String> {
         match word {
             Word::Literal(s) => {
                 if s.starts_with('~') {
@@ -1052,7 +1112,7 @@ impl Executor {
         }
     }
 
-    fn expand_var(&self, name: &str) -> String {
+    fn expand_var(&mut self, name: &str) -> String {
         match name {
             "?" => self.last_status.0.to_string(),
             "$" => std::process::id().to_string(),
@@ -1087,19 +1147,21 @@ impl Executor {
                         }
                         ":?" => {
                             if val.is_empty() {
-                                eprintln!(
-                                    "swagsh: {var}: {}",
-                                    if default.is_empty() {
-                                        "parameter not set"
-                                    } else {
-                                        default
-                                    }
-                                );
+                                let msg = if default.is_empty() {
+                                    "parameter not set"
+                                } else {
+                                    default
+                                };
+                                eprintln!("swagsh: {var}: {msg}");
+                                if !self.interactive {
+                                    std::process::exit(1);
+                                }
                             }
                             val
                         }
                         ":=" => {
                             if val.is_empty() {
+                                self.env.set(var, default);
                                 default.to_owned()
                             } else {
                                 val
@@ -1114,11 +1176,7 @@ impl Executor {
         }
     }
 
-    pub(crate) fn expand_cmd_sub_cmd(&mut self, cmd: &Command) -> Result<String> {
-        self.expand_cmd_sub(cmd)
-    }
-
-    fn expand_cmd_sub(&self, cmd: &Command) -> Result<String> {
+    fn expand_cmd_sub(&mut self, cmd: &Command) -> Result<String> {
         let (read_fd, write_fd) = raw_pipe()?;
         // SAFETY: fork is inherently unsafe.
         match unsafe { kernel_fork()? } {
@@ -1142,7 +1200,7 @@ impl Executor {
                         Ok(0) => break,
                         Ok(n) => output.extend_from_slice(&buf[..n]),
                         Err(e) if e == Errno::INTR => continue,
-                        Err(e) => return Err(anyhow!(e)),
+                        Err(e) => return Err(eyre!(e)),
                     }
                 }
                 close_raw(read_fd);
@@ -1154,7 +1212,7 @@ impl Executor {
         }
     }
 
-    pub fn expand_words(&self, words: &[Word]) -> Result<Vec<String>> {
+    pub fn expand_words(&mut self, words: &[Word]) -> Result<Vec<String>> {
         let ifs = self.env.get("IFS").unwrap_or_else(|| " \t\n".to_owned());
         let mut result = Vec::with_capacity(words.len());
         for word in words {
@@ -1188,10 +1246,10 @@ fn builtin_false(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
     Ok(ExitStatus::FAILURE)
 }
 fn builtin_break(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
-    Err(anyhow::anyhow!("__break__"))
+    Err(eyre!("__break__"))
 }
 fn builtin_continue(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
-    Err(anyhow::anyhow!("__continue__"))
+    Err(eyre!("__continue__"))
 }
 
 fn builtin_alias(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
@@ -1239,7 +1297,7 @@ fn builtin_cd(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
     let old = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
-    std::env::set_current_dir(&target).map_err(|e| anyhow!("cd: {target}: {e}"))?;
+    std::env::set_current_dir(&target).map_err(|e| eyre!("cd: {target}: {e}"))?;
     exec.env.export("OLDPWD", old);
     let new = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -1252,7 +1310,7 @@ fn builtin_pwd(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
     println!(
         "{}",
         std::env::current_dir()
-            .map_err(|e| anyhow!("pwd: {e}"))?
+            .map_err(|e| eyre!("pwd: {e}"))?
             .display()
     );
     Ok(ExitStatus::SUCCESS)
@@ -1374,9 +1432,9 @@ fn builtin_set(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
 fn builtin_source(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
     let path = args
         .first()
-        .ok_or_else(|| anyhow!("source: filename required"))?;
-    let src = std::fs::read_to_string(path).map_err(|e| anyhow!("source: {path}: {e}"))?;
-    let program = crate::parser::parse(&src).map_err(|e| anyhow!("source: {path}: {e}"))?;
+        .ok_or_else(|| eyre!("source: filename required"))?;
+    let src = std::fs::read_to_string(path).map_err(|e| eyre!("source: {path}: {e}"))?;
+    let program = crate::parser::parse(&src).map_err(|e| eyre!("source: {path}: {e}"))?;
     exec.run_program(&program)
 }
 
@@ -1423,7 +1481,7 @@ fn builtin_fg(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
         .iter()
         .find(|j| j.id == id)
         .map(|j| (j.pgid, j.command.clone()))
-        .ok_or_else(|| anyhow!("fg: no such job: {id}"))?;
+        .ok_or_else(|| eyre!("fg: no such job: {id}"))?;
     eprintln!("{cmd}");
     kill_process_group(pgid, Signal::CONT)?;
     let _ = tcsetpgrp_stdin(pgid);
@@ -1442,7 +1500,7 @@ fn builtin_fg(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
             }
             Ok(None) => continue,
             Err(e) if e == Errno::INTR => continue,
-            Err(e) => return Err(anyhow!(e)),
+            Err(e) => return Err(eyre!(e)),
         }
     };
     let _ = tcsetpgrp_stdin(exec.shell_pgid);
@@ -1460,7 +1518,7 @@ fn builtin_bg(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
         .iter()
         .find(|j| j.id == id)
         .map(|j| j.pgid)
-        .ok_or_else(|| anyhow!("bg: no such job: {id}"))?;
+        .ok_or_else(|| eyre!("bg: no such job: {id}"))?;
     kill_process_group(pgid, Signal::CONT)?;
     eprintln!("[{id}]+ {pgid} &");
     Ok(ExitStatus::SUCCESS)
@@ -1479,24 +1537,24 @@ fn builtin_kill(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
             .ok()
             .and_then(Signal::from_named_raw)
             .or_else(|| parse_signal_name(sig_str))
-            .ok_or_else(|| anyhow!("kill: invalid signal: {sig_str}"))?;
+            .ok_or_else(|| eyre!("kill: invalid signal: {sig_str}"))?;
         targets = &args[1..];
     }
     for target in targets {
         let pid = if let Some(id_str) = target.strip_prefix('%') {
             let id: usize = id_str
                 .parse()
-                .map_err(|_| anyhow!("kill: invalid job: {target}"))?;
+                .map_err(|_| eyre!("kill: invalid job: {target}"))?;
             exec.jobs
                 .iter()
                 .find(|j| j.id == id)
                 .map(|j| j.pgid)
-                .ok_or_else(|| anyhow!("kill: no such job: {id}"))?
+                .ok_or_else(|| eyre!("kill: no such job: {id}"))?
         } else {
             let raw: i32 = target
                 .parse()
-                .map_err(|_| anyhow!("kill: invalid pid: {target}"))?;
-            Pid::from_raw(raw).ok_or_else(|| anyhow!("kill: invalid pid: {target}"))?
+                .map_err(|_| eyre!("kill: invalid pid: {target}"))?;
+            Pid::from_raw(raw).ok_or_else(|| eyre!("kill: invalid pid: {target}"))?
         };
         kill_process(pid, sig)?;
     }
@@ -1606,7 +1664,7 @@ fn glob_expand(pattern: &str) -> Vec<String> {
     results
 }
 
-fn expand_heredoc_body(body: &str, exec: &Executor) -> Result<String> {
+fn expand_heredoc_body(body: &str, exec: &mut Executor) -> Result<String> {
     use crate::parser::parse;
     let mut result = String::with_capacity(body.len());
     let mut chars = body.chars().peekable();
@@ -1639,16 +1697,10 @@ fn expand_heredoc_body(body: &str, exec: &Executor) -> Result<String> {
                         }
                         cmd_src.push(ch);
                     }
-                    if let Ok(program) = parse(&cmd_src) {
-                        let mut sub = Executor::new(exec.env.clone(), false)
-                            .unwrap_or_else(|_| panic!("sub executor"));
-                        if let Some(aol) = program.body.into_iter().next()
-                            && let Some(item) = aol.items.into_iter().next()
-                            && let Some(cmd) = item.command.commands.into_iter().next()
-                            && let Ok(s) = sub.expand_cmd_sub_cmd(&cmd)
-                        {
-                            result.push_str(&s);
-                        }
+                    if let Ok(program) = parse(&cmd_src)
+                        && let Ok(s) = exec.expand_cmd_sub(&program.into_command())
+                    {
+                        result.push_str(&s);
                     }
                 }
                 Some(c2) if c2.is_ascii_alphanumeric() || c2 == '_' || "@*#?-$!".contains(c2) => {
@@ -1739,7 +1791,6 @@ fn builtin_test(_exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
 }
 
 fn builtin_read(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
-    let var = args.first().copied().unwrap_or("REPLY");
     let mut line = String::new();
     match std::io::stdin().read_line(&mut line) {
         Ok(0) => return Ok(ExitStatus::FAILURE),
@@ -1747,7 +1798,20 @@ fn builtin_read(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
         Err(e) => bail!("read: {e}"),
     }
     let line = line.trim_end_matches('\n').trim_end_matches('\r');
-    exec.env.set(var, line);
+    let vars: &[&str] = if args.is_empty() { &["REPLY"] } else { args };
+    let ifs = exec.env.get("IFS").unwrap_or_else(|| " \t\n".to_owned());
+    let is_ifs = |c: char| ifs.contains(c);
+    let mut rest = line.trim_start_matches(is_ifs);
+    for (i, &var) in vars.iter().enumerate() {
+        let is_last = i + 1 == vars.len();
+        if is_last {
+            exec.env.set(var, rest.trim_end_matches(is_ifs));
+        } else {
+            let field_end = rest.find(is_ifs).unwrap_or(rest.len());
+            exec.env.set(var, &rest[..field_end]);
+            rest = rest[field_end..].trim_start_matches(is_ifs);
+        }
+    }
     Ok(ExitStatus::SUCCESS)
 }
 
@@ -2019,9 +2083,9 @@ fn is_special_builtin(name: &str) -> bool {
     )
 }
 
-fn is_break(e: &anyhow::Error) -> bool {
+fn is_break(e: &Report) -> bool {
     e.to_string() == "__break__"
 }
-fn is_continue(e: &anyhow::Error) -> bool {
+fn is_continue(e: &Report) -> bool {
     e.to_string() == "__continue__"
 }

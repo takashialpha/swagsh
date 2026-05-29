@@ -743,23 +743,7 @@ fn decompose_word(raw: &str, parser: &Parser) -> ParseResult<Vec<Word>> {
                             col: e.col,
                             msg: format!("inside command substitution: {}", e.msg),
                         })?;
-                        let cmd = if program.body.len() == 1
-                            && program.body[0].items.len() == 1
-                            && !program.body[0].is_async
-                        {
-                            let pl = &program.body[0].items[0].command;
-                            if pl.commands.len() == 1 {
-                                pl.commands[0].clone()
-                            } else {
-                                Command::Pipeline(pl.clone())
-                            }
-                        } else {
-                            Command::Group(crate::ast::GroupCmd {
-                                body: program.body,
-                                subshell: true,
-                            })
-                        };
-                        parts.push(Word::CmdSub(Box::new(cmd)));
+                        parts.push(Word::CmdSub(Box::new(program.into_command())));
                     }
                     Some('{') => {
                         // ${VAR} or ${VAR:-default} etc.
@@ -831,20 +815,7 @@ fn decompose_word(raw: &str, parser: &Parser) -> ParseResult<Vec<Word>> {
                 }
                 let sub_parser = Parser::new(&inner)?;
                 let program = sub_parser.parse()?;
-                let cmd = if program.body.len() == 1 && program.body[0].items.len() == 1 {
-                    let pl = &program.body[0].items[0].command;
-                    if pl.commands.len() == 1 {
-                        pl.commands[0].clone()
-                    } else {
-                        Command::Pipeline(pl.clone())
-                    }
-                } else {
-                    Command::Group(crate::ast::GroupCmd {
-                        body: program.body,
-                        subshell: true,
-                    })
-                };
-                parts.push(Word::CmdSub(Box::new(cmd)));
+                parts.push(Word::CmdSub(Box::new(program.into_command())));
             }
 
             '\\' => {

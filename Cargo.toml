@@ -9,7 +9,7 @@ repository = "https://github.com/takashialpha/swagsh"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
-anyhow = "1"
+color-eyre = "0.6"
 rustyline = "18"
 ahash = "0.8"
 rustix = { version = "1", features = [
