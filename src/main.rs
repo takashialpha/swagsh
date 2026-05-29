@@ -48,8 +48,11 @@ fn main() -> Result<()> {
     }
 
     // Interactive REPL
-    let _is_login = Cli::login_shell(&argv0);
-    let exec = Executor::new(env, true)?;
+    let is_login = Cli::login_shell(&argv0);
+    let mut exec = Executor::new(env, true)?;
+    if !cli.no_config {
+        source_startup_files(&mut exec, is_login);
+    }
     run_interactive(exec, &cli)?;
     Ok(())
 }
@@ -261,6 +264,29 @@ fn extract_heredoc_delimiters(line: &str) -> Vec<String> {
         }
     }
     delims
+}
+
+fn source_startup_files(exec: &mut Executor, is_login: bool) {
+    let home = match exec.env.get("HOME") {
+        Some(h) => std::path::PathBuf::from(h),
+        None => return,
+    };
+    if is_login {
+        source_if_exists(exec, &home.join(".swagsh_profile"));
+    }
+    source_if_exists(exec, &home.join(".swagshrc"));
+}
+
+fn source_if_exists(exec: &mut Executor, path: &std::path::Path) {
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return;
+    };
+    match parser::parse(&src) {
+        Ok(program) => {
+            let _ = exec.run_program(&program);
+        }
+        Err(e) => eprintln!("swagsh: {}: {e}", path.display()),
+    }
 }
 
 fn run_interactive(mut exec: Executor, cli: &Cli) -> Result<()> {

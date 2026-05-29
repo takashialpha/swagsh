@@ -13,7 +13,7 @@ use std::path::PathBuf;
 for speed, reliability, and modern system integration."
 )]
 pub struct Cli {
-    /// Do not read configuration files
+    /// Skip sourcing ~/.swagsh_profile (login shells) and ~/.swagshrc on startup
     #[arg(short = 'N', long = "no-config")]
     pub no_config: bool,
 
