@@ -10,7 +10,7 @@ env:
 
 jobs:
   test:
-    name: Build, Test, Clippy
+    name: Test, Clippy
     runs-on: ubuntu-latest
 
     steps:
@@ -23,9 +23,6 @@ jobs:
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
-
-      - name: Build
-        run: cargo build --verbose
 
       - name: Clippy
         run: cargo clippy
