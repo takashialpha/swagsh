@@ -118,9 +118,9 @@ History is saved to `~/.swagsh_history` (override with `$HISTFILE`).
 - And-or lists: `cmd1 && cmd2`, `cmd1 || cmd2`
 - Background jobs: `cmd &`
 - Redirection: `>`, `>>`, `<`, `<<`, `>&`, `&>`, here-strings (`<<<`)
-- Command substitution: `$(cmd)`
+- Command substitution: `$(cmd)`, `` `cmd` ``
 - Variable expansion: `$VAR`, `${VAR:-default}`, `${VAR:+alt}`, `${VAR:?err}`, `${VAR:=default}`
-- Tilde expansion, glob expansion (`*`, `?`, `[...]`)
+- Tilde expansion, glob expansion (`*`, `?`)
 - Control flow: `if`/`elif`/`else`, `for`, `while`, `until`, `case`
 - Functions, command groups `{ }`, subshells `( )`
 - Aliases with tab completion
@@ -137,9 +137,11 @@ History is saved to `~/.swagsh_history` (override with `$HISTFILE`).
 - No multiline REPL (`PS2` prompt)
 - No `local`, `return`, `eval`, `trap`
 - No arithmetic expansion (`$((...))`)
+- No `[...]` glob character class matching
 - No `[[ =~ ]]` regex matching
 - No `set -e`/`-u`/`-x`
 - `$@` / `"$@"` quoting semantics are incomplete
+- `&>>` is not supported (parsed but treated as `>>`)
 - No `wait`, `disown`, full `SIGCHLD` handling
 - Heredoc expansion is partial
 
