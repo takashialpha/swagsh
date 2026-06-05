@@ -5,8 +5,8 @@ mod exec;
 mod lexer;
 mod parser;
 
-use color_eyre::eyre::{self, Result};
 use clap::Parser as _;
+use color_eyre::eyre::{self, Result};
 use rustix::process::getuid;
 
 use cli::Cli;
@@ -37,8 +37,8 @@ fn main() -> Result<()> {
     // Script file — non-interactive
     if let Some(path) = &cli.script {
         let mut exec = Executor::new(env, false)?;
-        let src = std::fs::read_to_string(path)
-            .map_err(|e| eyre::eyre!("{}: {e}", path.display()))?;
+        let src =
+            std::fs::read_to_string(path).map_err(|e| eyre::eyre!("{}: {e}", path.display()))?;
         let program = parser::parse(&src)?;
         if !cli.no_execute {
             let status = exec.run_program(&program)?;

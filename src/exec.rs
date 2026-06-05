@@ -420,7 +420,10 @@ impl Executor {
 
         // Register the foreground pipeline so wait_for_pid can find the job on Ctrl+Z.
         let job_id = if self.interactive {
-            Some(self.jobs.add(pgid, pids.clone(), format!("pipeline ({n} stages)")))
+            Some(
+                self.jobs
+                    .add(pgid, pids.clone(), format!("pipeline ({n} stages)")),
+            )
         } else {
             None
         };
@@ -433,7 +436,9 @@ impl Executor {
         if self.interactive {
             let _ = tcsetpgrp_stdin(self.shell_pgid);
             // Remove the job entry when the pipeline finishes normally (not stopped).
-            if last_status.0 != 130 && let Some(id) = job_id {
+            if last_status.0 != 130
+                && let Some(id) = job_id
+            {
                 self.jobs.remove(id);
             }
         }
@@ -803,7 +808,9 @@ impl Executor {
                 let status = self.wait_for_pid(child)?;
                 if self.interactive {
                     let _ = tcsetpgrp_stdin(self.shell_pgid);
-                    if status.0 != 130 && let Some(id) = job_id {
+                    if status.0 != 130
+                        && let Some(id) = job_id
+                    {
                         self.jobs.remove(id);
                     }
                 }
