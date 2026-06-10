@@ -12,7 +12,7 @@ env:
 
 jobs:
   test:
-    name: Test, Clippy
+    name: Test, Fmt, Clippy
     runs-on: ubuntu-latest
 
     steps:
@@ -25,6 +25,9 @@ jobs:
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --verbose
 
       - name: Format check
         run: cargo fmt --all -- --check
