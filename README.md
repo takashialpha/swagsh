@@ -1,3 +1,5 @@
+Dirty! should be rewritten
+
 # swagsh
 
 **A sleek, high-performance Linux shell built in Rust.**  
@@ -56,8 +58,6 @@ paru -S swagsh
 # or
 yay -S swagsh
 ```
-
-> **Warning:** Do not replace `/bin/sh` without thorough testing. The project is under active development.
 
 ---
 
@@ -144,11 +144,3 @@ History is saved to `~/.swagsh_history` (override with `$HISTFILE`).
 - `&>>` is not supported (parsed but treated as `>>`)
 - No `wait`, `disown`, full `SIGCHLD` handling
 - Heredoc expansion is partial
-
----
-
-## Wiki
-
-See the [wiki](https://github.com/takashialpha/swagsh/wiki) for extended documentation:
-- [Usage](https://github.com/takashialpha/swagsh/wiki/Usage) — full command reference
-- [Performance](https://github.com/takashialpha/swagsh/wiki/Performance) — benchmark methodology and raw data
