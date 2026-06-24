@@ -1,4 +1,4 @@
-/// A single word after expansion — may be a literal, a variable reference,
+/// A single word after expansion: may be a literal, a variable reference,
 /// a glob pattern, a command substitution, etc.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Word {
@@ -24,9 +24,9 @@ pub enum RedirectKind {
     Append,
     /// `<file`
     In,
-    /// `2>file`  — fd is stored in `RedirectOp.fd`
+    /// `2>file` : fd is stored in `RedirectOp.fd`
     FdOut,
-    /// `&>file` — stdout + stderr
+    /// `&>file`: stdout + stderr
     Both,
     /// `<<<word` (herestring)
     HereString,
@@ -113,7 +113,7 @@ pub struct GroupCmd {
     pub subshell: bool,
 }
 
-/// The top-level command node — every syntactic construct reduces to this.
+/// The top-level command node: every syntactic construct reduces to this.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Simple(SimpleCmd),

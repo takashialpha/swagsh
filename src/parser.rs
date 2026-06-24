@@ -19,11 +19,7 @@ pub struct ParseError {
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "parse error at {}:{} — {}",
-            self.line, self.col, self.msg
-        )
+        write!(f, "parse error at {}:{}: {}", self.line, self.col, self.msg)
     }
 }
 
@@ -42,7 +38,7 @@ impl From<LexError> for ParseError {
 type ParseResult<T> = Result<T, ParseError>;
 
 // ---------------------------------------------------------------------------
-// Spanned token — the parser works on a pre-lexed flat list annotated with
+// Spanned token: the parser works on a pre-lexed flat list annotated with
 // source positions for accurate error reporting.
 // ---------------------------------------------------------------------------
 
@@ -171,7 +167,7 @@ impl Parser {
 
     /// Parse a sequence of and-or lists separated by `;`, `&`, or newlines.
     /// Stops at `Eof`, `fi`, `done`, `esac`, `elif`, `else`, `then`, `)`
-    /// or `}` — all of which are consumed by the caller.
+    /// or `}`: all of which are consumed by the caller.
     fn parse_list(&mut self) -> ParseResult<Vec<AndOrList>> {
         let mut list = Vec::new();
         self.skip_newlines();
@@ -201,6 +197,7 @@ impl Parser {
                 | Token::RParen
                 | Token::RBrace
                 | Token::In
+                | Token::SemiSemi
         )
     }
 
@@ -238,7 +235,7 @@ impl Parser {
             }
         }
 
-        // trailing & or ; — determines async and consumes separator
+        // trailing & or ;: determines async and consumes separator
         let is_async = if self.eat(&Token::Ampersand) {
             true
         } else {
@@ -295,7 +292,7 @@ impl Parser {
         }
     }
 
-    /// Parse `[[ expr ]]` — collect all tokens until `]]` as word arguments,
+    /// Parse `[[ expr ]]`: collect all tokens until `]]` as word arguments,
     /// converting operators like `&&`, `||`, `!`, `(`, `)` to string words
     /// so the builtin evaluator receives them intact.
     fn parse_double_bracket(&mut self) -> ParseResult<Command> {
@@ -307,17 +304,13 @@ impl Parser {
             let tok = self.peek().clone();
             match &tok {
                 Token::Eof => return Err(self.err("unexpected EOF inside [[ ]]")),
-                Token::Newline => {
-                    self.advance();
-                    continue;
-                }
                 Token::Word(w) if w == "]]" => {
                     self.advance();
                     words.push(crate::ast::Word::Literal("]]".into()));
                     break;
                 }
-                // Operators that normally parse as structural tokens —
-                // emit them as string words so the test evaluator sees them.
+                // Operators that parse as structural tokens; emit as string words
+                // so the test evaluator sees them.
                 Token::AndAnd => {
                     self.advance();
                     words.push(crate::ast::Word::Literal("&&".into()));
@@ -349,7 +342,6 @@ impl Parser {
                     // Also handle >= and <= which arrive as Append(>>) or similar.
                     use crate::lexer::RedirKind;
                     let s = match rt.kind {
-                        RedirKind::Out => ">",
                         RedirKind::In => "<",
                         RedirKind::Append => ">>",
                         _ => ">",
@@ -417,13 +409,13 @@ impl Parser {
     }
 
     // ------------------------------------------------------------------
-    // Word parsing — convert a raw token string into a `Word` node
+    // Word parsing: convert a raw token string into a `Word` node
     // ------------------------------------------------------------------
 
     fn parse_word_str(&self, raw: &str) -> ParseResult<Word> {
         let bytes = raw.as_bytes();
 
-        // Fast path — pure literal (no `$`, `` ` ``, `"`, `\`).
+        // Fast path: pure literal (no `$`, `` ` ``, `"`, `\`).
         if !bytes
             .iter()
             .any(|&b| matches!(b, b'$' | b'`' | b'"' | b'\\'))
@@ -431,7 +423,7 @@ impl Parser {
             return Ok(Word::Literal(raw.to_owned()));
         }
 
-        // Check for bare arithmetic expansion `$(( ))` — error per spec.
+        // Check for bare arithmetic expansion `$(( ))`: error per spec.
         if raw.starts_with("$((") {
             let sp = self.peek_spanned();
             return Err(ParseError {
@@ -441,7 +433,7 @@ impl Parser {
             });
         }
 
-        // Compound word — decompose into parts.
+        // Compound word: decompose into parts.
         let parts = decompose_word(raw, self)?;
         if parts.len() == 1 {
             Ok(parts.into_iter().next().unwrap())
@@ -471,15 +463,13 @@ impl Parser {
                     RedirKind::Out => (RedirectKind::Out, 1),
                     RedirKind::Append => (RedirectKind::Append, 1),
                     RedirKind::In => (RedirectKind::In, 0),
-                    RedirKind::InOut => (RedirectKind::In, 0), // treat <> as <
                     RedirKind::OutFd => (RedirectKind::FdOut, 1),
                     RedirKind::BothOut => (RedirectKind::Both, 1),
-                    RedirKind::BothAppend => (RedirectKind::Append, 1),
                 };
 
                 Ok(Redirect {
                     kind: rk,
-                    fd: fd.map(|n| n as i32).unwrap_or(default_fd),
+                    fd: fd.map_or(default_fd, u32::cast_signed),
                     target,
                 })
             }
@@ -549,7 +539,7 @@ impl Parser {
 
         self.skip_newlines();
 
-        // Optional `in wordlist` — if absent defaults to "$@"
+        // Optional `in wordlist`: if absent defaults to "$@"
         let items = if self.eat(&Token::In) {
             let mut words = Vec::new();
             while let Token::Word(w) = self.peek().clone() {
@@ -634,7 +624,7 @@ impl Parser {
 
             let body = self.parse_list()?;
 
-            // `;;` terminates the arm — optional before `esac`
+            // `;;` terminates the arm: optional before `esac`
             self.eat(&Token::SemiSemi);
             self.skip_newlines();
 
@@ -679,11 +669,11 @@ impl Parser {
         };
 
         if !has_keyword {
-            // name () form — must have `()`
+            // name () form: must have `()`
             self.expect(&Token::LParen)?;
             self.expect(&Token::RParen)?;
         } else if self.eat(&Token::LParen) {
-            // `function name()` form — parens are optional but consume if present
+            // `function name()` form: parens are optional but consume if present
             self.expect(&Token::RParen)?;
         }
 
@@ -704,6 +694,55 @@ impl Parser {
 // into a Vec<Word> that the executor can expand piece by piece.
 // ---------------------------------------------------------------------------
 
+fn parse_dollar(
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+    parser: &Parser,
+) -> ParseResult<Option<Word>> {
+    match chars.peek().map(|(_, c)| *c) {
+        Some('(') => {
+            if chars.clone().nth(1).map(|(_, c)| c) == Some('(') {
+                return Err(parser.err("arithmetic expansion `$(( ))` is not supported"));
+            }
+            let fragment = collect_balanced(chars, '(', ')')?;
+            let inner = &fragment[2..fragment.len() - 1];
+            let prog = Parser::new(inner)
+                .and_then(Parser::parse)
+                .map_err(|e| ParseError {
+                    msg: format!("in command substitution: {}", e.msg),
+                    ..e
+                })?;
+            Ok(Some(Word::CmdSub(Box::new(prog.into_command()))))
+        }
+        Some('{') => {
+            let fragment = collect_balanced(chars, '{', '}')?;
+            Ok(Some(Word::Var(fragment[2..fragment.len() - 1].to_owned())))
+        }
+        _ => {
+            let mut var = String::new();
+            match chars.peek().map(|(_, c)| *c) {
+                Some('@' | '*' | '#' | '?' | '-' | '$' | '!') => {
+                    var.push(chars.next().unwrap().1);
+                }
+                Some(c) if c.is_ascii_digit() => {
+                    var.push(chars.next().unwrap().1);
+                }
+                Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                    while let Some(&(_, c)) = chars.peek() {
+                        if c.is_ascii_alphanumeric() || c == '_' {
+                            var.push(c);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                _ => return Ok(None), // lone `$`: caller treats as literal
+            }
+            Ok(Some(Word::Var(var)))
+        }
+    }
+}
+
 fn decompose_word(raw: &str, parser: &Parser) -> ParseResult<Vec<Word>> {
     let mut parts: Vec<Word> = Vec::new();
     let mut chars = raw.char_indices().peekable();
@@ -719,73 +758,16 @@ fn decompose_word(raw: &str, parser: &Parser) -> ParseResult<Vec<Word>> {
 
     while let Some((_, ch)) = chars.next() {
         match ch {
-            '$' => {
-                match chars.peek().map(|(_, c)| *c) {
-                    Some('(') => {
-                        // Reject arithmetic expansion before collecting.
-                        if chars.clone().nth(1).map(|(_, c)| c) == Some('(') {
-                            return Err(
-                                parser.err("arithmetic expansion `$(( ))` is not supported")
-                            );
-                        }
-                        // command substitution $(...)
-                        flush_lit!();
-                        let start = raw.find("$(").unwrap_or(0);
-                        let fragment = collect_balanced(raw, &mut chars, '(', ')')?;
-                        let inner = &fragment[2..fragment.len() - 1];
-                        let sub_parser = Parser::new(inner).map_err(|e| ParseError {
-                            line: e.line,
-                            col: e.col,
-                            msg: format!("inside command substitution at col {start}: {}", e.msg),
-                        })?;
-                        let program = sub_parser.parse().map_err(|e| ParseError {
-                            line: e.line,
-                            col: e.col,
-                            msg: format!("inside command substitution: {}", e.msg),
-                        })?;
-                        parts.push(Word::CmdSub(Box::new(program.into_command())));
-                    }
-                    Some('{') => {
-                        // ${VAR} or ${VAR:-default} etc.
-                        flush_lit!();
-                        let fragment = collect_balanced(raw, &mut chars, '{', '}')?;
-                        let var_expr = &fragment[2..fragment.len() - 1];
-                        parts.push(Word::Var(var_expr.to_owned()));
-                    }
-                    _ => {
-                        // bare $VAR or $@, $*, $?, $#, $-, $$, $!, $0-$9
-                        flush_lit!();
-                        let mut var = String::new();
-                        match chars.peek().map(|(_, c)| *c) {
-                            Some('@' | '*' | '#' | '?' | '-' | '$' | '!') => {
-                                var.push(chars.next().unwrap().1);
-                            }
-                            Some(c) if c.is_ascii_digit() => {
-                                var.push(chars.next().unwrap().1);
-                            }
-                            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
-                                while let Some(&(_, c)) = chars.peek() {
-                                    if c.is_ascii_alphanumeric() || c == '_' {
-                                        var.push(c);
-                                        chars.next();
-                                    } else {
-                                        break;
-                                    }
-                                }
-                            }
-                            _ => {
-                                // lone `$` — treat as literal
-                                lit.push('$');
-                                continue;
-                            }
-                        }
-                        parts.push(Word::Var(var));
-                    }
+            '$' => match parse_dollar(&mut chars, parser)? {
+                Some(word) => {
+                    flush_lit!();
+                    parts.push(word);
                 }
-            }
+                None => lit.push('$'),
+            },
 
             '"' => {
-                // double-quoted region — recurse on the inner content
+                // double-quoted region: recurse on the inner content
                 flush_lit!();
                 let mut inner = String::new();
                 for (_, c) in chars.by_ref() {
@@ -804,7 +786,7 @@ fn decompose_word(raw: &str, parser: &Parser) -> ParseResult<Vec<Word>> {
             }
 
             '`' => {
-                // backtick substitution — collect until closing backtick
+                // backtick substitution: collect until closing backtick
                 flush_lit!();
                 let mut inner = String::new();
                 for (_, c) in chars.by_ref() {
@@ -819,7 +801,7 @@ fn decompose_word(raw: &str, parser: &Parser) -> ParseResult<Vec<Word>> {
             }
 
             '\\' => {
-                // escape — consume next character literally
+                // escape: consume next character literally
                 if let Some((_, next)) = chars.next() {
                     lit.push(next);
                 }
@@ -842,7 +824,6 @@ fn decompose_word(raw: &str, parser: &Parser) -> ParseResult<Vec<Word>> {
 /// `open` already peeked (the `$` was already consumed by the caller).
 /// Returns the full fragment including the leading `$` + `open` and trailing `close`.
 fn collect_balanced(
-    _raw: &str,
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
     open: char,
     close: char,

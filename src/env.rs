@@ -1,14 +1,13 @@
-use ahash::AHashMap;
-use ahash::AHashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::Command;
 
 #[derive(Debug, Clone)]
 pub struct Env {
-    vars: AHashMap<String, String>,
-    exported: AHashSet<String>,
-    functions: AHashMap<String, Command>,
-    aliases: AHashMap<String, String>,
+    vars: HashMap<String, String>,
+    exported: HashSet<String>,
+    functions: HashMap<String, Command>,
+    aliases: HashMap<String, String>,
     positional: Vec<String>,
 }
 
@@ -16,8 +15,8 @@ impl Env {
     pub fn from_process() -> Self {
         let raw: Vec<(String, String)> = std::env::vars().collect();
         let cap = raw.len() + 8;
-        let mut vars = AHashMap::with_capacity(cap);
-        let mut exported = AHashSet::with_capacity(cap);
+        let mut vars = HashMap::with_capacity(cap);
+        let mut exported = HashSet::with_capacity(cap);
         for (k, v) in raw {
             exported.insert(k.clone());
             vars.insert(k, v);
@@ -35,8 +34,8 @@ impl Env {
         Self {
             vars,
             exported,
-            functions: AHashMap::new(),
-            aliases: AHashMap::new(),
+            functions: HashMap::new(),
+            aliases: HashMap::new(),
             positional: Vec::new(),
         }
     }
@@ -57,7 +56,7 @@ impl Env {
     pub fn set(&mut self, name: &str, value: impl Into<String>) {
         let value = value.into();
         if self.exported.contains(name) {
-            // SAFETY: single-threaded shell — no concurrent env mutation.
+            // SAFETY: single-threaded shell: no concurrent env mutation.
             unsafe {
                 std::env::set_var(name, &value);
             }
@@ -68,7 +67,7 @@ impl Env {
     pub fn export(&mut self, name: impl Into<String>, value: impl Into<String>) {
         let name = name.into();
         let value = value.into();
-        // SAFETY: single-threaded shell — no concurrent env mutation.
+        // SAFETY: single-threaded shell: no concurrent env mutation.
         unsafe {
             std::env::set_var(&name, &value);
         }
@@ -78,7 +77,7 @@ impl Env {
 
     pub fn mark_exported(&mut self, name: &str) {
         let value = self.vars.entry(name.to_owned()).or_default().clone();
-        // SAFETY: single-threaded shell — no concurrent env mutation.
+        // SAFETY: single-threaded shell: no concurrent env mutation.
         unsafe {
             std::env::set_var(name, &value);
         }
@@ -89,7 +88,7 @@ impl Env {
         self.vars.remove(name);
         self.exported.remove(name);
         self.functions.remove(name);
-        // SAFETY: single-threaded shell — no concurrent env mutation.
+        // SAFETY: single-threaded shell: no concurrent env mutation.
         unsafe {
             std::env::remove_var(name);
         }
@@ -135,9 +134,9 @@ impl Env {
     pub fn all_aliases(&self) -> impl Iterator<Item = (&str, &str)> {
         self.aliases.iter().map(|(k, v)| (k.as_str(), v.as_str()))
     }
-    /// All alias names — used by tab completion.
+    /// All alias names: used by tab completion.
     pub fn alias_names(&self) -> impl Iterator<Item = &str> {
-        self.aliases.keys().map(|k| k.as_str())
+        self.aliases.keys().map(std::string::String::as_str)
     }
 
     // ------------------------------------------------------------------
@@ -150,5 +149,14 @@ impl Env {
     }
     pub fn set_positional_args(&mut self, args: Vec<String>) {
         self.positional = args;
+    }
+
+    pub fn restore_vars(&mut self, saved: Vec<(String, Option<String>)>) {
+        for (k, old) in saved {
+            match old {
+                Some(v) => self.set(&k, v),
+                None => self.unset(&k),
+            }
+        }
     }
 }

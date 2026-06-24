@@ -56,10 +56,8 @@ pub enum RedirKind {
     Out,
     Append,
     In,
-    InOut,
     OutFd,
     BothOut,
-    BothAppend,
 }
 
 impl fmt::Display for Token {
@@ -97,7 +95,7 @@ pub struct LexError {
 
 impl fmt::Display for LexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "lex error at {}:{} — {}", self.line, self.col, self.msg)
+        write!(f, "lex error at {}:{}: {}", self.line, self.col, self.msg)
     }
 }
 
@@ -124,7 +122,7 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    /// Current source position — called by the parser before each token advance
+    /// Current source position: called by the parser before each token advance
     /// to attach accurate span information.
     #[inline]
     pub fn position(&self) -> (usize, usize) {
@@ -326,7 +324,7 @@ impl<'src> Lexer<'src> {
         let mut delim = String::new();
         loop {
             match self.peek() {
-                None | Some(b'\n') | Some(b' ') | Some(b'\t') => break,
+                None | Some(b'\n' | b' ' | b'\t') => break,
                 Some(b'\'') => {
                     self.advance();
                     self.lex_single_quoted(&mut delim)?;
@@ -365,7 +363,7 @@ impl<'src> Lexer<'src> {
             let mut line = String::new();
             loop {
                 match self.peek() {
-                    // EOF before delimiter — return partial body.
+                    // EOF before delimiter: return partial body.
                     None => return Ok(Token::HereString(body)),
                     Some(b'\n') => {
                         self.advance();
@@ -422,25 +420,15 @@ impl<'src> Lexer<'src> {
                     } else if self.peek() == Some(b'-') {
                         self.advance();
                         return self.lex_heredoc(true);
-                    } else {
-                        return self.lex_heredoc(false);
                     }
-                }
-                Some(b'>') => {
-                    self.advance();
-                    RedirKind::InOut
+                    return self.lex_heredoc(false);
                 }
                 _ => RedirKind::In,
             },
             b'&' => {
                 if self.peek() == Some(b'>') {
                     self.advance();
-                    if self.peek() == Some(b'>') {
-                        self.advance();
-                        RedirKind::BothAppend
-                    } else {
-                        RedirKind::BothOut
-                    }
+                    RedirKind::BothOut
                 } else {
                     unreachable!("lex_redir called for plain &");
                 }
@@ -459,15 +447,15 @@ impl<'src> Lexer<'src> {
             match self.peek() {
                 None
                 | Some(
-                    b' ' | b'\t' | b'\r' | b'\n' | b';' | b'|' | b'&' | b'(' | b')' | b'{' | b'}',
+                    b' ' | b'\t' | b'\r' | b'\n' | b';' | b'|' | b'&' | b'(' | b')' | b'{' | b'}'
+                    | b'<' | b'>',
                 ) => break,
                 Some(b'#') => {
                     if buf.is_empty() {
                         break;
-                    } else {
-                        buf.push('#');
-                        self.advance();
                     }
+                    buf.push('#');
+                    self.advance();
                 }
                 Some(b'\\') => {
                     self.advance();
@@ -502,10 +490,9 @@ impl<'src> Lexer<'src> {
                         _ => {
                             buf.push('$');
                             match self.peek() {
-                                Some(b'@' | b'*' | b'#' | b'?' | b'-' | b'$' | b'!') => {
-                                    buf.push(self.advance().unwrap() as char);
-                                }
-                                Some(b'0'..=b'9') => {
+                                Some(
+                                    b'@' | b'*' | b'#' | b'?' | b'-' | b'$' | b'!' | b'0'..=b'9',
+                                ) => {
                                     buf.push(self.advance().unwrap() as char);
                                 }
                                 Some(b'a'..=b'z' | b'A'..=b'Z' | b'_') => {
@@ -601,26 +588,22 @@ impl<'src> Lexer<'src> {
                 self.advance();
                 return Ok(Token::Bang);
             }
-            Some(b'<') => return self.lex_redir(None),
-            Some(b'>') => return self.lex_redir(None),
+            Some(b'<' | b'>') => return self.lex_redir(None),
             // [[ and ]] are emitted as Word tokens so they hit the builtin table.
-            Some(b'[') => {
-                self.advance();
-                return Ok(if self.peek() == Some(b'[') {
-                    self.advance();
-                    Token::Word("[[".into())
+            Some(b'[' | b']') => {
+                let open = self.advance().unwrap();
+                let (single, double) = if open == b'[' {
+                    ("[", "[[")
                 } else {
-                    Token::Word("[".into())
-                });
-            }
-            Some(b']') => {
-                self.advance();
-                return Ok(if self.peek() == Some(b']') {
+                    ("]", "]]")
+                };
+                let s = if self.peek() == Some(open) {
                     self.advance();
-                    Token::Word("]]".into())
+                    double
                 } else {
-                    Token::Word("]".into())
-                });
+                    single
+                };
+                return Ok(Token::Word(s.into()));
             }
             _ => {}
         }
@@ -630,28 +613,32 @@ impl<'src> Lexer<'src> {
 
         if !buf.is_empty()
             && buf.chars().all(|c| c.is_ascii_digit())
-            && matches!(self.peek(), Some(b'<') | Some(b'>'))
+            && matches!(self.peek(), Some(b'<' | b'>'))
         {
             let fd: u32 = buf.parse().unwrap_or(u32::MAX);
             return self.lex_redir(Some(fd));
         }
 
-        Ok(match buf.as_str() {
-            "if" => Token::If,
-            "then" => Token::Then,
-            "else" => Token::Else,
-            "elif" => Token::Elif,
-            "fi" => Token::Fi,
-            "for" => Token::For,
-            "in" => Token::In,
-            "do" => Token::Do,
-            "done" => Token::Done,
-            "while" => Token::While,
-            "until" => Token::Until,
-            "case" => Token::Case,
-            "esac" => Token::Esac,
-            "function" => Token::Function,
-            _ => Token::Word(buf),
-        })
+        Ok(keyword_or_word(buf))
+    }
+}
+
+fn keyword_or_word(buf: String) -> Token {
+    match buf.as_str() {
+        "if" => Token::If,
+        "then" => Token::Then,
+        "else" => Token::Else,
+        "elif" => Token::Elif,
+        "fi" => Token::Fi,
+        "for" => Token::For,
+        "in" => Token::In,
+        "do" => Token::Do,
+        "done" => Token::Done,
+        "while" => Token::While,
+        "until" => Token::Until,
+        "case" => Token::Case,
+        "esac" => Token::Esac,
+        "function" => Token::Function,
+        _ => Token::Word(buf),
     }
 }

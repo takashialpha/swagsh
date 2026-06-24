@@ -5,8 +5,8 @@ mod exec;
 mod lexer;
 mod parser;
 
+use anyhow::{Result, anyhow};
 use clap::Parser as _;
-use color_eyre::eyre::{self, Result};
 use rustix::process::getuid;
 
 use cli::Cli;
@@ -14,7 +14,6 @@ use env::Env;
 use exec::{Executor, expand_tilde};
 
 fn main() -> Result<()> {
-    color_eyre::install()?;
     let argv0 = std::env::args().next().unwrap_or_default();
     let cli = Cli::parse();
 
@@ -23,9 +22,9 @@ fn main() -> Result<()> {
         env.set_positional_args(cli.args.clone());
     }
 
-    // -c "command string" — non-interactive
+    // -c "command string": non-interactive
     if let Some(cmd) = &cli.command {
-        let mut exec = Executor::new(env, false)?;
+        let mut exec = Executor::new(env, false);
         let program = parser::parse(cmd)?;
         if !cli.no_execute {
             let status = exec.run_program(&program)?;
@@ -34,11 +33,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Script file — non-interactive
+    // Script file: non-interactive
     if let Some(path) = &cli.script {
-        let mut exec = Executor::new(env, false)?;
-        let src =
-            std::fs::read_to_string(path).map_err(|e| eyre::eyre!("{}: {e}", path.display()))?;
+        let mut exec = Executor::new(env, false);
+        let src = std::fs::read_to_string(path).map_err(|e| anyhow!("{}: {e}", path.display()))?;
         let program = parser::parse(&src)?;
         if !cli.no_execute {
             let status = exec.run_program(&program)?;
@@ -49,7 +47,7 @@ fn main() -> Result<()> {
 
     // Interactive REPL
     let is_login = Cli::login_shell(&argv0);
-    let mut exec = Executor::new(env, true)?;
+    let mut exec = Executor::new(env, true);
     if !cli.no_config {
         source_startup_files(&mut exec, is_login);
     }
@@ -86,7 +84,7 @@ struct ShellHelper {
     completer: ShellCompleter,
     /// Raw pointer to the executor's Env so we can read aliases without
     /// threading lifetimes through rustyline's `Helper` trait.
-    /// SAFETY: the Executor outlives the Editor — both are on the stack in
+    /// SAFETY: the Executor outlives the Editor: both are on the stack in
     /// `run_interactive` and the Editor is dropped first.
     env_ptr: *const Env,
 }
@@ -95,7 +93,7 @@ impl ShellHelper {
     fn new(exec: &Executor) -> Self {
         Self {
             completer: ShellCompleter::new(),
-            env_ptr: &exec.env as *const Env,
+            env_ptr: &raw const exec.env,
         }
     }
 
@@ -124,8 +122,7 @@ impl Completer for ShellHelper {
         let before_cursor = &line[..pos];
         let word_start = before_cursor
             .rfind(|c: char| c.is_whitespace())
-            .map(|i| i + 1)
-            .unwrap_or(0);
+            .map_or(0, |i| i + 1);
         let word = &before_cursor[word_start..];
         let is_first_word = !before_cursor[..word_start].contains(|c: char| !c.is_whitespace());
 
@@ -153,7 +150,7 @@ impl Completer for ShellHelper {
             if let Some(path_var) = self.env().get("PATH") {
                 for dir in path_var.split(':') {
                     if let Ok(entries) = std::fs::read_dir(dir) {
-                        for entry in entries.filter_map(|e| e.ok()) {
+                        for entry in entries.filter_map(std::result::Result::ok) {
                             let name = entry.file_name().to_string_lossy().to_string();
                             if name.starts_with(word)
                                 && let Ok(meta) = entry.metadata()
@@ -219,17 +216,11 @@ fn collect_heredoc_input(
     for delim in delimiters {
         let delim = delim.trim_matches(|c| c == '\'' || c == '"');
 
-        #[allow(clippy::while_let_loop)]
-        loop {
-            match rl.readline("> ") {
-                Ok(body_line) => {
-                    buf.push_str(&body_line);
-                    buf.push('\n');
-                    if body_line.trim_end_matches('\r') == delim {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(body_line) = rl.readline("> ") {
+            buf.push_str(&body_line);
+            buf.push('\n');
+            if body_line.trim_end_matches('\r') == delim {
+                break;
             }
         }
     }
@@ -248,7 +239,7 @@ fn extract_heredoc_delimiters(line: &str) -> Vec<String> {
             if chars.peek() == Some(&'-') {
                 chars.next();
             }
-            while matches!(chars.peek(), Some(' ') | Some('\t')) {
+            while matches!(chars.peek(), Some(' ' | '\t')) {
                 chars.next();
             }
             let mut delim = String::new();
@@ -337,7 +328,7 @@ fn run_interactive(mut exec: Executor, cli: &Cli) -> Result<()> {
                 }
                 exec.jobs.reap_nonblocking();
             }
-            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Interrupted) => {}
             Err(ReadlineError::Eof) => break,
             Err(e) => {
                 eprintln!("swagsh: readline: {e}");
@@ -398,8 +389,9 @@ fn expand_ps1(ps1: &str, exec: &Executor) -> String {
 
 /// Returns the current working directory with `$HOME` collapsed to `~`.
 fn current_dir_display(env: &Env) -> String {
-    std::env::current_dir()
-        .map(|p| {
+    std::env::current_dir().map_or_else(
+        |_| "?".into(),
+        |p| {
             let s = p.to_string_lossy().to_string();
             let home = env.get_or_empty("HOME");
             if !home.is_empty() && s.starts_with(&home) {
@@ -407,8 +399,8 @@ fn current_dir_display(env: &Env) -> String {
             } else {
                 s
             }
-        })
-        .unwrap_or_else(|_| "?".into())
+        },
+    )
 }
 
 fn history_file() -> Option<std::path::PathBuf> {

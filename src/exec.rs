@@ -1,8 +1,11 @@
+#![allow(clippy::unnecessary_wraps)] // builtins share BuiltinFn: fn(...) -> Result<ExitStatus>
+
 use std::ffi::CString;
+use std::fmt::{self, Write as _};
 use std::os::fd::{FromRawFd, IntoRawFd};
 use std::path::PathBuf;
 
-use color_eyre::eyre::{Report, Result, bail, eyre};
+use anyhow::{Error, Result, anyhow, bail};
 use rustix::fd::{BorrowedFd, OwnedFd, RawFd};
 use rustix::fs::{self, Access, FileTypeExt, Mode, OFlags};
 use rustix::io::{Errno, dup2, fcntl_dupfd_cloexec, read, write};
@@ -24,7 +27,7 @@ use crate::ast::{
 use crate::env::Env;
 
 // ---------------------------------------------------------------------------
-// Helpers — rustix/nix wrappers
+// Helpers: rustix/nix wrappers
 // ---------------------------------------------------------------------------
 
 #[inline]
@@ -32,7 +35,7 @@ fn tcsetpgrp_stdin(pgid: Pid) -> rustix::io::Result<()> {
     tcsetpgrp(std::io::stdin(), pgid)
 }
 
-/// `dup2(oldfd, newfd)` — duplicate `oldfd` onto the specific integer `newfd`.
+/// `dup2(oldfd, newfd)`: duplicate `oldfd` onto the specific integer `newfd`.
 ///
 /// rustix's `dup2` takes `(src: impl AsFd, dst: &mut OwnedFd)`.  We satisfy
 /// that by wrapping `newfd` in an `OwnedFd` for the call, then immediately
@@ -43,7 +46,7 @@ fn dup2_raw(oldfd: RawFd, newfd: RawFd) -> rustix::io::Result<()> {
     let src = unsafe { BorrowedFd::borrow_raw(oldfd) };
     let mut dst = unsafe { OwnedFd::from_raw_fd(newfd) };
     let result = dup2(src, &mut dst);
-    // Do NOT let dst drop — we don't own newfd's lifetime here; the caller
+    // Do NOT let dst drop: we don't own newfd's lifetime here; the caller
     // owns that slot (e.g. stdin/stdout/stderr or a pipe end).
     std::mem::forget(dst);
     result
@@ -104,7 +107,7 @@ fn dup_save(fd: RawFd) -> rustix::io::Result<RawFd> {
 // Signal helpers
 // ---------------------------------------------------------------------------
 
-/// Build a `KernelSigaction` that sets a signal to SIG_IGN.
+/// Build a `KernelSigaction` that sets a signal to `SIG_IGN`.
 #[inline]
 fn sig_ign_action() -> KernelSigaction {
     KernelSigaction {
@@ -115,7 +118,7 @@ fn sig_ign_action() -> KernelSigaction {
     }
 }
 
-/// Build a `KernelSigaction` that restores a signal to SIG_DFL.
+/// Build a `KernelSigaction` that restores a signal to `SIG_DFL`.
 #[inline]
 fn sig_dfl_action() -> KernelSigaction {
     KernelSigaction {
@@ -134,14 +137,14 @@ fn sig_dfl_action() -> KernelSigaction {
 #[inline]
 unsafe fn restore_child_signals() {
     let dfl = sig_dfl_action();
-    // Errors are silently ignored — we are in a forked child and cannot
+    // Errors are silently ignored: we are in a forked child and cannot
     // meaningfully recover; the exec will simply inherit the parent handler.
     let _ = unsafe { kernel_sigaction(Signal::TTOU, Some(dfl.clone())) };
     let _ = unsafe { kernel_sigaction(Signal::TTIN, Some(dfl.clone())) };
     let _ = unsafe { kernel_sigaction(Signal::TSTP, Some(dfl.clone())) };
     let _ = unsafe { kernel_sigaction(Signal::INT, Some(dfl.clone())) };
     let _ = unsafe { kernel_sigaction(Signal::QUIT, Some(dfl)) };
-    // Unblock all signals — the parent may have blocked some.
+    // Unblock all signals: the parent may have blocked some.
     let _ = unsafe { kernel_sigprocmask(How::SETMASK, Some(&KernelSigSet::empty())) };
 }
 
@@ -244,7 +247,27 @@ impl JobTable {
 }
 
 // ---------------------------------------------------------------------------
-// Builtin dispatch — static sorted table, O(log n) binary search.
+// Alias resolution: expand alias if defined, prepend extra args.
+// Used in both the parent (run_simple) and child (exec_simple_in_child).
+// ---------------------------------------------------------------------------
+
+fn resolve_alias(env: &Env, raw: &str, rest: &[String]) -> (String, Vec<String>) {
+    if let Some(alias_val) = env.get_alias(raw) {
+        let mut parts: Vec<String> = alias_val.split_whitespace().map(String::from).collect();
+        let name = if parts.is_empty() {
+            raw.to_owned()
+        } else {
+            parts.remove(0)
+        };
+        parts.extend_from_slice(rest);
+        (name, parts)
+    } else {
+        (raw.to_owned(), rest.to_vec())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Builtin dispatch: static sorted table, O(log n) binary search.
 // INVARIANT: entries must remain in strict lexicographic order.
 // ---------------------------------------------------------------------------
 
@@ -301,7 +324,7 @@ pub struct Executor {
 }
 
 impl Executor {
-    pub fn new(env: Env, interactive: bool) -> Result<Self> {
+    pub fn new(env: Env, interactive: bool) -> Self {
         let shell_pgid = getpid();
 
         if interactive {
@@ -317,13 +340,13 @@ impl Executor {
             }
         }
 
-        Ok(Self {
+        Self {
             env,
             jobs: JobTable::default(),
             shell_pgid,
             last_status: ExitStatus::SUCCESS,
             interactive,
-        })
+        }
     }
 
     // ------------------------------------------------------------------
@@ -343,19 +366,34 @@ impl Executor {
     // ------------------------------------------------------------------
 
     fn run_and_or(&mut self, aol: &AndOrList) -> Result<ExitStatus> {
+        let items = &aol.items;
         let mut status = ExitStatus::SUCCESS;
-        for (i, item) in aol.items.iter().enumerate() {
-            let is_last = i == aol.items.len() - 1;
+        let mut i = 0;
+        while i < items.len() {
+            let is_last = i == items.len() - 1;
             status = if aol.is_async && is_last {
-                self.run_pipeline_async(&item.command)?
+                self.run_pipeline_async(&items[i].command)?
             } else {
-                self.run_pipeline(&item.command)?
+                self.run_pipeline(&items[i].command)?
             };
-            match item.op {
-                None => {}
-                Some(AndOrOp::And) if !status.is_success() => break,
-                Some(AndOrOp::Or) if status.is_success() => break,
-                _ => {}
+            match items[i].op {
+                None => break,
+                // && failed: skip forward past && items until we reach a || (or end).
+                // The item after the || is where execution resumes.
+                Some(AndOrOp::And) if !status.is_success() => {
+                    i += 1;
+                    while i < items.len() && items[i - 1].op != Some(AndOrOp::Or) {
+                        i += 1;
+                    }
+                }
+                // || succeeded: skip forward past || items until we reach a && (or end).
+                Some(AndOrOp::Or) if status.is_success() => {
+                    i += 1;
+                    while i < items.len() && items[i - 1].op != Some(AndOrOp::And) {
+                        i += 1;
+                    }
+                }
+                _ => i += 1,
             }
         }
         self.last_status = status;
@@ -363,14 +401,14 @@ impl Executor {
     }
 
     // ------------------------------------------------------------------
-    // Pipeline — foreground
+    // Pipeline: foreground
     // ------------------------------------------------------------------
 
     pub fn run_pipeline(&mut self, pipeline: &Pipeline) -> Result<ExitStatus> {
         let n = pipeline.commands.len();
 
         if n == 1 {
-            let mut status = self.run_command(&pipeline.commands[0], None, None)?;
+            let mut status = self.run_command(&pipeline.commands[0])?;
             if pipeline.negated {
                 status = if status.is_success() {
                     ExitStatus::FAILURE
@@ -387,23 +425,23 @@ impl Executor {
 
         for (idx, cmd) in pipeline.commands.iter().enumerate() {
             let is_last = idx == n - 1;
-            let (pipe_read, pipe_write) = if !is_last {
+            let (pipe_read, pipe_write) = if is_last {
+                (None, None)
+            } else {
                 let (r, w) = raw_pipe()?;
                 (Some(r), Some(w))
-            } else {
-                (None, None)
             };
 
-            let pid = self.fork_command(cmd, prev_read, pipe_write, pgid)?;
+            let child = self.fork_command(cmd, prev_read, pipe_write, pgid)?;
 
             if let Some(existing) = pgid {
-                let _ = setpgid(Some(pid), Some(existing));
+                let _ = setpgid(Some(child), Some(existing));
             } else {
-                pgid = Some(pid);
-                let _ = setpgid(Some(pid), Some(pid));
+                pgid = Some(child);
+                let _ = setpgid(Some(child), Some(child));
             }
 
-            pids.push(pid);
+            pids.push(child);
             if let Some(fd) = pipe_write {
                 close_raw(fd);
             }
@@ -429,8 +467,8 @@ impl Executor {
         };
 
         let mut last_status = ExitStatus::SUCCESS;
-        for pid in &pids {
-            last_status = self.wait_for_pid(*pid)?;
+        for child in &pids {
+            last_status = self.wait_for_pid(*child)?;
         }
 
         if self.interactive {
@@ -454,7 +492,7 @@ impl Executor {
     }
 
     // ------------------------------------------------------------------
-    // Pipeline — background
+    // Pipeline: background
     // ------------------------------------------------------------------
 
     fn run_pipeline_async(&mut self, pipeline: &Pipeline) -> Result<ExitStatus> {
@@ -466,23 +504,23 @@ impl Executor {
 
         for (idx, cmd) in pipeline.commands.iter().enumerate() {
             let is_last = idx == n - 1;
-            let (pipe_read, pipe_write) = if !is_last {
+            let (pipe_read, pipe_write) = if is_last {
+                (None, None)
+            } else {
                 let (r, w) = raw_pipe()?;
                 (Some(r), Some(w))
-            } else {
-                (None, None)
             };
 
-            let pid = self.fork_command(cmd, prev_read, pipe_write, pgid)?;
+            let child = self.fork_command(cmd, prev_read, pipe_write, pgid)?;
 
             if let Some(existing) = pgid {
-                let _ = setpgid(Some(pid), Some(existing));
+                let _ = setpgid(Some(child), Some(existing));
             } else {
-                pgid = Some(pid);
-                let _ = setpgid(Some(pid), Some(pid));
+                pgid = Some(child);
+                let _ = setpgid(Some(child), Some(child));
             }
 
-            pids.push(pid);
+            pids.push(child);
             if let Some(fd) = pipe_write {
                 close_raw(fd);
             }
@@ -536,7 +574,7 @@ impl Executor {
     fn exec_command_in_child(&mut self, cmd: &Command) -> i32 {
         match cmd {
             Command::Simple(sc) => self.exec_simple_in_child(sc),
-            other => match self.run_command(other, None, None) {
+            other => match self.run_command(other) {
                 Ok(s) => s.0,
                 Err(e) => {
                     if !is_break(&e) && !is_continue(&e) {
@@ -575,22 +613,11 @@ impl Executor {
         }
 
         let raw = &cmd_words[0];
-        let (name, expanded_args): (String, Vec<String>) = if let Some(alias_val) =
-            self.env.get_alias(raw)
-        {
-            let mut parts: Vec<String> = alias_val.split_whitespace().map(String::from).collect();
-            let alias_name = if parts.is_empty() {
-                raw.clone()
-            } else {
-                parts.remove(0)
-            };
-            parts.extend_from_slice(&cmd_words[1..]);
-            (alias_name, parts)
-        } else {
-            (raw.clone(), cmd_words[1..].to_vec())
-        };
-
-        let args: Vec<&str> = expanded_args.iter().map(|s| s.as_str()).collect();
+        let (name, expanded_args) = resolve_alias(&self.env, raw, &cmd_words[1..]);
+        let args: Vec<&str> = expanded_args
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
 
         if let Some(f) = lookup_builtin(name.as_str()) {
             return match f(self, &args) {
@@ -604,7 +631,7 @@ impl Executor {
 
         let mut full_words = vec![name];
         full_words.extend_from_slice(&expanded_args);
-        match self.do_exec(&full_words) {
+        match Executor::do_exec(&full_words) {
             Ok(_) => unreachable!(),
             Err(e) => {
                 eprintln!("swagsh: {e}");
@@ -617,12 +644,7 @@ impl Executor {
     // Command dispatch
     // ------------------------------------------------------------------
 
-    fn run_command(
-        &mut self,
-        cmd: &Command,
-        _stdin: Option<RawFd>,
-        _stdout: Option<RawFd>,
-    ) -> Result<ExitStatus> {
+    fn run_command(&mut self, cmd: &Command) -> Result<ExitStatus> {
         match cmd {
             Command::Simple(sc) => self.run_simple(sc),
             Command::Pipeline(p) => self.run_pipeline(p),
@@ -649,9 +671,9 @@ impl Executor {
         let (assignments, cmd_words) = words.split_at(assign_count);
 
         if cmd_words.is_empty() {
-            let saved = self.save_fds(&[0, 1, 2])?;
+            let saved = save_fds(&[0, 1, 2])?;
             self.apply_redirects(&sc.redirects)?;
-            self.restore_fds(saved)?;
+            restore_fds(saved)?;
             for assign in assignments {
                 let (name, value) = assign.split_once('=').unwrap();
                 self.env.set(name, value);
@@ -660,41 +682,34 @@ impl Executor {
         }
 
         let raw = &cmd_words[0];
-        let (name, mut args): (String, Vec<String>) = if let Some(alias_val) =
-            self.env.get_alias(raw)
-        {
-            let mut parts: Vec<String> = alias_val.split_whitespace().map(String::from).collect();
-            let alias_name = if parts.is_empty() {
-                raw.clone()
-            } else {
-                parts.remove(0)
-            };
-            parts.extend_from_slice(&cmd_words[1..]);
-            (alias_name, parts)
-        } else {
-            (raw.clone(), cmd_words[1..].to_vec())
-        };
-        let _ = &mut args;
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let (name, args) = resolve_alias(&self.env, raw, &cmd_words[1..]);
+        let arg_refs: Vec<&str> = args.iter().map(std::string::String::as_str).collect();
         let special = is_special_builtin(&name);
 
         if let Some(f) = lookup_builtin(name.as_str()) {
-            let no_split_args: Vec<String> = if matches!(name.as_str(), "alias" | "unalias") {
-                sc.words[assign_count + 1..]
-                    .iter()
-                    .map(|w| self.expand_word(w).map(|mut v| v.remove(0)))
-                    .collect::<Result<Vec<_>>>()?
+            // alias/unalias need verbatim (non-IFS-split) args to preserve quoted values.
+            let alias_args: Option<Vec<String>> = if matches!(name.as_str(), "alias" | "unalias") {
+                Some(
+                    sc.words[assign_count + 1..]
+                        .iter()
+                        .map(|w| self.expand_word(w).map(|mut v| v.remove(0)))
+                        .collect::<Result<Vec<_>>>()?,
+                )
             } else {
-                Vec::new()
+                None
             };
+            let effective_arg_refs: Vec<&str> = alias_args.as_ref().map_or_else(
+                || arg_refs.clone(),
+                |v| v.iter().map(String::as_str).collect(),
+            );
 
-            let effective_arg_refs: Vec<&str> = if matches!(name.as_str(), "alias" | "unalias") {
-                no_split_args.iter().map(|s| s.as_str()).collect()
+            let saved_vars: Vec<(String, Option<String>)> = if special {
+                for a in assignments {
+                    let (k, v) = a.split_once('=').unwrap();
+                    self.env.set(k, v);
+                }
+                vec![]
             } else {
-                arg_refs.clone()
-            };
-
-            let saved_vars: Vec<(String, Option<String>)> = if !special {
                 assignments
                     .iter()
                     .map(|a| {
@@ -704,27 +719,16 @@ impl Executor {
                         (k.to_owned(), old)
                     })
                     .collect()
-            } else {
-                for a in assignments {
-                    let (k, v) = a.split_once('=').unwrap();
-                    self.env.set(k, v);
-                }
-                vec![]
             };
 
-            let saved_fds = self.save_fds(&[0, 1, 2])?;
+            let saved_fds = save_fds(&[0, 1, 2])?;
             let result = if let Err(e) = self.apply_redirects(&sc.redirects) {
                 Err(e)
             } else {
                 f(self, &effective_arg_refs)
             };
-            let _ = self.restore_fds(saved_fds);
-            for (k, old) in saved_vars {
-                match old {
-                    Some(v) => self.env.set(&k, v),
-                    None => self.env.unset(&k),
-                }
-            }
+            let _ = restore_fds(saved_fds);
+            self.env.restore_vars(saved_vars);
             return result;
         }
 
@@ -741,20 +745,15 @@ impl Executor {
 
             let old_args = self.env.positional_args().to_vec();
             self.env.set_positional_args(args);
-            let saved_fds = self.save_fds(&[0, 1, 2])?;
+            let saved_fds = save_fds(&[0, 1, 2])?;
             let result = if let Err(e) = self.apply_redirects(&sc.redirects) {
                 Err(e)
             } else {
-                self.run_command(&body, None, None)
+                self.run_command(&body)
             };
-            let _ = self.restore_fds(saved_fds);
+            let _ = restore_fds(saved_fds);
             self.env.set_positional_args(old_args);
-            for (k, old) in saved_vars {
-                match old {
-                    Some(v) => self.env.set(&k, v),
-                    None => self.env.unset(&k),
-                }
-            }
+            self.env.restore_vars(saved_vars);
             return result;
         }
 
@@ -786,7 +785,7 @@ impl Executor {
                     eprintln!("swagsh: {e}");
                     std::process::exit(1);
                 }
-                match self.do_exec(words) {
+                match Executor::do_exec(words) {
                     Ok(_) => unreachable!(),
                     Err(e) => {
                         eprintln!("swagsh: {e}");
@@ -823,13 +822,13 @@ impl Executor {
     // exec(3)
     // ------------------------------------------------------------------
 
-    fn do_exec(&self, words: &[String]) -> Result<std::convert::Infallible> {
+    fn do_exec(words: &[String]) -> Result<std::convert::Infallible> {
         if words.is_empty() {
             bail!("exec: no command");
         }
         let argv: Vec<CString> = words
             .iter()
-            .map(|w| CString::new(w.as_str()).map_err(|e| eyre!(e)))
+            .map(|w| CString::new(w.as_str()).map_err(|e| anyhow!(e)))
             .collect::<Result<_>>()?;
         let errno = execvp_path(&argv);
         bail!("{}: {}", words[0], errno);
@@ -873,7 +872,7 @@ impl Executor {
                     status = ExitStatus::SUCCESS;
                     break;
                 }
-                Err(e) if is_continue(&e) => continue,
+                Err(e) if is_continue(&e) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -893,7 +892,7 @@ impl Executor {
                     status = ExitStatus::SUCCESS;
                     break;
                 }
-                Err(e) if is_continue(&e) => continue,
+                Err(e) if is_continue(&e) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -908,11 +907,8 @@ impl Executor {
             .unwrap_or_default();
         for arm in &cc.arms {
             for pattern in &arm.patterns {
-                let pat = self
-                    .expand_word(pattern)?
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default();
+                // Patterns are NOT glob-expanded against the filesystem: they ARE globs.
+                let pat = self.expand_word_to_string(pattern)?;
                 if glob_match(&pat, &word) {
                     return self.run_list(&arm.body);
                 }
@@ -967,7 +963,7 @@ impl Executor {
                 }
                 RedirectKind::FdOut => {
                     if let Word::Literal(s) = &r.target {
-                        let target_fd: RawFd = s.parse().map_err(|_| eyre!("invalid fd: {s}"))?;
+                        let target_fd: RawFd = s.parse().map_err(|_| anyhow!("invalid fd: {s}"))?;
                         dup2_raw(target_fd, r.fd)?;
                     }
                 }
@@ -982,11 +978,11 @@ impl Executor {
                         Word::Literal(s) => s.clone(),
                         other => self.expand_word_to_string(other)?,
                     };
-                    let content = expand_heredoc_body(&raw, self)?;
+                    let content = expand_heredoc_body(&raw, self);
                     let (read_fd, write_fd) = raw_pipe()?;
                     let bytes = content.as_bytes();
                     if bytes.len() < 65536 {
-                        // Fits in the pipe buffer — write directly without forking.
+                        // Fits in the pipe buffer: write directly without forking.
                         let mut written = 0;
                         while written < bytes.len() {
                             match write_raw(write_fd, &bytes[written..]) {
@@ -996,7 +992,7 @@ impl Executor {
                         }
                         close_raw(write_fd);
                     } else {
-                        // Too large for the buffer — fork a writer to avoid blocking.
+                        // Too large for the buffer: fork a writer to avoid blocking.
                         // SAFETY: grandchild only writes to the pipe and exits immediately.
                         if let Ok(Fork::Child(_)) = unsafe { kernel_fork() } {
                             close_raw(read_fd);
@@ -1025,36 +1021,40 @@ impl Executor {
             .expand_word(word)?
             .into_iter()
             .next()
-            .ok_or_else(|| eyre!("empty redirect target"))?;
+            .ok_or_else(|| anyhow!("empty redirect target"))?;
         Ok(PathBuf::from(s))
     }
 
     // ------------------------------------------------------------------
     // Fd save/restore
     // ------------------------------------------------------------------
+}
 
-    fn save_fds(&self, fds: &[RawFd]) -> Result<Vec<(RawFd, RawFd)>> {
-        let mut saved = Vec::with_capacity(fds.len());
-        for &fd in fds {
-            match dup_save(fd) {
-                Ok(saved_fd) => saved.push((fd, saved_fd)),
-                Err(e) => {
-                    saved.into_iter().for_each(|(_, s)| close_raw(s));
-                    return Err(eyre!(e));
+fn save_fds(fds: &[RawFd]) -> Result<Vec<(RawFd, RawFd)>> {
+    let mut saved = Vec::with_capacity(fds.len());
+    for &fd in fds {
+        match dup_save(fd) {
+            Ok(saved_fd) => saved.push((fd, saved_fd)),
+            Err(e) => {
+                for (_, s) in saved {
+                    close_raw(s);
                 }
+                return Err(anyhow!(e));
             }
         }
-        Ok(saved)
     }
+    Ok(saved)
+}
 
-    fn restore_fds(&self, saved: Vec<(RawFd, RawFd)>) -> Result<()> {
-        for (original, saved_fd) in saved {
-            dup2_raw(saved_fd, original).map_err(|e| eyre!(e))?;
-            close_raw(saved_fd);
-        }
-        Ok(())
+fn restore_fds(saved: Vec<(RawFd, RawFd)>) -> Result<()> {
+    for (original, saved_fd) in saved {
+        dup2_raw(saved_fd, original).map_err(|e| anyhow!(e))?;
+        close_raw(saved_fd);
     }
+    Ok(())
+}
 
+impl Executor {
     // ------------------------------------------------------------------
     // Wait
     // ------------------------------------------------------------------
@@ -1074,11 +1074,11 @@ impl Executor {
                         }
                         return Ok(ExitStatus(130));
                     }
-                    // continued or other — loop
+                    // continued or other: loop
                 }
-                Ok(None) => continue, // NOHANG would return None; with UNTRACED this means interrupted
-                Err(e) if e == Errno::INTR => continue,
-                Err(e) => return Err(eyre!(e)),
+                Ok(None) => {} // NOHANG: UNTRACED → loop
+                Err(e) if e == Errno::INTR => {}
+                Err(e) => return Err(anyhow!(e)),
             }
         }
     }
@@ -1191,11 +1191,8 @@ impl Executor {
                 close_raw(read_fd);
                 let _ = dup2_raw(write_fd, 1);
                 close_raw(write_fd);
-                let mut child_exec =
-                    Executor::new(self.env.clone(), false).expect("executor init in cmd sub");
-                let status = child_exec
-                    .run_command(cmd, None, None)
-                    .unwrap_or(ExitStatus::FAILURE);
+                let mut child_exec = Executor::new(self.env.clone(), false);
+                let status = child_exec.run_command(cmd).unwrap_or(ExitStatus::FAILURE);
                 std::process::exit(status.0);
             }
             Fork::ParentOf(child) => {
@@ -1206,8 +1203,8 @@ impl Executor {
                     match read_raw(read_fd, &mut buf) {
                         Ok(0) => break,
                         Ok(n) => output.extend_from_slice(&buf[..n]),
-                        Err(e) if e == Errno::INTR => continue,
-                        Err(e) => return Err(eyre!(e)),
+                        Err(e) if e == Errno::INTR => {}
+                        Err(e) => return Err(anyhow!(e)),
                     }
                 }
                 close_raw(read_fd);
@@ -1240,6 +1237,27 @@ impl Executor {
 }
 
 // ---------------------------------------------------------------------------
+// Loop control signal: typed alternative to string-sentinel errors.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum LoopSignal {
+    Break,
+    Continue,
+}
+
+impl fmt::Display for LoopSignal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Break => f.write_str("break outside loop"),
+            Self::Continue => f.write_str("continue outside loop"),
+        }
+    }
+}
+
+impl std::error::Error for LoopSignal {}
+
+// ---------------------------------------------------------------------------
 // Built-ins
 // ---------------------------------------------------------------------------
 
@@ -1253,10 +1271,10 @@ fn builtin_false(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
     Ok(ExitStatus::FAILURE)
 }
 fn builtin_break(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
-    Err(eyre!("__break__"))
+    Err(Error::new(LoopSignal::Break))
 }
 fn builtin_continue(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
-    Err(eyre!("__continue__"))
+    Err(Error::new(LoopSignal::Continue))
 }
 
 fn builtin_alias(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
@@ -1271,14 +1289,11 @@ fn builtin_alias(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
     for arg in args {
         if let Some((k, v)) = arg.split_once('=') {
             exec.env.set_alias(k.to_owned(), v.to_owned());
+        } else if let Some(v) = exec.env.get_alias(arg) {
+            println!("alias {arg}='{v}'");
         } else {
-            match exec.env.get_alias(arg) {
-                Some(v) => println!("alias {arg}='{v}'"),
-                None => {
-                    eprintln!("swagsh: alias: {arg}: not found");
-                    return Ok(ExitStatus::FAILURE);
-                }
-            }
+            eprintln!("swagsh: alias: {arg}: not found");
+            return Ok(ExitStatus::FAILURE);
         }
     }
     Ok(ExitStatus::SUCCESS)
@@ -1304,7 +1319,7 @@ fn builtin_cd(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
     let old = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
-    std::env::set_current_dir(&target).map_err(|e| eyre!("cd: {target}: {e}"))?;
+    std::env::set_current_dir(&target).map_err(|e| anyhow!("cd: {target}: {e}"))?;
     exec.env.export("OLDPWD", old);
     let new = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -1317,7 +1332,7 @@ fn builtin_pwd(_exec: &mut Executor, _args: &[&str]) -> Result<ExitStatus> {
     println!(
         "{}",
         std::env::current_dir()
-            .map_err(|e| eyre!("pwd: {e}"))?
+            .map_err(|e| anyhow!("pwd: {e}"))?
             .display()
     );
     Ok(ExitStatus::SUCCESS)
@@ -1381,14 +1396,13 @@ fn builtin_printf(_exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
                         .unwrap_or("0")
                         .parse()
                         .unwrap_or(0.0);
-                    output.push_str(&format!("{f:.6}"));
+                    let _ = write!(output, "{f:.6}");
                 }
-                Some('%') => output.push('%'),
+                Some('%') | None => output.push('%'),
                 Some(other) => {
                     output.push('%');
                     output.push(other);
                 }
-                None => output.push('%'),
             }
         } else {
             output.push(c);
@@ -1430,8 +1444,12 @@ fn builtin_set(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
         return Ok(ExitStatus::SUCCESS);
     }
     if args.first() == Some(&"--") {
-        exec.env
-            .set_positional_args(args[1..].iter().map(|s| s.to_string()).collect());
+        exec.env.set_positional_args(
+            args[1..]
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+        );
     }
     Ok(ExitStatus::SUCCESS)
 }
@@ -1439,18 +1457,18 @@ fn builtin_set(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
 fn builtin_source(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
     let path = args
         .first()
-        .ok_or_else(|| eyre!("source: filename required"))?;
-    let src = std::fs::read_to_string(path).map_err(|e| eyre!("source: {path}: {e}"))?;
-    let program = crate::parser::parse(&src).map_err(|e| eyre!("source: {path}: {e}"))?;
+        .ok_or_else(|| anyhow!("source: filename required"))?;
+    let src = std::fs::read_to_string(path).map_err(|e| anyhow!("source: {path}: {e}"))?;
+    let program = crate::parser::parse(&src).map_err(|e| anyhow!("source: {path}: {e}"))?;
     exec.run_program(&program)
 }
 
-fn builtin_exec(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
+fn builtin_exec(_exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
     if args.is_empty() {
         return Ok(ExitStatus::SUCCESS);
     }
-    let words: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    exec.do_exec(&words)?;
+    let words: Vec<String> = args.iter().map(std::string::ToString::to_string).collect();
+    Executor::do_exec(&words)?;
     unreachable!()
 }
 
@@ -1488,7 +1506,7 @@ fn builtin_fg(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
         .iter()
         .find(|j| j.id == id)
         .map(|j| (j.pgid, j.command.clone()))
-        .ok_or_else(|| eyre!("fg: no such job: {id}"))?;
+        .ok_or_else(|| anyhow!("fg: no such job: {id}"))?;
     eprintln!("{cmd}");
     kill_process_group(pgid, Signal::CONT)?;
     let _ = tcsetpgrp_stdin(pgid);
@@ -1503,11 +1521,11 @@ fn builtin_fg(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
                     let _ = tcsetpgrp_stdin(exec.shell_pgid);
                     break ExitStatus(130);
                 }
-                // continued — keep waiting
+                // continued: keep waiting
             }
-            Ok(None) => continue,
-            Err(e) if e == Errno::INTR => continue,
-            Err(e) => return Err(eyre!(e)),
+            Ok(None) => {}
+            Err(e) if e == Errno::INTR => {}
+            Err(e) => return Err(anyhow!(e)),
         }
     };
     let _ = tcsetpgrp_stdin(exec.shell_pgid);
@@ -1525,7 +1543,7 @@ fn builtin_bg(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
         .iter()
         .find(|j| j.id == id)
         .map(|j| j.pgid)
-        .ok_or_else(|| eyre!("bg: no such job: {id}"))?;
+        .ok_or_else(|| anyhow!("bg: no such job: {id}"))?;
     kill_process_group(pgid, Signal::CONT)?;
     eprintln!("[{id}]+ {pgid} &");
     Ok(ExitStatus::SUCCESS)
@@ -1544,24 +1562,24 @@ fn builtin_kill(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
             .ok()
             .and_then(Signal::from_named_raw)
             .or_else(|| parse_signal_name(sig_str))
-            .ok_or_else(|| eyre!("kill: invalid signal: {sig_str}"))?;
+            .ok_or_else(|| anyhow!("kill: invalid signal: {sig_str}"))?;
         targets = &args[1..];
     }
     for target in targets {
         let pid = if let Some(id_str) = target.strip_prefix('%') {
             let id: usize = id_str
                 .parse()
-                .map_err(|_| eyre!("kill: invalid job: {target}"))?;
+                .map_err(|_| anyhow!("kill: invalid job: {target}"))?;
             exec.jobs
                 .iter()
                 .find(|j| j.id == id)
                 .map(|j| j.pgid)
-                .ok_or_else(|| eyre!("kill: no such job: {id}"))?
+                .ok_or_else(|| anyhow!("kill: no such job: {id}"))?
         } else {
             let raw: i32 = target
                 .parse()
-                .map_err(|_| eyre!("kill: invalid pid: {target}"))?;
-            Pid::from_raw(raw).ok_or_else(|| eyre!("kill: invalid pid: {target}"))?
+                .map_err(|_| anyhow!("kill: invalid pid: {target}"))?;
+            Pid::from_raw(raw).ok_or_else(|| anyhow!("kill: invalid pid: {target}"))?
         };
         kill_process(pid, sig)?;
     }
@@ -1573,7 +1591,7 @@ fn builtin_kill(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// execvp — PATH-searching exec, built on rustix::runtime::execve.
+// execvp: PATH-searching exec, built on rustix::runtime::execve.
 //
 // If `argv[0]` contains a `/` it is used as an absolute/relative path directly.
 // Otherwise every directory in `$PATH` is tried in order.  The function only
@@ -1605,7 +1623,7 @@ fn execvp_path(argv: &[CString]) -> Errno {
     let name = &argv[0];
     let name_bytes = name.to_bytes();
 
-    // If the name contains a slash, exec it directly — no PATH search.
+    // If the name contains a slash, exec it directly: no PATH search.
     if name_bytes.contains(&b'/') {
         // SAFETY: argv_ptrs and envp_ptrs are null-terminated arrays of valid
         // pointers into CString data that outlive this call.
@@ -1656,7 +1674,7 @@ fn glob_expand(pattern: &str) -> Vec<String> {
         return vec![];
     };
     let mut results: Vec<String> = entries
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.file_name().to_string_lossy().to_string())
         .filter(|name| glob_match(file_pat, name))
         .map(|name| {
@@ -1671,7 +1689,7 @@ fn glob_expand(pattern: &str) -> Vec<String> {
     results
 }
 
-fn expand_heredoc_body(body: &str, exec: &mut Executor) -> Result<String> {
+fn expand_heredoc_body(body: &str, exec: &mut Executor) -> String {
     use crate::parser::parse;
     let mut result = String::with_capacity(body.len());
     let mut chars = body.chars().peekable();
@@ -1731,7 +1749,7 @@ fn expand_heredoc_body(body: &str, exec: &mut Executor) -> Result<String> {
     if !result.ends_with('\n') {
         result.push('\n');
     }
-    Ok(result)
+    result
 }
 
 fn builtin_bracket(exec: &mut Executor, args: &[&str]) -> Result<ExitStatus> {
@@ -1912,34 +1930,19 @@ fn parse_primary<'a>(args: &'a [&'a str]) -> Option<(bool, &'a [&'a str])> {
                 "-d" => p.is_dir(),
                 "-L" | "-h" => p
                     .symlink_metadata()
-                    .map(|m| m.file_type().is_symlink())
-                    .unwrap_or(false),
-                // rustix::fs::access — safe, no libc or unsafe needed.
+                    .is_ok_and(|m| m.file_type().is_symlink()),
+                // rustix::fs::access: safe, no libc or unsafe needed.
                 "-r" => fs::access(p, Access::READ_OK).is_ok(),
                 "-w" => fs::access(p, Access::WRITE_OK).is_ok(),
                 "-x" => fs::access(p, Access::EXEC_OK).is_ok(),
-                "-s" => sfs::metadata(p).map(|m| m.size() > 0).unwrap_or(false),
-                "-b" => sfs::metadata(p)
-                    .map(|m| m.file_type().is_block_device())
-                    .unwrap_or(false),
-                "-c" => sfs::metadata(p)
-                    .map(|m| m.file_type().is_char_device())
-                    .unwrap_or(false),
-                "-p" => sfs::metadata(p)
-                    .map(|m| m.file_type().is_fifo())
-                    .unwrap_or(false),
-                "-S" => sfs::metadata(p)
-                    .map(|m| m.file_type().is_socket())
-                    .unwrap_or(false),
-                "-u" => sfs::metadata(p)
-                    .map(|m| m.mode() & 0o4000 != 0)
-                    .unwrap_or(false),
-                "-g" => sfs::metadata(p)
-                    .map(|m| m.mode() & 0o2000 != 0)
-                    .unwrap_or(false),
-                "-k" => sfs::metadata(p)
-                    .map(|m| m.mode() & 0o1000 != 0)
-                    .unwrap_or(false),
+                "-s" => sfs::metadata(p).is_ok_and(|m| m.size() > 0),
+                "-b" => sfs::metadata(p).is_ok_and(|m| m.file_type().is_block_device()),
+                "-c" => sfs::metadata(p).is_ok_and(|m| m.file_type().is_char_device()),
+                "-p" => sfs::metadata(p).is_ok_and(|m| m.file_type().is_fifo()),
+                "-S" => sfs::metadata(p).is_ok_and(|m| m.file_type().is_socket()),
+                "-u" => sfs::metadata(p).is_ok_and(|m| m.mode() & 0o4000 != 0),
+                "-g" => sfs::metadata(p).is_ok_and(|m| m.mode() & 0o2000 != 0),
+                "-k" => sfs::metadata(p).is_ok_and(|m| m.mode() & 0o1000 != 0),
                 _ => false,
             };
             Some((val, rest))
@@ -1948,21 +1951,17 @@ fn parse_primary<'a>(args: &'a [&'a str]) -> Option<(bool, &'a [&'a str])> {
         ["-z", s, rest @ ..] => Some((s.is_empty(), rest)),
         ["-n", s, rest @ ..] => Some((!s.is_empty(), rest)),
 
-        // -t fd  — test whether fd is a terminal.
+        // -t fd : test whether fd is a terminal.
         ["-t", fd_str, rest @ ..] => {
-            let val = fd_str
-                .parse::<RawFd>()
-                .map(|fd| {
-                    // SAFETY: we only borrow the fd for the duration of isatty;
-                    // the descriptor is not closed or otherwise manipulated.
-                    isatty(unsafe { BorrowedFd::borrow_raw(fd) })
-                })
-                .unwrap_or(false);
+            let val = fd_str.parse::<RawFd>().is_ok_and(|fd| {
+                // SAFETY: we only borrow the fd for the duration of isatty;
+                // the descriptor is not closed or otherwise manipulated.
+                isatty(unsafe { BorrowedFd::borrow_raw(fd) })
+            });
             Some((val, rest))
         }
 
-        [a, "=", b, rest @ ..] => Some((a == b, rest)),
-        [a, "==", b, rest @ ..] => Some((a == b, rest)),
+        [a, "=" | "==", b, rest @ ..] => Some((a == b, rest)),
         [a, "!=", b, rest @ ..] => Some((a != b, rest)),
         [a, "<", b, rest @ ..] => Some((a < b, rest)),
         [a, ">", b, rest @ ..] => Some((a > b, rest)),
@@ -1994,16 +1993,16 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 fn glob_match_inner(p: &[char], t: &[char]) -> bool {
-    match (p.first(), t.first()) {
-        (None, None) => true,
-        (None, _) => false,
-        (Some(&'*'), _) => {
-            glob_match_inner(&p[1..], t) || (!t.is_empty() && glob_match_inner(p, &t[1..]))
-        }
-        (_, None) => false,
-        (Some(&'?'), _) => glob_match_inner(&p[1..], &t[1..]),
-        (Some(pc), Some(tc)) => pc == tc && glob_match_inner(&p[1..], &t[1..]),
+    let Some(pc) = p.first() else {
+        return t.is_empty();
+    };
+    if *pc == '*' {
+        return glob_match_inner(&p[1..], t) || (!t.is_empty() && glob_match_inner(p, &t[1..]));
     }
+    let Some(tc) = t.first() else {
+        return false;
+    };
+    (*pc == '?' || pc == tc) && glob_match_inner(&p[1..], &t[1..])
 }
 
 fn parse_param_op(s: &str) -> Option<(&str, &str, &str)> {
@@ -2024,13 +2023,12 @@ fn unescape(s: &str) -> String {
                 Some('n') => out.push('\n'),
                 Some('t') => out.push('\t'),
                 Some('r') => out.push('\r'),
-                Some('\\') => out.push('\\'),
+                Some('\\') | None => out.push('\\'),
                 Some('0') => out.push('\0'),
                 Some(other) => {
                     out.push('\\');
                     out.push(other);
                 }
-                None => out.push('\\'),
             }
         } else {
             out.push(c);
@@ -2068,8 +2066,7 @@ fn is_assignment(word: &str) -> bool {
         && name
             .chars()
             .next()
-            .map(|c| c.is_ascii_alphabetic() || c == '_')
-            .unwrap_or(false)
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -2090,9 +2087,9 @@ fn is_special_builtin(name: &str) -> bool {
     )
 }
 
-fn is_break(e: &Report) -> bool {
-    e.to_string() == "__break__"
+fn is_break(e: &Error) -> bool {
+    matches!(e.downcast_ref::<LoopSignal>(), Some(LoopSignal::Break))
 }
-fn is_continue(e: &Report) -> bool {
-    e.to_string() == "__continue__"
+fn is_continue(e: &Error) -> bool {
+    matches!(e.downcast_ref::<LoopSignal>(), Some(LoopSignal::Continue))
 }
