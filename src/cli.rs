@@ -1,6 +1,6 @@
 use clap::Parser;
 
-/// A fast, minimal shell for Linux.
+/// A fast, minimal, modern Linux shell. Named after swag, slang for stylish flair.
 // CLI flag structs legitimately hold many booleans; grouping them would add
 // indirection without any benefit.
 #[allow(clippy::struct_excessive_bools)]

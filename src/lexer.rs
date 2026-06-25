@@ -1,5 +1,18 @@
 use std::fmt;
 
+// UTF-8 byte classification used by the lexer to handle multi-byte characters.
+// Any byte >= 0x80 is part of a multi-byte sequence: start bytes are 0xC0-0xFF,
+// continuation bytes are 0x80-0xBF. ASCII is 0x00-0x7F (< 0x80).
+const UTF8_CONT_START: u8 = 0x80; // first continuation byte
+const UTF8_CONT_END: u8 = 0xBF; // last continuation byte
+
+// Sentinels used to communicate single-quote boundaries to decompose_word.
+// These control characters (SOH/STX) cannot appear in valid shell source.
+pub(crate) const QUOTE_START: char = '\x01';
+pub(crate) const QUOTE_END: char = '\x02';
+pub(crate) const QUOTE_START_BYTE: u8 = QUOTE_START as u8;
+pub(crate) const QUOTE_END_BYTE: u8 = QUOTE_END as u8;
+
 // ---------------------------------------------------------------------------
 // Token types
 // ---------------------------------------------------------------------------
@@ -165,6 +178,24 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    /// Push a complete UTF-8 scalar to `buf`.
+    ///
+    /// Call this after `advance()` has consumed the first byte of the sequence
+    /// and returned it. `start` must be `self.pos - 1` (the byte just consumed).
+    /// Continuation bytes (0x80-0xBF) are consumed and the full sequence is
+    /// appended to `buf` as a valid UTF-8 str slice.
+    ///
+    /// SAFETY: `self.src` is from a valid `&str`, so any run of bytes starting
+    /// with a non-continuation byte and followed only by continuation bytes is
+    /// a complete, valid UTF-8 scalar. Slicing at these positions is safe.
+    #[inline]
+    fn push_utf8(&mut self, buf: &mut String, start: usize) {
+        while matches!(self.peek(), Some(UTF8_CONT_START..=UTF8_CONT_END)) {
+            self.advance();
+        }
+        buf.push_str(unsafe { std::str::from_utf8_unchecked(&self.src[start..self.pos]) });
+    }
+
     // ------------------------------------------------------------------
     // Whitespace & comments
     // ------------------------------------------------------------------
@@ -202,7 +233,8 @@ impl<'src> Lexer<'src> {
             match self.advance() {
                 None => return Err(self.err("unterminated single-quoted string")),
                 Some(b'\'') => break,
-                Some(b) => buf.push(b as char),
+                Some(b) if b < UTF8_CONT_START => buf.push(b as char),
+                Some(_) => self.push_utf8(buf, self.pos - 1),
             }
         }
         Ok(())
@@ -229,7 +261,8 @@ impl<'src> Lexer<'src> {
                         buf.push('\\');
                     }
                 },
-                Some(b) => buf.push(b as char),
+                Some(b) if b < UTF8_CONT_START => buf.push(b as char),
+                Some(_) => self.push_utf8(buf, self.pos - 1),
             }
         }
         Ok(())
@@ -262,10 +295,15 @@ impl<'src> Lexer<'src> {
                 Some(b'\\') => {
                     buf.push('\\');
                     if let Some(n) = self.advance() {
-                        buf.push(n as char);
+                        if n < UTF8_CONT_START {
+                            buf.push(n as char);
+                        } else {
+                            self.push_utf8(buf, self.pos - 1);
+                        }
                     }
                 }
-                Some(b) => buf.push(b as char),
+                Some(b) if b < UTF8_CONT_START => buf.push(b as char),
+                Some(_) => self.push_utf8(buf, self.pos - 1),
             }
         }
         Ok(())
@@ -288,7 +326,8 @@ impl<'src> Lexer<'src> {
                         break;
                     }
                 }
-                Some(b) => buf.push(b as char),
+                Some(b) if b < UTF8_CONT_START => buf.push(b as char),
+                Some(_) => self.push_utf8(buf, self.pos - 1),
             }
         }
         Ok(())
@@ -306,10 +345,15 @@ impl<'src> Lexer<'src> {
                 Some(b'\\') => {
                     buf.push('\\');
                     if let Some(n) = self.advance() {
-                        buf.push(n as char);
+                        if n < UTF8_CONT_START {
+                            buf.push(n as char);
+                        } else {
+                            self.push_utf8(buf, self.pos - 1);
+                        }
                     }
                 }
-                Some(b) => buf.push(b as char),
+                Some(b) if b < UTF8_CONT_START => buf.push(b as char),
+                Some(_) => self.push_utf8(buf, self.pos - 1),
             }
         }
         Ok(())
@@ -369,9 +413,14 @@ impl<'src> Lexer<'src> {
                         self.advance();
                         break;
                     }
-                    Some(b) => {
+                    Some(b) if b < UTF8_CONT_START => {
                         line.push(b as char);
                         self.advance();
+                    }
+                    Some(_) => {
+                        let start = self.pos;
+                        self.advance();
+                        self.push_utf8(&mut line, start);
                     }
                 }
             }
@@ -470,7 +519,9 @@ impl<'src> Lexer<'src> {
                 }
                 Some(b'\'') => {
                     self.advance();
+                    buf.push(QUOTE_START);
                     self.lex_single_quoted(buf)?;
+                    buf.push(QUOTE_END);
                 }
                 Some(b'"') => {
                     self.advance();
@@ -512,9 +563,14 @@ impl<'src> Lexer<'src> {
                     self.advance();
                     self.lex_backtick(buf)?;
                 }
-                Some(b) => {
+                Some(b) if b < UTF8_CONT_START => {
                     buf.push(b as char);
                     self.advance();
+                }
+                Some(_) => {
+                    let start = self.pos;
+                    self.advance();
+                    self.push_utf8(buf, start);
                 }
             }
         }

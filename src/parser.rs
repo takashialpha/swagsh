@@ -4,7 +4,10 @@ use crate::ast::{
     AndOrItem, AndOrList, AndOrOp, CaseArm, CaseClause, Command, ForClause, FunctionDef, GroupCmd,
     IfClause, Pipeline, Program, Redirect, RedirectKind, SimpleCmd, WhileClause, Word,
 };
-use crate::lexer::{LexError, RedirKind, RedirToken, Token};
+use crate::lexer::{
+    LexError, QUOTE_END, QUOTE_END_BYTE, QUOTE_START, QUOTE_START_BYTE, RedirKind, RedirToken,
+    Token,
+};
 
 // ---------------------------------------------------------------------------
 // Parse errors
@@ -415,11 +418,13 @@ impl Parser {
     fn parse_word_str(&self, raw: &str) -> ParseResult<Word> {
         let bytes = raw.as_bytes();
 
-        // Fast path: pure literal (no `$`, `` ` ``, `"`, `\`).
-        if !bytes
-            .iter()
-            .any(|&b| matches!(b, b'$' | b'`' | b'"' | b'\\'))
-        {
+        // Fast path: pure literal (no special chars or quote sentinels).
+        if !bytes.iter().any(|&b| {
+            matches!(
+                b,
+                b'$' | b'`' | b'"' | b'\\' | QUOTE_START_BYTE | QUOTE_END_BYTE
+            )
+        }) {
             return Ok(Word::Literal(raw.to_owned()));
         }
 
@@ -766,8 +771,22 @@ fn decompose_word(raw: &str, parser: &Parser) -> ParseResult<Vec<Word>> {
                 None => lit.push('$'),
             },
 
+            // Single-quote sentinel injected by the lexer: literal content, no expansion.
+            QUOTE_START => {
+                flush_lit!();
+                let mut inner = String::new();
+                for (_, c) in chars.by_ref() {
+                    if c == QUOTE_END {
+                        break;
+                    }
+                    inner.push(c);
+                }
+                parts.push(Word::Quoted(Box::new(Word::Literal(inner))));
+            }
+
             '"' => {
-                // double-quoted region: recurse on the inner content
+                // Double-quoted region: expand $VAR/$(cmd) inside but suppress
+                // IFS splitting and glob expansion on the result.
                 flush_lit!();
                 let mut inner = String::new();
                 for (_, c) in chars.by_ref() {
@@ -776,13 +795,17 @@ fn decompose_word(raw: &str, parser: &Parser) -> ParseResult<Vec<Word>> {
                     }
                     inner.push(c);
                 }
-                // inner may itself contain $VAR / $(cmd)
-                if inner.chars().any(|c| c == '$' || c == '`') {
+                let inner_word = if inner.chars().any(|c| c == '$' || c == '`') {
                     let sub_parts = decompose_word(&inner, parser)?;
-                    parts.extend(sub_parts);
+                    if sub_parts.len() == 1 {
+                        sub_parts.into_iter().next().unwrap()
+                    } else {
+                        Word::Compound(sub_parts)
+                    }
                 } else {
-                    parts.push(Word::Literal(inner));
-                }
+                    Word::Literal(inner)
+                };
+                parts.push(Word::Quoted(Box::new(inner_word)));
             }
 
             '`' => {

@@ -24,6 +24,16 @@ fn main() -> Result<()> {
         env.set_positional_args(args);
     }
 
+    // Seed $HOSTNAME once so PS1 \h doesn't hit /etc/hostname on every prompt.
+    if env.get("HOSTNAME").is_none_or(|h| h.is_empty())
+        && let Ok(name) = std::fs::read_to_string("/etc/hostname")
+    {
+        let name = name.trim().to_owned();
+        if !name.is_empty() {
+            env.set("HOSTNAME", name);
+        }
+    }
+
     // -c "command string": non-interactive
     if let Some(cmd) = &cli.command {
         let mut exec = Executor::new(env, false);
@@ -266,19 +276,27 @@ fn extract_heredoc_delimiters(line: &str) -> Vec<String> {
 }
 
 fn source_startup_files(exec: &mut Executor, is_login: bool) {
-    let home = match exec.env.get("HOME") {
-        Some(h) => std::path::PathBuf::from(h),
-        None => return,
+    let Some(home_str) = exec.env.get("HOME") else {
+        return;
     };
+    let home = std::path::PathBuf::from(home_str);
+    // Login shells source the profile only. Non-login interactive shells source
+    // the rc only. Users who want both source the rc from their profile.
     if is_login {
         source_if_exists(exec, &home.join(".swagsh_profile"));
+    } else {
+        source_if_exists(exec, &home.join(".swagshrc"));
     }
-    source_if_exists(exec, &home.join(".swagshrc"));
 }
 
 fn source_if_exists(exec: &mut Executor, path: &std::path::Path) {
-    let Ok(src) = std::fs::read_to_string(path) else {
-        return;
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            eprintln!("swagsh: {}: {e}", path.display());
+            return;
+        }
     };
     match parser::parse(&src) {
         Ok(program) => {
@@ -292,9 +310,17 @@ fn run_interactive(mut exec: Executor, cli: &Cli) -> Result<()> {
     use rustyline::error::ReadlineError;
     use rustyline::{Config, Editor};
 
+    let histsize: usize = exec
+        .env
+        .get("HISTSIZE")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000)
+        .max(1);
+
     let config = Config::builder()
-        .max_history_size(1000)?
+        .max_history_size(histsize)?
         .history_ignore_space(true)
+        .history_ignore_dups(true)?
         .completion_type(rustyline::CompletionType::List)
         .build();
 
@@ -302,7 +328,7 @@ fn run_interactive(mut exec: Executor, cli: &Cli) -> Result<()> {
     let mut rl: Editor<ShellHelper, rustyline::history::FileHistory> = Editor::with_config(config)?;
     rl.set_helper(Some(helper));
 
-    let history_path = history_file();
+    let history_path = history_file(&exec.env);
     if !cli.private
         && let Some(ref p) = history_path
     {
@@ -347,8 +373,9 @@ fn run_interactive(mut exec: Executor, cli: &Cli) -> Result<()> {
 
     if !cli.private
         && let Some(ref p) = history_path
+        && let Err(e) = rl.save_history(p)
     {
-        let _ = rl.save_history(p);
+        eprintln!("swagsh: history: could not save to {}: {e}", p.display());
     }
     Ok(())
 }
@@ -369,7 +396,7 @@ fn build_prompt(exec: &Executor) -> String {
 }
 
 fn expand_ps1(ps1: &str, exec: &Executor) -> String {
-    let mut out = String::with_capacity(ps1.len());
+    let mut out = String::with_capacity(ps1.len() + 16);
     let mut chars = ps1.chars();
     while let Some(c) = chars.next() {
         if c != '\\' {
@@ -378,13 +405,20 @@ fn expand_ps1(ps1: &str, exec: &Executor) -> String {
         }
         match chars.next() {
             Some('w') => out.push_str(&current_dir_display(&exec.env)),
-            Some('u') => out.push_str(&exec.env.get_or_empty("USER")),
-            Some('h') => {
-                let host = exec.env.get_or_empty("HOSTNAME");
-                out.push_str(host.split('.').next().unwrap_or(&host));
+            Some('W') => {
+                let cwd = current_dir_display(&exec.env);
+                let base = cwd.rsplit('/').next().unwrap_or(&cwd);
+                out.push_str(if base.is_empty() { "/" } else { base });
             }
+            Some('u') => out.push_str(&exec.env.get_or_empty("USER")),
+            Some('h') => out.push_str(&short_hostname(&exec.env)),
             Some('$') => out.push(if getuid().is_root() { '#' } else { '$' }),
             Some('n') => out.push('\n'),
+            Some('e') => out.push('\x1b'),
+            // \[ and \] mark invisible sequences (ANSI colors) so readline can
+            // measure the visible prompt width correctly.
+            Some('[') => out.push('\x01'),
+            Some(']') => out.push('\x02'),
             Some(other) => {
                 out.push('\\');
                 out.push(other);
@@ -395,29 +429,49 @@ fn expand_ps1(ps1: &str, exec: &Executor) -> String {
     out
 }
 
-/// Returns the current working directory with `$HOME` collapsed to `~`.
-fn current_dir_display(env: &Env) -> String {
-    std::env::current_dir().map_or_else(
-        |_| "?".into(),
-        |p| {
-            let s = p.to_string_lossy().to_string();
-            let home = env.get_or_empty("HOME");
-            if !home.is_empty() && s.starts_with(&home) {
-                s.replacen(&home, "~", 1)
-            } else {
-                s
-            }
-        },
-    )
+fn short_hostname(env: &Env) -> String {
+    // $HOSTNAME is seeded from /etc/hostname at startup if not already set.
+    let host = env
+        .get("HOSTNAME")
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "localhost".to_owned());
+    host.split('.').next().unwrap_or(&host).to_owned()
 }
 
-fn history_file() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("HISTFILE") {
-        return Some(std::path::PathBuf::from(p));
+/// Returns the current working directory with `$HOME` collapsed to `~`.
+/// Prefers `$PWD` (logical path, preserves symlinks) over the kernel cwd.
+fn current_dir_display(env: &Env) -> String {
+    let cwd = env
+        .get("PWD")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("?"));
+
+    let s = cwd.to_string_lossy().into_owned();
+    let home = env.get_or_empty("HOME");
+
+    if home.is_empty() {
+        return s;
     }
-    std::env::var("HOME").ok().map(|h| {
-        let mut p = std::path::PathBuf::from(h);
-        p.push(".swagsh_history");
-        p
-    })
+    // Check at a path boundary to avoid /home/foobar collapsing to ~/bar.
+    if s == home {
+        "~".to_owned()
+    } else if s.starts_with(&format!("{home}/")) {
+        format!("~/{}", &s[home.len() + 1..])
+    } else {
+        s
+    }
+}
+
+fn history_file(env: &Env) -> Option<std::path::PathBuf> {
+    // $HISTFILE="" explicitly disables history; otherwise expand tilde and use it.
+    if let Some(raw) = env.get("HISTFILE") {
+        if raw.is_empty() {
+            return None;
+        }
+        return Some(std::path::PathBuf::from(expand_tilde(&raw, env)));
+    }
+    // Default: ~/.swagsh_history
+    env.get("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".swagsh_history"))
 }

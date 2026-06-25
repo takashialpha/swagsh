@@ -2,8 +2,7 @@
 
 # swagsh
 
-**A sleek, high-performance Linux shell built in Rust.**
-*Name inspired by* swag*, slang for stylish flair.*
+**A fast, minimal, modern Linux shell. Named after swag, slang for stylish flair.**
 
 [![crates.io](https://img.shields.io/crates/v/swagsh?style=flat-square&color=64b4ff&labelColor=161616)](https://crates.io/crates/swagsh)
 [![AUR](https://img.shields.io/aur/version/swagsh?style=flat-square&color=64b4ff&labelColor=161616)](https://aur.archlinux.org/packages/swagsh)
@@ -15,25 +14,26 @@
 
 ## Features
 
-- **Real shell grammar:** the POSIX constructs you reach for every day, like pipelines, redirections, substitutions, control flow, functions and subshells.
-- **Full expansions:** variable, parameter, tilde and glob expansion, with sensible defaults built in.
+- **Shell grammar:** pipelines, redirections, control flow, functions, subshells, and here-documents.
+- **Expansions:** variable, parameter, tilde, glob, and command substitution.
 - **Tab completion:** builtins, aliases, executables and filenames, out of the box.
 - **Job control:** background jobs, foreground and background switching, stopping and signalling.
-- **Configurable:** config and profile files, a customizable prompt, and persistent history.
+- **Prompt:** customisable via `$PS1` with `\w`, `\W`, `\u`, `\h`, `\e`, `\[`/`\]` and more.
+- **History:** persistent, respects `$HISTFILE` and `$HISTSIZE`, with private mode.
 
-Run `swagsh --help` for the full command set.
+Run `swagsh --help` for the full option set.
 
 ---
 
 ## Performance
 
-Measured with `hyperfine --shell=none` on Linux x86-64. On pure builtins swagsh runs within about 10% of dash, the irreducible gap between Rust's startup cost and a bare C binary, and about 37% faster than bash. On fork+exec workloads the gap to bash shrinks to a few percent.
+Measured with hyperfine --shell=none on Linux x86-64. Across builtins, variable expansion, conditionals, loops, and function calls, swagsh delivers dash-class performance: ~40% faster than bash. On pipelines, where process-spawn overhead dominates and the shell layer matters less, it's ~25% faster than bash.
 
 ---
 
 ## Installation
 
-**Cargo (all platforms):**
+**Cargo:**
 
 ```sh
 cargo install swagsh
@@ -52,6 +52,16 @@ git clone https://github.com/takashialpha/swagsh.git
 cd swagsh
 cargo build --release   # binary at target/release/swagsh
 ```
+
+---
+
+## TODO
+
+- `return` builtin: not yet implemented; calling it inside a function fails.
+- Arithmetic expansion `$((...))` is not supported.
+- Quoted heredocs (`<<'EOF'`): variable expansion inside the body is not suppressed as it should be.
+- String operators: `${#var}` (length), `${var%pat}` / `${var#pat}` (trim) are not implemented.
+- Reserved words (`done`, `fi`, `then`, etc.) cannot be passed as plain command arguments.
 
 ---
 

@@ -2,7 +2,7 @@
 name = "swagsh"
 version = "0.8.0"
 edition = "2024"
-description = "A sleek, high-performance Linux shell. Name inspired by 'swag' slang for stylish flair."
+description = "A fast, minimal, modern Linux shell. Named after swag, slang for stylish flair."
 authors = ["takashialpha <takashialpha@protonmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/takashialpha/swagsh"

@@ -1088,6 +1088,10 @@ impl Executor {
     // ------------------------------------------------------------------
 
     pub fn expand_word(&mut self, word: &Word) -> Result<Vec<String>> {
+        // Quoted words: expand variables/cmd-subs inside but skip glob and IFS.
+        if let Word::Quoted(inner) = word {
+            return Ok(vec![self.expand_word_to_string_inner(inner, true)?]);
+        }
         let raw = self.expand_word_to_string(word)?;
         if raw.contains('*') || raw.contains('?') || raw.contains('[') {
             let matches = glob_expand(&raw);
@@ -1099,9 +1103,14 @@ impl Executor {
     }
 
     pub(crate) fn expand_word_to_string(&mut self, word: &Word) -> Result<String> {
+        self.expand_word_to_string_inner(word, false)
+    }
+
+    fn expand_word_to_string_inner(&mut self, word: &Word, in_quotes: bool) -> Result<String> {
         match word {
             Word::Literal(s) => {
-                if s.starts_with('~') {
+                // Tilde expansion is suppressed inside single or double quotes.
+                if !in_quotes && s.starts_with('~') {
                     Ok(expand_tilde(s, &self.env))
                 } else {
                     Ok(s.clone())
@@ -1112,10 +1121,11 @@ impl Executor {
             Word::Compound(parts) => {
                 let mut result = String::new();
                 for part in parts {
-                    result.push_str(&self.expand_word_to_string(part)?);
+                    result.push_str(&self.expand_word_to_string_inner(part, in_quotes)?);
                 }
                 Ok(result)
             }
+            Word::Quoted(inner) => self.expand_word_to_string_inner(inner, true),
         }
     }
 
@@ -1220,8 +1230,12 @@ impl Executor {
         let ifs = self.env.get("IFS").unwrap_or_else(|| " \t\n".to_owned());
         let mut result = Vec::with_capacity(words.len());
         for word in words {
+            // IFS splitting only applies to bare (unquoted) variable or command
+            // substitutions. Literals, quoted regions, and compound words
+            // (which include things like x="hello world") produce a single token.
+            let split = matches!(word, Word::Var(_) | Word::CmdSub(_));
             for s in self.expand_word(word)? {
-                if s.contains(|c: char| ifs.contains(c)) {
+                if split && s.contains(|c: char| ifs.contains(c)) {
                     result.extend(
                         s.split(|c: char| ifs.contains(c))
                             .filter(|f| !f.is_empty())
@@ -1676,7 +1690,10 @@ fn glob_expand(pattern: &str) -> Vec<String> {
     let mut results: Vec<String> = entries
         .filter_map(std::result::Result::ok)
         .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|name| glob_match(file_pat, name))
+        .filter(|name| {
+            // POSIX: globs do not match dotfiles unless the pattern starts with '.'.
+            (file_pat.starts_with('.') || !name.starts_with('.')) && glob_match(file_pat, name)
+        })
         .map(|name| {
             if dir == "." {
                 name

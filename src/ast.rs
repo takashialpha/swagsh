@@ -10,6 +10,9 @@ pub enum Word {
     CmdSub(Box<Command>),
     /// A sequence of word-parts concatenated at expansion time.
     Compound(Vec<Word>),
+    /// Content from a single- or double-quoted region.
+    /// Suppresses IFS word-splitting and glob expansion on the result.
+    Quoted(Box<Word>),
 }
 
 // ---------------------------------------------------------------------------

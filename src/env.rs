@@ -26,10 +26,14 @@ impl Env {
         vars.entry("HOME".into())
             .or_insert_with(|| std::env::var("HOME").unwrap_or_else(|_| "/".into()));
         vars.entry("IFS".into()).or_insert_with(|| " \t\n".into());
-        if let Ok(cwd) = std::env::current_dir() {
-            let s = cwd.to_string_lossy().into_owned();
-            vars.insert("PWD".into(), s);
+        // Preserve the inherited $PWD (logical path through symlinks set by the
+        // parent shell). Only fall back to the kernel cwd if $PWD is absent.
+        if vars.contains_key("PWD") {
             exported.insert("PWD".into());
+        } else if let Ok(cwd) = std::env::current_dir() {
+            let s = cwd.to_string_lossy().into_owned();
+            exported.insert("PWD".into());
+            vars.insert("PWD".into(), s);
         }
         Self {
             vars,
