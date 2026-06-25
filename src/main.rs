@@ -17,9 +17,11 @@ fn main() -> Result<()> {
     let argv0 = std::env::args().next().unwrap_or_default();
     let cli = Cli::parse();
 
+    let (script, args) = cli.split_positionals();
+
     let mut env = Env::from_process();
-    if !cli.args.is_empty() {
-        env.set_positional_args(cli.args.clone());
+    if !args.is_empty() {
+        env.set_positional_args(args);
     }
 
     // -c "command string": non-interactive
@@ -34,7 +36,7 @@ fn main() -> Result<()> {
     }
 
     // Script file: non-interactive
-    if let Some(path) = &cli.script {
+    if let Some(path) = &script {
         let mut exec = Executor::new(env, false);
         let src = std::fs::read_to_string(path).map_err(|e| anyhow!("{}: {e}", path.display()))?;
         let program = parser::parse(&src)?;
@@ -46,9 +48,9 @@ fn main() -> Result<()> {
     }
 
     // Interactive REPL
-    let is_login = Cli::login_shell(&argv0);
+    let is_login = cli.login || Cli::is_login_shell(&argv0);
     let mut exec = Executor::new(env, true);
-    if !cli.no_config {
+    if !cli.no_rc {
         source_startup_files(&mut exec, is_login);
     }
     run_interactive(exec, &cli)?;
@@ -82,10 +84,16 @@ impl ShellCompleter {
 
 struct ShellHelper {
     completer: ShellCompleter,
-    /// Raw pointer to the executor's Env so we can read aliases without
-    /// threading lifetimes through rustyline's `Helper` trait.
-    /// SAFETY: the Executor outlives the Editor: both are on the stack in
-    /// `run_interactive` and the Editor is dropped first.
+    /// Raw pointer to `Executor::env`. Needed because rustyline's `Helper`
+    /// trait has no lifetime parameter, so we cannot store a `&Env` directly.
+    ///
+    /// SAFETY invariants (all hold in `run_interactive`):
+    ///   1. `exec` is never moved after this pointer is taken (`&raw const`).
+    ///   2. The `Editor` (which holds this helper) is a local declared after
+    ///      `exec`, so it is dropped before `exec` (Rust drops locals in
+    ///      reverse order; parameters outlive locals).
+    ///   3. This pointer is only dereferenced inside `readline`, which blocks
+    ///      for user input. `exec` is not mutated while `readline` is running.
     env_ptr: *const Env,
 }
 

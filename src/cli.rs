@@ -1,53 +1,53 @@
-const APP_NAME: &str = "swagsh";
-
 use clap::Parser;
-use std::path::PathBuf;
 
-/// Command line interface for the shell.
+/// A fast, minimal shell for Linux.
+// CLI flag structs legitimately hold many booleans; grouping them would add
+// indirection without any benefit.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Parser, Clone)]
-#[command(
-    name = APP_NAME,
-    version,
-    about = "A sleek, high-performance POSIX-compatible shell written in Rust.",
-    long_about = "A sleek, high-performance POSIX-compatible shell written in Rust \
-for speed, reliability, and modern system integration."
-)]
+#[command(name = "swagsh", version)]
 pub struct Cli {
-    /// Skip sourcing ~/.`swagsh_profile` (login shells) and ~/.swagshrc on startup
-    #[arg(short = 'N', long = "no-config")]
-    pub no_config: bool,
-
-    /// Check syntax but do not execute commands
-    #[arg(short = 'n', long = "no-execute")]
-    pub no_execute: bool,
-
-    /// Enable private mode (history will not be read or written)
-    #[arg(short = 'P', long = "private")]
-    pub private: bool,
-
-    /// Execute a command string
-    #[arg(
-        short = 'c',
-        value_name = "CMD",
-        help = "Execute the given command string",
-        conflicts_with = "script"
-    )]
+    /// Execute CMD then exit. Remaining positionals become $1, $2, ...
+    #[arg(short = 'c', value_name = "CMD")]
     pub command: Option<String>,
 
-    /// Script file to execute
-    #[arg(value_name = "SCRIPT", help = "Script file to execute")]
-    pub script: Option<PathBuf>,
+    /// Parse and check syntax without executing anything.
+    #[arg(long = "dry-run")]
+    pub no_execute: bool,
 
-    /// Arguments passed to the script
+    /// Skip sourcing startup files (only affects interactive mode).
+    #[arg(long = "no-rc")]
+    pub no_rc: bool,
+
+    /// Do not read or write history.
+    #[arg(long = "private")]
+    pub private: bool,
+
+    /// Start as a login shell, sourcing `~/.swagsh_profile`.
+    #[arg(short = 'l', long = "login")]
+    pub login: bool,
+
+    /// Without -c: first positional is the script, the rest become $1, $2, ...
+    /// With -c: all positionals become $1, $2, ...
     #[arg(value_name = "ARGS")]
-    pub args: Vec<String>,
+    pub positionals: Vec<String>,
 }
 
 impl Cli {
-    /// Detect whether the shell was started as a login shell.
-    /// This happens when argv[0] starts with `-`, which is how
-    /// system login programs traditionally launch shells.
-    pub fn login_shell(argv0: &str) -> bool {
+    /// Returns `(script_path, positional_args)` split from `positionals`.
+    pub fn split_positionals(&self) -> (Option<std::path::PathBuf>, Vec<String>) {
+        if self.command.is_some() || self.positionals.is_empty() {
+            (None, self.positionals.clone())
+        } else {
+            (
+                Some(std::path::PathBuf::from(&self.positionals[0])),
+                self.positionals[1..].to_vec(),
+            )
+        }
+    }
+
+    /// True if argv[0] starts with `-`, the convention used by login programs.
+    pub fn is_login_shell(argv0: &str) -> bool {
         argv0.starts_with('-')
     }
 }
