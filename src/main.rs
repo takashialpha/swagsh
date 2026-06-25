@@ -144,6 +144,11 @@ impl Completer for ShellHelper {
         let word = &before_cursor[word_start..];
         let is_first_word = !before_cursor[..word_start].contains(|c: char| !c.is_whitespace());
 
+        // Don't flood the terminal on a blank line: require at least one character.
+        if is_first_word && word.is_empty() {
+            return Ok((0, vec![]));
+        }
+
         if is_first_word {
             let mut candidates: Vec<Pair> = Vec::new();
 

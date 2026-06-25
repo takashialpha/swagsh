@@ -27,7 +27,7 @@ Run `swagsh --help` for the full option set.
 
 ## Performance
 
-Measured with hyperfine --shell=none on Linux x86-64. Across builtins, variable expansion, conditionals, loops, and function calls, swagsh delivers dash-class performance: ~40% faster than bash. On pipelines, where process-spawn overhead dominates and the shell layer matters less, it's ~25% faster than bash.
+Measured with `hyperfine --shell=none` on Linux x86-64. Across builtins, variable expansion, conditionals, loops, and function calls, swagsh delivers dash-class performance: ~40% faster than bash. On pipelines, where process-spawn overhead dominates and the shell layer matters less, it's ~25% faster than bash.
 
 ---
 
@@ -62,6 +62,7 @@ cargo build --release   # binary at target/release/swagsh
 - Quoted heredocs (`<<'EOF'`): variable expansion inside the body is not suppressed as it should be.
 - String operators: `${#var}` (length), `${var%pat}` / `${var#pat}` (trim) are not implemented.
 - Reserved words (`done`, `fi`, `then`, etc.) cannot be passed as plain command arguments.
+- Tab completion pager (`--More--`): prompt appears mid-output instead of at the bottom, and Ctrl-C does not exit it (only `q` works). These might be bugs in rustyline.
 
 ---
 
