@@ -62,7 +62,7 @@ cargo build --release   # binary at target/release/swagsh
 - Quoted heredocs (`<<'EOF'`): variable expansion inside the body is not suppressed as it should be.
 - String operators: `${#var}` (length), `${var%pat}` / `${var#pat}` (trim) are not implemented.
 - Reserved words (`done`, `fi`, `then`, etc.) cannot be passed as plain command arguments.
-- Tab completion pager (`--More--`): prompt appears mid-output instead of at the bottom, and Ctrl-C does not exit it (only `q` works). These might be bugs in rustyline.
+- Tab completion pager (`--More--`): prompt appears mid-output instead of at the bottom, and Ctrl-C does not exit it (only `q` works). These might be bugs in rustyline. May also try another display approach for it that solves the problem
 
 ---
 
