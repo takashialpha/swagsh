@@ -1,9 +1,17 @@
 <div align="center">
 
-# swagsh
+<pre>
+███████╗██╗    ██╗ █████╗  ██████╗ ███████╗██╗  ██╗
+██╔════╝██║    ██║██╔══██╗██╔════╝ ██╔════╝██║  ██║
+███████╗██║ █╗ ██║███████║██║  ███╗███████╗███████║
+╚════██║██║███╗██║██╔══██║██║   ██║╚════██║██╔══██║
+███████║╚███╔███╔╝██║  ██║╚██████╔╝███████║██║  ██║
+╚══════╝ ╚══╝╚══╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝
+</pre>
 
 **A fast, minimal, modern Linux shell. Named after swag, slang for stylish flair.**
 
+[![Website](https://img.shields.io/badge/website-takashialpha.com%2Fswagsh-64b4ff?style=flat-square&labelColor=161616)](https://takashialpha.com/swagsh)
 [![crates.io](https://img.shields.io/crates/v/swagsh?style=flat-square&color=64b4ff&labelColor=161616)](https://crates.io/crates/swagsh)
 [![AUR](https://img.shields.io/aur/version/swagsh?style=flat-square&color=64b4ff&labelColor=161616)](https://aur.archlinux.org/packages/swagsh)
 [![License](https://img.shields.io/crates/l/swagsh?style=flat-square&color=64b4ff&labelColor=161616)](LICENSE)
