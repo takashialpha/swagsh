@@ -1,13 +1,15 @@
 use std::fmt;
 
 use crate::ast::{
-    AndOrItem, AndOrList, AndOrOp, CaseArm, CaseClause, Command, ForClause, FunctionDef, GroupCmd,
-    IfClause, Pipeline, Program, Redirect, RedirectKind, SimpleCmd, WhileClause, Word,
+    AndOrItem, AndOrList, AndOrOp, Command, Pipeline, Program, Redirect, RedirectKind, SimpleCmd,
+    Word,
 };
 use crate::lexer::{
     LexError, QUOTE_END, QUOTE_END_BYTE, QUOTE_START, QUOTE_START_BYTE, RedirKind, RedirToken,
     Token,
 };
+
+mod compound;
 
 // ---------------------------------------------------------------------------
 // Parse errors
@@ -41,8 +43,7 @@ impl From<LexError> for ParseError {
 type ParseResult<T> = Result<T, ParseError>;
 
 // ---------------------------------------------------------------------------
-// Spanned token: the parser works on a pre-lexed flat list annotated with
-// source positions for accurate error reporting.
+// Spanned token
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -58,12 +59,10 @@ struct Spanned {
 
 pub struct Parser {
     tokens: Vec<Spanned>,
-    /// Cursor into `tokens`.
     pos: usize,
 }
 
 impl Parser {
-    /// Build a parser from a raw source string, running the lexer internally.
     pub fn new(src: &str) -> ParseResult<Self> {
         use crate::lexer::Lexer;
 
@@ -71,7 +70,6 @@ impl Parser {
         let mut tokens = Vec::new();
 
         loop {
-            // We need position info; capture before advancing.
             let (line, col) = lexer.position();
             let tok = lexer.next_token()?;
             let done = tok == Token::Eof;
@@ -102,7 +100,6 @@ impl Parser {
         &self.tokens[self.pos]
     }
 
-    /// Advance and return the consumed token.
     fn advance(&mut self) -> &Token {
         let t = &self.tokens[self.pos].token;
         if self.pos + 1 < self.tokens.len() {
@@ -111,7 +108,6 @@ impl Parser {
         t
     }
 
-    /// Consume a token, returning an error if it doesn't match `expected`.
     fn expect(&mut self, expected: &Token) -> ParseResult<()> {
         if self.peek() == expected {
             self.advance();
@@ -135,14 +131,12 @@ impl Parser {
         }
     }
 
-    /// Skip zero or more newlines and semicolons (used as separator).
     fn skip_newlines(&mut self) {
         while matches!(self.peek(), Token::Newline | Token::Semi) {
             self.advance();
         }
     }
 
-    /// Return `true` and consume if the next token matches.
     fn eat(&mut self, tok: &Token) -> bool {
         if self.peek() == tok {
             self.advance();
@@ -168,9 +162,6 @@ impl Parser {
     // List  ::=  (NewlineList | AndOrList (';' | '&' | '\n')*)*
     // ------------------------------------------------------------------
 
-    /// Parse a sequence of and-or lists separated by `;`, `&`, or newlines.
-    /// Stops at `Eof`, `fi`, `done`, `esac`, `elif`, `else`, `then`, `)`
-    /// or `}`: all of which are consumed by the caller.
     fn parse_list(&mut self) -> ParseResult<Vec<AndOrList>> {
         let mut list = Vec::new();
         self.skip_newlines();
@@ -219,9 +210,8 @@ impl Parser {
         });
 
         if first_op.is_some() {
-            self.advance(); // consume && / ||
+            self.advance();
             self.skip_newlines();
-            // parse remaining items
             loop {
                 let pipeline = self.parse_pipeline()?;
                 let op = self.peek_and_or_op();
@@ -238,7 +228,6 @@ impl Parser {
             }
         }
 
-        // trailing & or ;: determines async and consumes separator
         let is_async = if self.eat(&Token::Ampersand) {
             true
         } else {
@@ -294,9 +283,7 @@ impl Parser {
         }
     }
 
-    /// Peek ahead to check for `name ()` function definition syntax.
     fn is_function_def_ahead(&self) -> bool {
-        // current token is Word, next non-whitespace should be `(`
         if let Token::Word(_) = self.peek()
             && self.pos + 1 < self.tokens.len()
         {
@@ -335,13 +322,12 @@ impl Parser {
     }
 
     // ------------------------------------------------------------------
-    // Word parsing: convert a raw token string into a `Word` node
+    // Word parsing
     // ------------------------------------------------------------------
 
     fn parse_word_str(&self, raw: &str) -> ParseResult<Word> {
         let bytes = raw.as_bytes();
 
-        // Fast path: pure literal (no special chars or quote sentinels).
         if !bytes.iter().any(|&b| {
             matches!(
                 b,
@@ -351,7 +337,6 @@ impl Parser {
             return Ok(Word::Literal(raw.to_owned()));
         }
 
-        // Compound word: decompose into parts.
         let parts = decompose_word(raw, self)?;
         if parts.len() == 1 {
             Ok(parts.into_iter().next().unwrap())
@@ -410,215 +395,10 @@ impl Parser {
             other => Err(self.err(format!("expected redirection, got `{other}`"))),
         }
     }
-
-    // ------------------------------------------------------------------
-    // Compound commands
-    // ------------------------------------------------------------------
-
-    // if condition; then body (elif condition; then body)* (else body)? fi
-    fn parse_if(&mut self) -> ParseResult<Command> {
-        self.expect(&Token::If)?;
-        let condition = self.parse_list()?;
-        self.expect(&Token::Then)?;
-        let then_body = self.parse_list()?;
-
-        let mut elif_clauses = Vec::new();
-        let mut else_body = None;
-
-        loop {
-            match self.peek() {
-                Token::Elif => {
-                    self.advance();
-                    let elif_cond = self.parse_list()?;
-                    self.expect(&Token::Then)?;
-                    let elif_body = self.parse_list()?;
-                    elif_clauses.push((elif_cond, elif_body));
-                }
-                Token::Else => {
-                    self.advance();
-                    else_body = Some(self.parse_list()?);
-                    break;
-                }
-                _ => break,
-            }
-        }
-
-        self.expect(&Token::Fi)?;
-
-        Ok(Command::If(IfClause {
-            condition,
-            then_body,
-            elif_clauses,
-            else_body,
-        }))
-    }
-
-    // for var in words; do body; done
-    fn parse_for(&mut self) -> ParseResult<Command> {
-        self.expect(&Token::For)?;
-
-        let var = match self.advance().clone() {
-            Token::Word(name) => name,
-            other => {
-                return Err(self.err(format!("expected variable name after `for`, got `{other}`")));
-            }
-        };
-
-        self.skip_newlines();
-
-        // Optional `in wordlist`: if absent defaults to "$@"
-        let items = if self.eat(&Token::In) {
-            let mut words = Vec::new();
-            while let Token::Word(w) = self.peek().clone() {
-                let word = self.parse_word_str(&w)?;
-                self.advance();
-                words.push(word);
-            }
-            words
-        } else {
-            vec![Word::Var("@".to_owned())]
-        };
-
-        self.skip_newlines();
-        self.eat(&Token::Semi);
-        self.skip_newlines();
-        self.expect(&Token::Do)?;
-        let body = self.parse_list()?;
-        self.expect(&Token::Done)?;
-
-        Ok(Command::For(ForClause { var, items, body }))
-    }
-
-    // while/until condition; do body; done
-    fn parse_while(&mut self, until: bool) -> ParseResult<Command> {
-        // consume `while` or `until`
-        self.advance();
-
-        let condition = self.parse_list()?;
-        self.expect(&Token::Do)?;
-        let body = self.parse_list()?;
-        self.expect(&Token::Done)?;
-
-        Ok(Command::While(WhileClause {
-            condition,
-            body,
-            until,
-        }))
-    }
-
-    // case word in (pattern | ...) ) body ;; ... esac
-    fn parse_case(&mut self) -> ParseResult<Command> {
-        self.expect(&Token::Case)?;
-
-        let word_raw = match self.advance().clone() {
-            Token::Word(w) => w,
-            other => return Err(self.err(format!("expected word after `case`, got `{other}`"))),
-        };
-        let word = self.parse_word_str(&word_raw)?;
-
-        self.skip_newlines();
-        self.expect(&Token::In)?;
-        self.skip_newlines();
-
-        let mut arms = Vec::new();
-
-        loop {
-            if self.eat(&Token::Esac) {
-                break;
-            }
-
-            // optional leading `(`
-            self.eat(&Token::LParen);
-
-            // pattern list separated by `|`
-            let mut patterns = Vec::new();
-            loop {
-                match self.advance().clone() {
-                    Token::Word(p) => patterns.push(self.parse_word_str(&p)?),
-                    other => {
-                        return Err(
-                            self.err(format!("expected pattern in case arm, got `{other}`"))
-                        );
-                    }
-                }
-                if !self.eat(&Token::Pipe) {
-                    break;
-                }
-            }
-
-            self.expect(&Token::RParen)?;
-            self.skip_newlines();
-
-            let body = self.parse_list()?;
-
-            // `;;` terminates the arm: optional before `esac`
-            self.eat(&Token::SemiSemi);
-            self.skip_newlines();
-
-            arms.push(CaseArm { patterns, body });
-        }
-
-        Ok(Command::Case(CaseClause { word, arms }))
-    }
-
-    // { list; }
-    fn parse_brace_group(&mut self) -> ParseResult<Command> {
-        self.expect(&Token::LBrace)?;
-        self.skip_newlines();
-        let body = self.parse_list()?;
-        self.expect(&Token::RBrace)?;
-        Ok(Command::Group(GroupCmd {
-            body,
-            subshell: false,
-        }))
-    }
-
-    // ( list )
-    fn parse_subshell(&mut self) -> ParseResult<Command> {
-        self.expect(&Token::LParen)?;
-        self.skip_newlines();
-        let body = self.parse_list()?;
-        self.expect(&Token::RParen)?;
-        Ok(Command::Group(GroupCmd {
-            body,
-            subshell: true,
-        }))
-    }
-
-    // function name() { body; }  or  name() { body; }
-    fn parse_function_def(&mut self) -> ParseResult<Command> {
-        // consume optional `function` keyword
-        let has_keyword = self.eat(&Token::Function);
-
-        let name = match self.advance().clone() {
-            Token::Word(n) => n,
-            other => return Err(self.err(format!("expected function name, got `{other}`"))),
-        };
-
-        if !has_keyword {
-            // name () form: must have `()`
-            self.expect(&Token::LParen)?;
-            self.expect(&Token::RParen)?;
-        } else if self.eat(&Token::LParen) {
-            // `function name()` form: parens are optional but consume if present
-            self.expect(&Token::RParen)?;
-        }
-
-        self.skip_newlines();
-
-        let body = self.parse_command()?;
-
-        Ok(Command::FunctionDef(FunctionDef {
-            name,
-            body: Box::new(body),
-        }))
-    }
 }
 
 // ---------------------------------------------------------------------------
 // Word decomposition
-// Converts a raw lexer string (which may contain `$VAR`, `$(cmd)`, `"..."`)
-// into a Vec<Word> that the executor can expand piece by piece.
 // ---------------------------------------------------------------------------
 
 fn parse_dollar(
@@ -669,7 +449,7 @@ fn parse_dollar(
                         }
                     }
                 }
-                _ => return Ok(None), // lone `$`: caller treats as literal
+                _ => return Ok(None),
             }
             Ok(Some(Word::Var(var)))
         }
@@ -699,7 +479,6 @@ fn decompose_word(raw: &str, parser: &Parser) -> ParseResult<Vec<Word>> {
                 None => lit.push('$'),
             },
 
-            // Single-quote sentinel injected by the lexer: literal content, no expansion.
             QUOTE_START => {
                 flush_lit!();
                 let mut inner = String::new();
@@ -713,8 +492,6 @@ fn decompose_word(raw: &str, parser: &Parser) -> ParseResult<Vec<Word>> {
             }
 
             '"' => {
-                // Double-quoted region: expand $VAR/$(cmd) inside but suppress
-                // IFS splitting and glob expansion on the result.
                 flush_lit!();
                 let mut inner = String::new();
                 for (_, c) in chars.by_ref() {
@@ -737,7 +514,6 @@ fn decompose_word(raw: &str, parser: &Parser) -> ParseResult<Vec<Word>> {
             }
 
             '`' => {
-                // backtick substitution: collect until closing backtick
                 flush_lit!();
                 let mut inner = String::new();
                 for (_, c) in chars.by_ref() {
@@ -752,7 +528,6 @@ fn decompose_word(raw: &str, parser: &Parser) -> ParseResult<Vec<Word>> {
             }
 
             '\\' => {
-                // escape: consume next character literally
                 if let Some((_, next)) = chars.next() {
                     lit.push(next);
                 }
@@ -771,9 +546,6 @@ fn decompose_word(raw: &str, parser: &Parser) -> ParseResult<Vec<Word>> {
     Ok(parts)
 }
 
-/// Collect a balanced `open`/`close` delimited region starting from the
-/// `open` already peeked (the `$` was already consumed by the caller).
-/// Returns the full fragment including the leading `$` + `open` and trailing `close`.
 fn collect_balanced(
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
     open: char,
@@ -809,7 +581,6 @@ fn collect_balanced(
 // Public convenience
 // ---------------------------------------------------------------------------
 
-/// Parse a complete source string into a `Program`.
 pub fn parse(src: &str) -> ParseResult<Program> {
     Parser::new(src)?.parse()
 }

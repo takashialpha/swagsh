@@ -4,14 +4,27 @@ use crate::env::Env;
 use crate::eval::Shell;
 use crate::expand::expand_tilde;
 
+// \x01/\x02 wrap ANSI codes so rustyline measures visible width correctly.
+const CYAN: &str = "\x01\x1b[1;36m\x02";
+const GREEN: &str = "\x01\x1b[1;32m\x02";
+const RED: &str = "\x01\x1b[1;31m\x02";
+const RESET: &str = "\x01\x1b[0m\x02";
+
 pub fn build_prompt(shell: &Shell) -> String {
     let ps1 = shell.env.get("PS1").unwrap_or_default();
-    if ps1.is_empty() {
-        let cwd = current_dir_display(&shell.env);
-        let suffix = if getuid().is_root() { "#" } else { "❯" };
-        format!("{cwd} {suffix} ")
+    if !ps1.is_empty() {
+        return expand_ps1(&ps1, shell);
+    }
+    let cwd = current_dir_display(&shell.env);
+    if getuid().is_root() {
+        format!("{RED}{cwd}{RESET} {RED}#{RESET} ")
     } else {
-        expand_ps1(&ps1, shell)
+        let arrow = if shell.last_status.is_success() {
+            GREEN
+        } else {
+            RED
+        };
+        format!("{CYAN}{cwd}{RESET} {arrow}❯{RESET} ")
     }
 }
 
