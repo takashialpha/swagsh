@@ -6,13 +6,15 @@ pub enum Word {
     Literal(String),
     /// `$VAR` or `${VAR}`.
     Var(String),
+    /// `$(( expr ))` arithmetic expansion.
+    Arith(String),
     /// `$(cmd)` or backtick form.
     CmdSub(Box<Command>),
     /// A sequence of word-parts concatenated at expansion time.
-    Compound(Vec<Word>),
+    Compound(Vec<Self>),
     /// Content from a single- or double-quoted region.
     /// Suppresses IFS word-splitting and glob expansion on the result.
-    Quoted(Box<Word>),
+    Quoted(Box<Self>),
 }
 
 // ---------------------------------------------------------------------------
@@ -31,6 +33,8 @@ pub enum RedirectKind {
     FdOut,
     /// `&>file`: stdout + stderr
     Both,
+    /// `<<DELIM` here-document body. `quoted=true` when delim was single-quoted.
+    HereDoc { raw_body: String, quoted: bool },
     /// `<<<word` (herestring)
     HereString,
 }

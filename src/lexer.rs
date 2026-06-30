@@ -8,10 +8,10 @@ const UTF8_CONT_END: u8 = 0xBF; // last continuation byte
 
 // Sentinels used to communicate single-quote boundaries to decompose_word.
 // These control characters (SOH/STX) cannot appear in valid shell source.
-pub(crate) const QUOTE_START: char = '\x01';
-pub(crate) const QUOTE_END: char = '\x02';
-pub(crate) const QUOTE_START_BYTE: u8 = QUOTE_START as u8;
-pub(crate) const QUOTE_END_BYTE: u8 = QUOTE_END as u8;
+pub const QUOTE_START: char = '\x01';
+pub const QUOTE_END: char = '\x02';
+pub const QUOTE_START_BYTE: u8 = QUOTE_START as u8;
+pub const QUOTE_END_BYTE: u8 = QUOTE_END as u8;
 
 // ---------------------------------------------------------------------------
 // Token types
@@ -37,6 +37,7 @@ pub enum Token {
     // Redirections
     Redir(RedirToken),
     // Here-documents & here-strings
+    HereDoc { body: String, quoted: bool },
     HereString(String),
     // Reserved words
     If,
@@ -76,20 +77,21 @@ pub enum RedirKind {
 impl fmt::Display for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Token::Word(w) => write!(f, "Word({w:?})"),
-            Token::Pipe => f.write_str("|"),
-            Token::OrOr => f.write_str("||"),
-            Token::Ampersand => f.write_str("&"),
-            Token::AndAnd => f.write_str("&&"),
-            Token::Semi => f.write_str(";"),
-            Token::SemiSemi => f.write_str(";;"),
-            Token::LParen => f.write_str("("),
-            Token::RParen => f.write_str(")"),
-            Token::LBrace => f.write_str("{"),
-            Token::RBrace => f.write_str("}"),
-            Token::Bang => f.write_str("!"),
-            Token::Newline => f.write_str("\\n"),
-            Token::Eof => f.write_str("<EOF>"),
+            Self::Word(w) => write!(f, "Word({w:?})"),
+            Self::Pipe => f.write_str("|"),
+            Self::OrOr => f.write_str("||"),
+            Self::Ampersand => f.write_str("&"),
+            Self::AndAnd => f.write_str("&&"),
+            Self::Semi => f.write_str(";"),
+            Self::SemiSemi => f.write_str(";;"),
+            Self::LParen => f.write_str("("),
+            Self::RParen => f.write_str(")"),
+            Self::LBrace => f.write_str("{"),
+            Self::RBrace => f.write_str("}"),
+            Self::Bang => f.write_str("!"),
+            Self::Newline => f.write_str("\\n"),
+            Self::Eof => f.write_str("<EOF>"),
+            Self::HereDoc { .. } => f.write_str("here-doc"),
             _ => write!(f, "{self:?}"),
         }
     }
@@ -126,7 +128,7 @@ pub struct Lexer<'src> {
 }
 
 impl<'src> Lexer<'src> {
-    pub fn new(src: &'src str) -> Self {
+    pub const fn new(src: &'src str) -> Self {
         Self {
             src: src.as_bytes(),
             pos: 0,
@@ -138,7 +140,7 @@ impl<'src> Lexer<'src> {
     /// Current source position: called by the parser before each token advance
     /// to attach accurate span information.
     #[inline]
-    pub fn position(&self) -> (usize, usize) {
+    pub const fn position(&self) -> (usize, usize) {
         (self.line, self.col)
     }
 
@@ -170,7 +172,7 @@ impl<'src> Lexer<'src> {
     }
 
     #[inline]
-    fn err(&self, msg: &'static str) -> LexError {
+    const fn err(&self, msg: &'static str) -> LexError {
         LexError {
             line: self.line,
             col: self.col,
@@ -366,12 +368,14 @@ impl<'src> Lexer<'src> {
     fn lex_heredoc(&mut self, strip_tabs: bool) -> Result<Token, LexError> {
         self.skip_whitespace();
         let mut delim = String::new();
+        let mut quoted = false;
         loop {
             match self.peek() {
                 None | Some(b'\n' | b' ' | b'\t') => break,
                 Some(b'\'') => {
                     self.advance();
                     self.lex_single_quoted(&mut delim)?;
+                    quoted = true;
                 }
                 Some(b'"') => {
                     self.advance();
@@ -407,8 +411,7 @@ impl<'src> Lexer<'src> {
             let mut line = String::new();
             loop {
                 match self.peek() {
-                    // EOF before delimiter: return partial body.
-                    None => return Ok(Token::HereString(body)),
+                    None => return Ok(Token::HereDoc { body, quoted }),
                     Some(b'\n') => {
                         self.advance();
                         break;
@@ -436,7 +439,7 @@ impl<'src> Lexer<'src> {
             body.push('\n');
         }
 
-        Ok(Token::HereString(body))
+        Ok(Token::HereDoc { body, quoted })
     }
 
     // ------------------------------------------------------------------
@@ -645,21 +648,14 @@ impl<'src> Lexer<'src> {
                 return Ok(Token::Bang);
             }
             Some(b'<' | b'>') => return self.lex_redir(None),
-            // [[ and ]] are emitted as Word tokens so they hit the builtin table.
-            Some(b'[' | b']') => {
-                let open = self.advance().unwrap();
-                let (single, double) = if open == b'[' {
-                    ("[", "[[")
-                } else {
-                    ("]", "]]")
-                };
-                let s = if self.peek() == Some(open) {
-                    self.advance();
-                    double
-                } else {
-                    single
-                };
-                return Ok(Token::Word(s.into()));
+            // [ and ] are standalone word tokens (used by the [ / test builtin).
+            Some(b'[') => {
+                self.advance();
+                return Ok(Token::Word("[".into()));
+            }
+            Some(b']') => {
+                self.advance();
+                return Ok(Token::Word("]".into()));
             }
             _ => {}
         }

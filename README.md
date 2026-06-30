@@ -22,20 +22,20 @@
 
 ```sh
 $ swagsh
-~ $ echo $SHELL
-/usr/bin/swagsh
-~ $ ls src/*.rs | sort | head -3
-src/eval.rs
-src/lexer.rs
-src/main.rs
-~ $ for f in src/*.rs; do echo "$(wc -l < $f) $f"; done | sort -rn | head -3
-312 src/eval.rs
-287 src/parser.rs
-201 src/lexer.rs
-~ $ sleep 30 &
-[1] 4821
+~ $ greet() { echo "hello, ${1:-world}"; }
+~ $ greet takashi
+hello, takashi
+~ $ count=$((1 + 2 + 3)); echo $count
+6
+~ $ for f in /etc/os-release /etc/hostname; do
+>   [ -f "$f" ] && echo "$f: $(head -1 $f)"
+> done
+/etc/os-release: NAME="Arch Linux"
+/etc/hostname: mymachine
+~ $ sleep 5 &
+[1] 9182
 ~ $ jobs
-[1]+  Running    sleep 30
+[1]+  Running    sleep 5
 ~ $
 ```
 
@@ -49,25 +49,18 @@ src/main.rs
 
 🔧 **Shell grammar**
 
-Pipelines, redirections, control flow, functions, subshells, and here-documents.
+The constructs you expect: pipelines, redirections, control flow, functions, subshells, and here-documents.
 
 </td>
 <td width="50%">
 
 🔤 **Expansions**
 
-Variable, parameter, tilde, glob, and command substitution.
+Variable, tilde, glob, command substitution, arithmetic, and parameter operators.
 
 </td>
 </tr>
 <tr>
-<td>
-
-⌨️ **Tab completion**
-
-Builtins, aliases, executables, and filenames — out of the box.
-
-</td>
 <td>
 
 ⚙️ **Job control**
@@ -75,20 +68,11 @@ Builtins, aliases, executables, and filenames — out of the box.
 Background jobs, foreground and background switching, stopping, and signalling.
 
 </td>
-</tr>
-<tr>
 <td>
 
-💬 **Prompt**
+💬 **Prompt and history**
 
-Customisable via `$PS1` with `\w`, `\W`, `\u`, `\h`, `\e`, `\[`/`\]`, and more.
-
-</td>
-<td>
-
-📜 **History**
-
-Persistent, respects `$HISTFILE` and `$HISTSIZE`, with private mode.
+Customisable `$PS1`, persistent history with `$HISTFILE`/`$HISTSIZE`.
 
 </td>
 </tr>
@@ -135,12 +119,9 @@ cargo build --release   # binary at target/release/swagsh
 
 ## Known limitations
 
-- `return` inside functions is not yet implemented.
-- Arithmetic expansion `$((...))` is not supported.
-- Quoted heredocs (`<<'EOF'`) do not suppress variable expansion.
-- `${#var}` (length), `${var%pat}` / `${var#pat}` (trim) are not implemented.
 - Reserved words (`done`, `fi`, `then`, etc.) cannot be passed as plain arguments.
-- Tab completion pager: prompt appears mid-output instead of at the bottom; `q` exits, Ctrl-C does not.
+- No `local` builtin; functions share the caller's variable scope.
+- No `trap` builtin.
 
 ---
 

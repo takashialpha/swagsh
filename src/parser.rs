@@ -289,86 +289,9 @@ impl Parser {
             Token::LBrace => self.parse_brace_group(),
             Token::LParen => self.parse_subshell(),
             Token::Function => self.parse_function_def(),
-            Token::Word(w) if w == "[[" => self.parse_double_bracket(),
             Token::Word(_) if self.is_function_def_ahead() => self.parse_function_def(),
             _ => self.parse_simple_cmd().map(Command::Simple),
         }
-    }
-
-    /// Parse `[[ expr ]]`: collect all tokens until `]]` as word arguments,
-    /// converting operators like `&&`, `||`, `!`, `(`, `)` to string words
-    /// so the builtin evaluator receives them intact.
-    fn parse_double_bracket(&mut self) -> ParseResult<Command> {
-        // Consume the opening `[[`
-        self.advance();
-        let mut words: Vec<crate::ast::Word> = vec![crate::ast::Word::Literal("[[".into())];
-
-        loop {
-            let tok = self.peek().clone();
-            match &tok {
-                Token::Eof => return Err(self.err("unexpected EOF inside [[ ]]")),
-                Token::Word(w) if w == "]]" => {
-                    self.advance();
-                    words.push(crate::ast::Word::Literal("]]".into()));
-                    break;
-                }
-                // Operators that parse as structural tokens; emit as string words
-                // so the test evaluator sees them.
-                Token::AndAnd => {
-                    self.advance();
-                    words.push(crate::ast::Word::Literal("&&".into()));
-                }
-                Token::OrOr => {
-                    self.advance();
-                    words.push(crate::ast::Word::Literal("||".into()));
-                }
-                Token::Bang => {
-                    self.advance();
-                    // Peek: if next token starts with '=', combine into "!="
-                    if matches!(self.peek(), Token::Word(w) if w == "=") {
-                        self.advance();
-                        words.push(crate::ast::Word::Literal("!=".into()));
-                    } else {
-                        words.push(crate::ast::Word::Literal("!".into()));
-                    }
-                }
-                Token::LParen => {
-                    self.advance();
-                    words.push(crate::ast::Word::Literal("(".into()));
-                }
-                Token::RParen => {
-                    self.advance();
-                    words.push(crate::ast::Word::Literal(")".into()));
-                }
-                Token::Redir(rt) => {
-                    // < and > inside [[ are string comparisons, not redirections.
-                    // Also handle >= and <= which arrive as Append(>>) or similar.
-                    use crate::lexer::RedirKind;
-                    let s = match rt.kind {
-                        RedirKind::In => "<",
-                        RedirKind::Append => ">>",
-                        _ => ">",
-                    };
-                    self.advance();
-                    // Peek: > followed by = should be ">=" (not a real redir op,
-                    // but handle defensively).
-                    words.push(crate::ast::Word::Literal(s.into()));
-                }
-                Token::Word(w) => {
-                    let word = self.parse_word_str(w)?;
-                    self.advance();
-                    words.push(word);
-                }
-                _ => {
-                    self.advance();
-                } // skip anything else
-            }
-        }
-
-        Ok(Command::Simple(crate::ast::SimpleCmd {
-            words,
-            redirects: vec![],
-        }))
     }
 
     /// Peek ahead to check for `name ()` function definition syntax.
@@ -397,7 +320,7 @@ impl Parser {
                         words.push(self.parse_word_str(&w)?);
                     }
                 }
-                Token::Redir(_) | Token::HereString(_) => {
+                Token::Redir(_) | Token::HereString(_) | Token::HereDoc { .. } => {
                     redirects.push(self.parse_redirect()?);
                 }
                 _ => break,
@@ -426,16 +349,6 @@ impl Parser {
             )
         }) {
             return Ok(Word::Literal(raw.to_owned()));
-        }
-
-        // Check for bare arithmetic expansion `$(( ))`: error per spec.
-        if raw.starts_with("$((") {
-            let sp = self.peek_spanned();
-            return Err(ParseError {
-                line: sp.line,
-                col: sp.col,
-                msg: "arithmetic expansion `$(( ))` is not supported".to_owned(),
-            });
         }
 
         // Compound word: decompose into parts.
@@ -478,6 +391,15 @@ impl Parser {
                     target,
                 })
             }
+
+            Token::HereDoc { body, quoted } => Ok(Redirect {
+                kind: RedirectKind::HereDoc {
+                    raw_body: body,
+                    quoted,
+                },
+                fd: 0,
+                target: Word::Literal(String::new()),
+            }),
 
             Token::HereString(s) => Ok(Redirect {
                 kind: RedirectKind::HereString,
@@ -701,12 +623,18 @@ impl Parser {
 
 fn parse_dollar(
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
-    parser: &Parser,
+    _parser: &Parser,
 ) -> ParseResult<Option<Word>> {
     match chars.peek().map(|(_, c)| *c) {
         Some('(') => {
             if chars.clone().nth(1).map(|(_, c)| c) == Some('(') {
-                return Err(parser.err("arithmetic expansion `$(( ))` is not supported"));
+                let fragment = collect_balanced(chars, '(', ')')?;
+                let expr = fragment
+                    .strip_prefix("$((")
+                    .and_then(|s| s.strip_suffix("))"))
+                    .unwrap_or("")
+                    .to_owned();
+                return Ok(Some(Word::Arith(expr)));
             }
             let fragment = collect_balanced(chars, '(', ')')?;
             let inner = &fragment[2..fragment.len() - 1];

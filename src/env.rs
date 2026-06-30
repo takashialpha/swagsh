@@ -138,10 +138,6 @@ impl Env {
     pub fn all_aliases(&self) -> impl Iterator<Item = (&str, &str)> {
         self.aliases.iter().map(|(k, v)| (k.as_str(), v.as_str()))
     }
-    /// All alias names: used by tab completion.
-    pub fn alias_names(&self) -> impl Iterator<Item = &str> {
-        self.aliases.keys().map(std::string::String::as_str)
-    }
 
     // ------------------------------------------------------------------
     // Positional parameters
