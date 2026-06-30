@@ -20,40 +20,110 @@
 
 ---
 
+```sh
+$ swagsh
+~ $ echo $SHELL
+/usr/bin/swagsh
+~ $ ls src/*.rs | sort | head -3
+src/eval.rs
+src/lexer.rs
+src/main.rs
+~ $ for f in src/*.rs; do echo "$(wc -l < $f) $f"; done | sort -rn | head -3
+312 src/eval.rs
+287 src/parser.rs
+201 src/lexer.rs
+~ $ sleep 30 &
+[1] 4821
+~ $ jobs
+[1]+  Running    sleep 30
+~ $
+```
+
+---
+
 ## Features
 
-- **Shell grammar:** pipelines, redirections, control flow, functions, subshells, and here-documents.
-- **Expansions:** variable, parameter, tilde, glob, and command substitution.
-- **Tab completion:** builtins, aliases, executables and filenames, out of the box.
-- **Job control:** background jobs, foreground and background switching, stopping and signalling.
-- **Prompt:** customisable via `$PS1` with `\w`, `\W`, `\u`, `\h`, `\e`, `\[`/`\]` and more.
-- **History:** persistent, respects `$HISTFILE` and `$HISTSIZE`, with private mode.
+<table>
+<tr>
+<td width="50%">
 
-Run `swagsh --help` for the full option set.
+🔧 **Shell grammar**
+
+Pipelines, redirections, control flow, functions, subshells, and here-documents.
+
+</td>
+<td width="50%">
+
+🔤 **Expansions**
+
+Variable, parameter, tilde, glob, and command substitution.
+
+</td>
+</tr>
+<tr>
+<td>
+
+⌨️ **Tab completion**
+
+Builtins, aliases, executables, and filenames — out of the box.
+
+</td>
+<td>
+
+⚙️ **Job control**
+
+Background jobs, foreground and background switching, stopping, and signalling.
+
+</td>
+</tr>
+<tr>
+<td>
+
+💬 **Prompt**
+
+Customisable via `$PS1` with `\w`, `\W`, `\u`, `\h`, `\e`, `\[`/`\]`, and more.
+
+</td>
+<td>
+
+📜 **History**
+
+Persistent, respects `$HISTFILE` and `$HISTSIZE`, with private mode.
+
+</td>
+</tr>
+</table>
 
 ---
 
 ## Performance
 
-Measured with `hyperfine --shell=none` on Linux x86-64. Across builtins, variable expansion, conditionals, loops, and function calls, swagsh delivers dash-class performance: ~40% faster than bash. On pipelines, where process-spawn overhead dominates and the shell layer matters less, it's ~25% faster than bash.
+Measured with `hyperfine --shell=none` on Linux x86-64.
+
+| Workload | vs bash |
+|:---|:---:|
+| Builtins, variable expansion, conditionals, loops, functions | **~40% faster** |
+| Pipelines (process-spawn heavy) | **~25% faster** |
+
+Dash-class performance where it counts.
 
 ---
 
 ## Installation
 
-**Cargo:**
+**Cargo**
 
 ```sh
 cargo install swagsh
 ```
 
-**AUR (Arch Linux):**
+**AUR (Arch Linux)**
 
 ```sh
 paru -S swagsh   # or: yay -S swagsh
 ```
 
-**From source:**
+**From source**
 
 ```sh
 git clone https://github.com/takashialpha/swagsh.git
@@ -63,17 +133,17 @@ cargo build --release   # binary at target/release/swagsh
 
 ---
 
-## TODO
+## Known limitations
 
-- `return` builtin: not yet implemented; calling it inside a function fails.
+- `return` inside functions is not yet implemented.
 - Arithmetic expansion `$((...))` is not supported.
-- Quoted heredocs (`<<'EOF'`): variable expansion inside the body is not suppressed as it should be.
-- String operators: `${#var}` (length), `${var%pat}` / `${var#pat}` (trim) are not implemented.
-- Reserved words (`done`, `fi`, `then`, etc.) cannot be passed as plain command arguments.
-- Tab completion pager (`--More--`): prompt appears mid-output instead of at the bottom, and Ctrl-C does not exit it (only `q` works). These might be bugs in rustyline. May also try another display approach for it that solves the problem
+- Quoted heredocs (`<<'EOF'`) do not suppress variable expansion.
+- `${#var}` (length), `${var%pat}` / `${var#pat}` (trim) are not implemented.
+- Reserved words (`done`, `fi`, `then`, etc.) cannot be passed as plain arguments.
+- Tab completion pager: prompt appears mid-output instead of at the bottom; `q` exits, Ctrl-C does not.
 
 ---
 
 ## Contributing
 
-Issues and pull requests are welcome. Please open an issue before starting work on a large change.
+Issues and pull requests are welcome. Open an issue before starting work on a large change.
