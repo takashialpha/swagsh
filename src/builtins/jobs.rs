@@ -54,6 +54,7 @@ pub fn builtin_fg(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
                     break exit;
                 } else if ws.stopped() {
                     let _ = tcsetpgrp(std::io::stdin(), shell.pgid);
+                    shell.restore_terminal();
                     break ExitStatus(130);
                 }
             }
@@ -63,6 +64,7 @@ pub fn builtin_fg(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
         }
     };
     let _ = tcsetpgrp(std::io::stdin(), shell.pgid);
+    shell.restore_terminal();
     shell.jobs.remove(id);
     Ok(status)
 }

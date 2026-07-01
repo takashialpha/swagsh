@@ -49,6 +49,7 @@ impl Shell {
 
         if self.interactive {
             let _ = tcsetpgrp(std::io::stdin(), self.pgid);
+            self.restore_terminal();
             if last_status.0 != 130
                 && let Some(id) = job_id
             {
@@ -258,6 +259,7 @@ impl Shell {
                 let status = self.wait_for_pid(child)?;
                 if self.interactive {
                     let _ = tcsetpgrp(std::io::stdin(), self.pgid);
+                    self.restore_terminal();
                     if status.0 != 130
                         && let Some(id) = job_id
                     {

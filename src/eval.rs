@@ -3,7 +3,7 @@ use std::fmt;
 use anyhow::{Error, Result};
 use rustix::process::{Pid, Signal, getpid, setpgid};
 use rustix::runtime::kernel_sigaction;
-use rustix::termios::tcsetpgrp;
+use rustix::termios::{OptionalActions, Termios, tcgetattr, tcsetattr, tcsetpgrp};
 
 use crate::ast::{Command, Program, SimpleCmd};
 use crate::builtins::{self, BuiltinFn};
@@ -102,14 +102,17 @@ pub struct Shell {
     pub pgid: Pid,
     pub last_status: ExitStatus,
     pub interactive: bool,
+    sane_termios: Option<Termios>,
 }
 
 impl Shell {
     pub fn new(env: Env, interactive: bool) -> Self {
         let pgid = getpid();
+        let mut sane_termios = None;
         if interactive {
             let _ = setpgid(Some(pgid), Some(pgid));
             let _ = tcsetpgrp(std::io::stdin(), pgid);
+            sane_termios = tcgetattr(std::io::stdin()).ok();
             // SAFETY: main shell process, single-threaded at startup.
             unsafe {
                 let ign = sig_ign_action();
@@ -125,6 +128,19 @@ impl Shell {
             pgid,
             last_status: ExitStatus::SUCCESS,
             interactive,
+            sane_termios,
+        }
+    }
+
+    /// Reasserts the shell's own known-good terminal modes after reclaiming
+    /// the foreground process group from a child. A foreground job that
+    /// disables echo (a password prompt, `su`/`sudo`'s pty relay, ...) and
+    /// then dies to a signal before undoing that (e.g. `^C` mid-prompt)
+    /// otherwise leaves the terminal stuck in that state for every command
+    /// typed afterwards, us included.
+    pub fn restore_terminal(&self) {
+        if let Some(t) = &self.sane_termios {
+            let _ = tcsetattr(std::io::stdin(), OptionalActions::Drain, t);
         }
     }
 
