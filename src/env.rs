@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::ast::Command;
 
@@ -6,7 +7,7 @@ use crate::ast::Command;
 pub struct Env {
     vars: HashMap<String, String>,
     exported: HashSet<String>,
-    functions: HashMap<String, Command>,
+    functions: HashMap<String, Rc<Command>>,
     aliases: HashMap<String, String>,
     positional: Vec<String>,
 }
@@ -113,10 +114,14 @@ impl Env {
     // ------------------------------------------------------------------
 
     pub fn define_function(&mut self, name: String, body: Command) {
-        self.functions.insert(name, body);
+        self.functions.insert(name, Rc::new(body));
     }
-    pub fn get_function(&self, name: &str) -> Option<&Command> {
-        self.functions.get(name)
+    /// Returns a cheap `Rc` clone of the function body rather than `&Command`:
+    /// callers need an owned value to run while `self` is mutably borrowed
+    /// for the call, and an `Rc` clone (a refcount bump) is what makes that
+    /// affordable on every invocation instead of deep-cloning the AST.
+    pub fn get_function(&self, name: &str) -> Option<Rc<Command>> {
+        self.functions.get(name).cloned()
     }
 
     // ------------------------------------------------------------------

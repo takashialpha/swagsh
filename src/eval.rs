@@ -202,7 +202,7 @@ impl Shell {
         if let Some(f) = builtins::lookup_builtin(name.as_str()) {
             return Ok((assignments, Resolved::Builtin(f, name, args)));
         }
-        if let Some(body) = self.env.get_function(&name).cloned() {
+        if let Some(body) = self.env.get_function(&name) {
             return Ok((assignments, Resolved::Function(body, args)));
         }
 
@@ -292,11 +292,23 @@ impl Shell {
     /// Saves fds 0/1/2, applies `sc.redirects`, runs `f`, then restores the
     /// original fds regardless of outcome. If applying the redirects fails,
     /// `f` doesn't run and that error is returned.
+    ///
+    /// Skips the save/restore dance entirely when there are no redirects to
+    /// apply: `run_builtin`/`run_function` call this unconditionally for
+    /// every invocation, and the no-redirect case (`f() { ...; }`, `[ ... ]`,
+    /// `:`, ...) is by far the common one in loops and functions. Each
+    /// save/restore round-trip is 3 `dup`s out plus 3 `dup2`s and 3
+    /// `close`s back in, 9 syscalls that were previously paid on every
+    /// builtin and function call regardless of whether there was anything
+    /// to restore.
     fn with_redirects<T>(
         &mut self,
         sc: &SimpleCmd,
         f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
+        if sc.redirects.is_empty() {
+            return f(self);
+        }
         let saved_fds = save_fds(&[0, 1, 2])?;
         let result = self.apply_redirects(&sc.redirects).and_then(|()| f(self));
         let _ = restore_fds(saved_fds);
@@ -309,7 +321,7 @@ enum Resolved {
     /// No command words after expansion (e.g. a bare `FOO=bar`).
     AssignOnly,
     Builtin(BuiltinFn, String, Vec<String>),
-    Function(Command, Vec<String>),
+    Function(std::rc::Rc<Command>, Vec<String>),
     /// `name` followed by its arguments.
     External(Vec<String>),
 }

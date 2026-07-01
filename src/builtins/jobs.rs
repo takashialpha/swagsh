@@ -73,6 +73,9 @@ pub fn builtin_bg(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
         .map(|j| j.pgid)
         .ok_or_else(|| anyhow!("bg: no such job: {id}"))?;
     kill_process_group(pgid, Signal::CONT)?;
+    if let Some(job) = shell.jobs.by_pgid_mut(pgid) {
+        job.state = JobState::Running;
+    }
     eprintln!("[{id}]+ {pgid} &");
     Ok(ExitStatus::SUCCESS)
 }

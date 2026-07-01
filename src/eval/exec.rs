@@ -63,9 +63,9 @@ impl Shell {
     }
 
     pub fn run_pipeline_async(&mut self, pipeline: &Pipeline) -> Result<ExitStatus> {
-        let n = pipeline.commands.len();
+        let label = describe_pipeline(pipeline);
         let (pgid, pids) = self.spawn_pipeline(pipeline)?;
-        let job_id = self.jobs.add(pgid, pids, format!("{n} commands"));
+        let job_id = self.jobs.add(pgid, pids, label);
         eprintln!("[{job_id}] {pgid}");
         Ok(ExitStatus::SUCCESS)
     }
@@ -397,6 +397,56 @@ fn write_herestring(content: &str) -> Result<()> {
     dup2_raw(read_fd, 0)?;
     close_raw(read_fd);
     Ok(())
+}
+
+/// Best-effort reconstruction of a pipeline's source text for job-control
+/// display (`[1]+  Running    sleep 5`, `jobs`, ...). The AST doesn't keep
+/// the original source span, so this rebuilds something close to it from
+/// the parsed words instead of the generic `"N commands"` placeholder that
+/// gave every backgrounded job the same uninformative label regardless of
+/// what it actually ran.
+fn describe_pipeline(pipeline: &Pipeline) -> String {
+    let body = pipeline
+        .commands
+        .iter()
+        .map(describe_command)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if pipeline.negated {
+        format!("! {body}")
+    } else {
+        body
+    }
+}
+
+fn describe_command(cmd: &Command) -> String {
+    match cmd {
+        Command::Simple(sc) => sc
+            .words
+            .iter()
+            .map(describe_word)
+            .collect::<Vec<_>>()
+            .join(" "),
+        Command::Pipeline(p) => describe_pipeline(p),
+        Command::If(_) => "if ...".to_owned(),
+        Command::For(_) => "for ...".to_owned(),
+        Command::While(_) => "while ...".to_owned(),
+        Command::Case(_) => "case ...".to_owned(),
+        Command::Group(gc) if gc.subshell => "(...)".to_owned(),
+        Command::Group(_) => "{ ... }".to_owned(),
+        Command::FunctionDef(fd) => format!("{}()", fd.name),
+    }
+}
+
+fn describe_word(word: &Word) -> String {
+    match word {
+        Word::Literal(s) => s.clone(),
+        Word::Var(name) => format!("${name}"),
+        Word::Arith(expr) => format!("$(({expr}))"),
+        Word::CmdSub(_) => "$(...)".to_owned(),
+        Word::Compound(parts) => parts.iter().map(describe_word).collect(),
+        Word::Quoted(inner) => describe_word(inner),
+    }
 }
 
 fn execvp_path(argv: &[CString]) -> rustix::io::Errno {

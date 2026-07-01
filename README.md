@@ -22,21 +22,21 @@
 
 ```sh
 $ swagsh
-~ $ greet() { echo "hello, ${1:-world}"; }
-~ $ greet takashi
+~ ❯ greet() { echo "hello, ${1:-world}"; }
+~ ❯ greet takashi
 hello, takashi
-~ $ count=$((1 + 2 + 3)); echo $count
+~ ❯ count=$((1 + 2 + 3)); echo $count
 6
-~ $ for f in /etc/os-release /etc/hostname; do
+~ ❯ for f in /etc/os-release /etc/hostname; do
 >   [ -f "$f" ] && echo "$f: $(head -1 $f)"
 > done
 /etc/os-release: NAME="Arch Linux"
 /etc/hostname: mymachine
-~ $ sleep 5 &
+~ ❯ sleep 5 &
 [1] 9182
-~ $ jobs
-[1]+  Running    sleep 5
-~ $
+~ ❯ jobs
+[1]  Running    sleep 5
+~ ❯
 ```
 
 ---

@@ -21,7 +21,13 @@ impl Shell {
             return Ok(vec![self.expand_word_to_string_inner(inner, true)?]);
         }
         let raw = self.expand_word_to_string(word)?;
-        if raw.contains('*') || raw.contains('?') || raw.contains('[') {
+        // Only '*'/'?' trigger a directory scan: `glob_match` (src/expand.rs)
+        // has no bracket-expression support, so a `[` here never changes
+        // what actually matches. Treating a bare `[` as a possible glob was
+        // pure overhead: the ubiquitous `[` test command is itself exactly
+        // one such word, so every `[ ... ]` invocation paid for a full
+        // `read_dir` (open+getdents64+close) with no matching payoff.
+        if raw.contains('*') || raw.contains('?') {
             let matches = glob_expand(&raw);
             if !matches.is_empty() {
                 return Ok(matches);
@@ -150,33 +156,20 @@ impl Shell {
 
     pub fn expand_var(&mut self, name: &str) -> String {
         match name {
-            "?" => self.last_status.0.to_string(),
-            "$" => std::process::id().to_string(),
-            "0" => std::env::args().next().unwrap_or_default(),
-            n if n.chars().all(|c| c.is_ascii_digit()) => {
-                let idx: usize = n.parse().unwrap_or(0);
-                self.env
-                    .positional_args()
-                    .get(idx.saturating_sub(1))
-                    .cloned()
-                    .unwrap_or_default()
-            }
-            "@" | "*" => self.env.positional_args().join(" "),
-            "#" => self.env.positional_args().len().to_string(),
+            "?" | "$" | "0" | "@" | "*" | "#" => self.resolve_param(name),
+            n if n.chars().all(|c| c.is_ascii_digit()) => self.resolve_param(n),
             name => match parse_param_op(name) {
-                Some(ParamOp::Length(var)) => {
-                    self.env.get(var).unwrap_or_default().len().to_string()
-                }
+                Some(ParamOp::Length(var)) => self.resolve_param(var).len().to_string(),
                 Some(ParamOp::PrefixStrip { var, pat, greedy }) => {
-                    let val = self.env.get(var).unwrap_or_default();
+                    let val = self.resolve_param(var);
                     strip_prefix(&val, pat, greedy)
                 }
                 Some(ParamOp::SuffixStrip { var, pat, greedy }) => {
-                    let val = self.env.get(var).unwrap_or_default();
+                    let val = self.resolve_param(var);
                     strip_suffix(&val, pat, greedy)
                 }
                 Some(ParamOp::Conditional { var, op, word }) => {
-                    let val = self.env.get(var).unwrap_or_default();
+                    let val = self.resolve_param(var);
                     match op {
                         ":-" => {
                             if val.is_empty() {
@@ -217,8 +210,37 @@ impl Shell {
                         _ => val,
                     }
                 }
-                None => self.env.get(name).unwrap_or_default(),
+                None => self.resolve_param(name),
             },
+        }
+    }
+
+    /// Resolves a bare parameter name to its value: the special parameters
+    /// (`$?`, `$$`, `$0`, `$1`.., `$@`/`$*`, `$#`) plus a plain env lookup
+    /// for everything else. `expand_var`'s operator branches (`${#var}`,
+    /// `${var#pat}`, `${var:-word}`, ...) route the name they parsed out
+    /// through here too, rather than reading `self.env` directly, so
+    /// `${1:-x}`, `${#@}`, `${?:-x}`, etc. resolve the same special
+    /// parameter a bare `$1`/`$#`/`$?` would instead of always seeing
+    /// "unset" (positional args and the other special parameters aren't
+    /// stored in `self.env`, so a raw lookup by that literal name never
+    /// finds them).
+    fn resolve_param(&self, name: &str) -> String {
+        match name {
+            "?" => self.last_status.0.to_string(),
+            "$" => std::process::id().to_string(),
+            "0" => std::env::args().next().unwrap_or_default(),
+            n if n.chars().all(|c| c.is_ascii_digit()) => {
+                let idx: usize = n.parse().unwrap_or(0);
+                self.env
+                    .positional_args()
+                    .get(idx.saturating_sub(1))
+                    .cloned()
+                    .unwrap_or_default()
+            }
+            "@" | "*" => self.env.positional_args().join(" "),
+            "#" => self.env.positional_args().len().to_string(),
+            name => self.env.get(name).unwrap_or_default(),
         }
     }
 
