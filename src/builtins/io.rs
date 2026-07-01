@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 
+use crate::errfmt::strerror;
 use crate::eval::Shell;
 use crate::jobs::ExitStatus;
 
@@ -8,7 +9,7 @@ pub fn builtin_read(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     match std::io::stdin().read_line(&mut line) {
         Ok(0) => return Ok(ExitStatus::FAILURE),
         Ok(_) => {}
-        Err(e) => bail!("read: {e}"),
+        Err(e) => bail!("read: {}", strerror(e)),
     }
     let line = line.trim_end_matches('\n').trim_end_matches('\r');
     let vars: &[&str] = if args.is_empty() { &["REPLY"] } else { args };

@@ -4,7 +4,19 @@ use rustix::process::{Signal, WaitOptions, kill_process, kill_process_group, wai
 use rustix::termios::tcsetpgrp;
 
 use crate::eval::Shell;
-use crate::jobs::{ExitStatus, JobState};
+use crate::jobs::{ExitStatus, Job, JobState, decode_wait_status};
+
+/// Parses the `%job` argument `fg`/`bg` take, defaulting to job 1 (`%%`,
+/// the "current job", which this shell doesn't distinguish from job 1).
+fn parse_job_id(args: &[&str]) -> usize {
+    args.first()
+        .and_then(|s| s.trim_start_matches('%').parse().ok())
+        .unwrap_or(1)
+}
+
+fn find_job(shell: &Shell, id: usize) -> Option<&Job> {
+    shell.jobs.iter().find(|j| j.id == id)
+}
 
 #[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
 pub fn builtin_jobs(shell: &mut Shell, _args: &[&str]) -> Result<ExitStatus> {
@@ -28,14 +40,8 @@ pub fn builtin_jobs(shell: &mut Shell, _args: &[&str]) -> Result<ExitStatus> {
 }
 
 pub fn builtin_fg(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
-    let id: usize = args
-        .first()
-        .and_then(|s| s.trim_start_matches('%').parse().ok())
-        .unwrap_or(1);
-    let (pgid, cmd) = shell
-        .jobs
-        .iter()
-        .find(|j| j.id == id)
+    let id = parse_job_id(args);
+    let (pgid, cmd) = find_job(shell, id)
         .map(|j| (j.pgid, j.command.clone()))
         .ok_or_else(|| anyhow!("fg: no such job: {id}"))?;
     eprintln!("{cmd}");
@@ -44,10 +50,8 @@ pub fn builtin_fg(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     let status = loop {
         match waitpgid(pgid, WaitOptions::UNTRACED) {
             Ok(Some((_, ws))) => {
-                if let Some(code) = ws.exit_status() {
-                    break ExitStatus(code);
-                } else if let Some(sig) = ws.terminating_signal() {
-                    break ExitStatus(128 + sig);
+                if let Some(exit) = decode_wait_status(ws) {
+                    break exit;
                 } else if ws.stopped() {
                     let _ = tcsetpgrp(std::io::stdin(), shell.pgid);
                     break ExitStatus(130);
@@ -55,7 +59,7 @@ pub fn builtin_fg(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
             }
             Ok(None) => {}
             Err(e) if e == Errno::INTR => {}
-            Err(e) => return Err(anyhow!(e)),
+            Err(e) => return Err(e.into()),
         }
     };
     let _ = tcsetpgrp(std::io::stdin(), shell.pgid);
@@ -64,14 +68,8 @@ pub fn builtin_fg(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
 }
 
 pub fn builtin_bg(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
-    let id: usize = args
-        .first()
-        .and_then(|s| s.trim_start_matches('%').parse().ok())
-        .unwrap_or(1);
-    let pgid = shell
-        .jobs
-        .iter()
-        .find(|j| j.id == id)
+    let id = parse_job_id(args);
+    let pgid = find_job(shell, id)
         .map(|j| j.pgid)
         .ok_or_else(|| anyhow!("bg: no such job: {id}"))?;
     kill_process_group(pgid, Signal::CONT)?;
@@ -100,10 +98,7 @@ pub fn builtin_kill(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
             let id: usize = id_str
                 .parse()
                 .map_err(|_| anyhow!("kill: invalid job: {target}"))?;
-            let pgid = shell
-                .jobs
-                .iter()
-                .find(|j| j.id == id)
+            let pgid = find_job(shell, id)
                 .map(|j| j.pgid)
                 .ok_or_else(|| anyhow!("kill: no such job: {id}"))?;
             kill_process_group(pgid, sig)?;

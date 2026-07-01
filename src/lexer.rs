@@ -106,6 +106,11 @@ pub struct LexError {
     pub line: usize,
     pub col: usize,
     pub msg: &'static str,
+    /// Set when this error means "ran out of source before a quote or
+    /// substitution closed" rather than a genuinely malformed construct;
+    /// the REPL uses this to tell "keep reading more lines" (an unclosed
+    /// `'`/`"`/`$(`/`${`/`` ` `` at end of input) apart from a hard error.
+    pub incomplete: bool,
 }
 
 impl fmt::Display for LexError {
@@ -177,6 +182,19 @@ impl<'src> Lexer<'src> {
             line: self.line,
             col: self.col,
             msg,
+            incomplete: false,
+        }
+    }
+
+    /// Like `err`, but for the "source ended before this quote or
+    /// substitution closed" case; see `LexError::incomplete`.
+    #[inline]
+    const fn err_incomplete(&self, msg: &'static str) -> LexError {
+        LexError {
+            line: self.line,
+            col: self.col,
+            msg,
+            incomplete: true,
         }
     }
 
@@ -233,7 +251,7 @@ impl<'src> Lexer<'src> {
     fn lex_single_quoted(&mut self, buf: &mut String) -> Result<(), LexError> {
         loop {
             match self.advance() {
-                None => return Err(self.err("unterminated single-quoted string")),
+                None => return Err(self.err_incomplete("unterminated single-quoted string")),
                 Some(b'\'') => break,
                 Some(b) if b < UTF8_CONT_START => buf.push(b as char),
                 Some(_) => self.push_utf8(buf, self.pos - 1),
@@ -246,7 +264,7 @@ impl<'src> Lexer<'src> {
         buf.push('"');
         loop {
             match self.advance() {
-                None => return Err(self.err("unterminated double-quoted string")),
+                None => return Err(self.err_incomplete("unterminated double-quoted string")),
                 Some(b'"') => {
                     buf.push('"');
                     break;
@@ -275,7 +293,7 @@ impl<'src> Lexer<'src> {
         let mut depth: usize = 1;
         loop {
             match self.advance() {
-                None => return Err(self.err("unterminated command substitution")),
+                None => return Err(self.err_incomplete("unterminated command substitution")),
                 Some(b'(') => {
                     depth += 1;
                     buf.push('(');
@@ -316,7 +334,7 @@ impl<'src> Lexer<'src> {
         let mut depth: usize = 1;
         loop {
             match self.advance() {
-                None => return Err(self.err("unterminated parameter expansion")),
+                None => return Err(self.err_incomplete("unterminated parameter expansion")),
                 Some(b'{') => {
                     depth += 1;
                     buf.push('{');
@@ -339,7 +357,7 @@ impl<'src> Lexer<'src> {
         buf.push('`');
         loop {
             match self.advance() {
-                None => return Err(self.err("unterminated backtick substitution")),
+                None => return Err(self.err_incomplete("unterminated backtick substitution")),
                 Some(b'`') => {
                     buf.push('`');
                     break;

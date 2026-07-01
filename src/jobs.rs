@@ -1,4 +1,4 @@
-use rustix::process::{Pid, WaitOptions, wait};
+use rustix::process::{Pid, WaitOptions, WaitStatus, wait};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitStatus(pub i32);
@@ -11,6 +11,29 @@ impl ExitStatus {
     pub const fn is_success(self) -> bool {
         self.0 == 0
     }
+
+    /// The status a `!`-negated pipeline reports: POSIX only distinguishes
+    /// success (0) from failure, so any nonzero status negates to `SUCCESS`.
+    #[inline]
+    pub const fn negated(self) -> Self {
+        if self.is_success() {
+            Self::FAILURE
+        } else {
+            Self::SUCCESS
+        }
+    }
+}
+
+/// Decodes a `waitpid`/`waitpgid` status for the two cases that end a wait
+/// loop: normal exit, or death by signal (reported as `128 + signum`, the
+/// POSIX convention `$?` follows). Returns `None` for a stopped process,
+/// since `wait_for_pid` and `fg` each handle that case differently
+/// (job-table bookkeeping vs. terminal ownership).
+pub fn decode_wait_status(status: WaitStatus) -> Option<ExitStatus> {
+    status
+        .exit_status()
+        .map(ExitStatus)
+        .or_else(|| status.terminating_signal().map(|sig| ExitStatus(128 + sig)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

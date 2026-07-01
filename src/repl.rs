@@ -2,9 +2,14 @@ use anyhow::Result;
 use rustyline::error::ReadlineError;
 use rustyline::{Config, DefaultEditor};
 
+use crate::ast::Program;
 use crate::cli::Cli;
-use crate::eval::Shell;
+use crate::errfmt::{emit, strerror};
+use crate::eval::{Shell, is_interrupted};
+use crate::jobs::ExitStatus;
+use crate::parser::ParseError;
 use crate::prompt::{build_prompt, history_file};
+use crate::signal::take_interrupted;
 
 pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
     let histsize: usize = shell
@@ -42,15 +47,19 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
                     let _ = rl.add_history_entry(line);
                 }
 
-                let full_input = collect_heredoc_input(line, &mut rl);
-
-                match crate::parser::parse(&full_input) {
-                    Err(e) => eprintln!("swagsh: {e}"),
+                take_interrupted();
+                match read_program(line, &mut rl) {
+                    Err(e) => emit(e),
                     Ok(program) => {
                         if !cli.no_execute
                             && let Err(e) = shell.run_program(&program)
                         {
-                            eprintln!("swagsh: {e}");
+                            if is_interrupted(&e) {
+                                println!();
+                                shell.last_status = ExitStatus(130);
+                            } else {
+                                emit(e);
+                            }
                         }
                     }
                 }
@@ -59,7 +68,7 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
             Err(ReadlineError::Interrupted) => {}
             Err(ReadlineError::Eof) => break,
             Err(e) => {
-                eprintln!("swagsh: readline: {e}");
+                eprintln!("swagsh: readline: {}", strerror(e));
                 break;
             }
         }
@@ -69,7 +78,11 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
         && let Some(ref p) = history_path
         && let Err(e) = rl.save_history(p)
     {
-        eprintln!("swagsh: history: could not save to {}: {e}", p.display());
+        eprintln!(
+            "swagsh: history: could not save to {}: {}",
+            p.display(),
+            strerror(e)
+        );
     }
     Ok(())
 }
@@ -91,7 +104,7 @@ fn source_if_exists(shell: &mut Shell, path: &std::path::Path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
-            eprintln!("swagsh: {}: {e}", path.display());
+            eprintln!("swagsh: {}: {}", path.display(), strerror(e));
             return;
         }
     };
@@ -101,6 +114,60 @@ fn source_if_exists(shell: &mut Shell, path: &std::path::Path) {
         }
         Err(e) => eprintln!("swagsh: {}: {e}", path.display()),
     }
+}
+
+/// Reads `first_line` plus as many further lines as needed for it to parse
+/// as a complete `Program`, printing rustyline's `> ` prompt for each one.
+/// Generalizes what heredoc collection already did for `<<`/`<<-` bodies
+/// specifically: try to parse, and if the only problem is that the parser
+/// ran out of input mid-construct (`ParseError::incomplete`, an unclosed
+/// `if`/`while`/`for`/`case`/`{`/`(`, or an unterminated quote), read one
+/// more line and retry instead of reporting a hard error immediately.
+/// Heredoc bodies are still special-cased per line via
+/// `collect_heredoc_input`, since their content is raw text that isn't
+/// meant to be parsed as shell syntax itself. A trailing `\` is also
+/// special-cased via `join_backslash_continuations`: unlike the other
+/// three, it's a *lexical* join of two physical lines into one; by the
+/// time it reaches the parser as `Token::Eof`-vs-real-token, `readline()`
+/// has already stripped the newline it needed to see, so there's no
+/// `incomplete` signal to react to, and it has to be resolved before
+/// parsing is even attempted.
+fn read_program(first_line: &str, rl: &mut DefaultEditor) -> Result<Program, ParseError> {
+    let mut buf = collect_heredoc_input(&join_backslash_continuations(first_line, rl), rl);
+    loop {
+        match crate::parser::parse(&buf) {
+            Ok(program) => return Ok(program),
+            Err(e) if e.incomplete => {
+                let Ok(next_line) = rl.readline("> ") else {
+                    return Err(e);
+                };
+                let next_line = join_backslash_continuations(&next_line, rl);
+                if !buf.ends_with('\n') {
+                    buf.push('\n');
+                }
+                buf.push_str(&collect_heredoc_input(&next_line, rl));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Joins `line` with however many further lines are needed to resolve every
+/// trailing `\` continuation, stripping each such backslash and splicing
+/// the next line directly onto it (matching what an unescaped `\<newline>`
+/// inside a single buffer already lexes as: nothing). An odd number of
+/// trailing backslashes means the last one escapes the newline; an even
+/// number means they're literal escaped backslashes and the line really
+/// does end there, the same rule the lexer itself would apply if this
+/// were one contiguous buffer instead of one `readline()` call per line.
+fn join_backslash_continuations(line: &str, rl: &mut DefaultEditor) -> String {
+    let mut line = line.to_owned();
+    while line.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1 {
+        line.pop();
+        let Ok(next) = rl.readline("> ") else { break };
+        line.push_str(&next);
+    }
+    line
 }
 
 fn collect_heredoc_input(line: &str, rl: &mut DefaultEditor) -> String {

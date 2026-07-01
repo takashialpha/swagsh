@@ -9,12 +9,12 @@ use rustix::runtime::{Fork, execve, kernel_fork};
 use rustix::termios::tcsetpgrp;
 
 use crate::ast::{Command, Pipeline, Redirect, RedirectKind, SimpleCmd, Word};
-use crate::builtins;
+use crate::errfmt::{emit, strerror};
 use crate::fd::{close_raw, dup2_raw, open_read, open_write, raw_pipe, write_raw};
-use crate::jobs::{ExitStatus, JobState};
+use crate::jobs::{ExitStatus, JobState, decode_wait_status};
 use crate::signal::restore_child_signals;
 
-use super::{Shell, is_assignment, is_break, is_continue, is_return, resolve_alias};
+use super::{Resolved, Shell, catch_return, is_break, is_continue, is_return};
 
 impl Shell {
     pub fn run_pipeline(&mut self, pipeline: &Pipeline) -> Result<ExitStatus> {
@@ -23,48 +23,12 @@ impl Shell {
         if n == 1 {
             let mut status = self.run_command(&pipeline.commands[0])?;
             if pipeline.negated {
-                status = if status.is_success() {
-                    ExitStatus::FAILURE
-                } else {
-                    ExitStatus::SUCCESS
-                };
+                status = status.negated();
             }
             return Ok(status);
         }
 
-        let mut pgid: Option<Pid> = None;
-        let mut pids = Vec::with_capacity(n);
-        let mut prev_read: Option<RawFd> = None;
-
-        for (idx, cmd) in pipeline.commands.iter().enumerate() {
-            let is_last = idx == n - 1;
-            let (pipe_read, pipe_write) = if is_last {
-                (None, None)
-            } else {
-                let (r, w) = raw_pipe()?;
-                (Some(r), Some(w))
-            };
-
-            let child = self.fork_command(cmd, prev_read, pipe_write, pgid)?;
-
-            if let Some(existing) = pgid {
-                let _ = setpgid(Some(child), Some(existing));
-            } else {
-                pgid = Some(child);
-                let _ = setpgid(Some(child), Some(child));
-            }
-
-            pids.push(child);
-            if let Some(fd) = pipe_write {
-                close_raw(fd);
-            }
-            if let Some(fd) = prev_read {
-                close_raw(fd);
-            }
-            prev_read = pipe_read;
-        }
-
-        let pgid = pgid.unwrap();
+        let (pgid, pids) = self.spawn_pipeline(pipeline)?;
         if self.interactive {
             let _ = tcsetpgrp(std::io::stdin(), pgid);
         }
@@ -93,21 +57,29 @@ impl Shell {
         }
 
         if pipeline.negated {
-            last_status = if last_status.is_success() {
-                ExitStatus::FAILURE
-            } else {
-                ExitStatus::SUCCESS
-            };
+            last_status = last_status.negated();
         }
         Ok(last_status)
     }
 
     pub fn run_pipeline_async(&mut self, pipeline: &Pipeline) -> Result<ExitStatus> {
         let n = pipeline.commands.len();
+        let (pgid, pids) = self.spawn_pipeline(pipeline)?;
+        let job_id = self.jobs.add(pgid, pids, format!("{n} commands"));
+        eprintln!("[{job_id}] {pgid}");
+        Ok(ExitStatus::SUCCESS)
+    }
+
+    /// Forks every stage of `pipeline`, wiring each stage's stdout to the
+    /// next stage's stdin via a pipe, and placing them all in one process
+    /// group. Returns the group's pgid and the pids of every forked stage,
+    /// in pipeline order. Shared by `run_pipeline` (waits synchronously) and
+    /// `run_pipeline_async` (registers a background job and returns).
+    fn spawn_pipeline(&mut self, pipeline: &Pipeline) -> Result<(Pid, Vec<Pid>)> {
+        let n = pipeline.commands.len();
         let mut pgid: Option<Pid> = None;
         let mut pids = Vec::with_capacity(n);
         let mut prev_read: Option<RawFd> = None;
-        let cmd_str = format!("{n} commands");
 
         for (idx, cmd) in pipeline.commands.iter().enumerate() {
             let is_last = idx == n - 1;
@@ -137,10 +109,7 @@ impl Shell {
             prev_read = pipe_read;
         }
 
-        let pgid = pgid.unwrap();
-        let job_id = self.jobs.add(pgid, pids, cmd_str);
-        eprintln!("[{job_id}] {pgid}");
-        Ok(ExitStatus::SUCCESS)
+        Ok((pgid.unwrap(), pids))
     }
 
     fn fork_command(
@@ -180,7 +149,7 @@ impl Shell {
                 Ok(s) => s.0,
                 Err(e) => {
                     if !is_break(&e) && !is_continue(&e) && !is_return(&e) {
-                        eprintln!("swagsh: {e}");
+                        emit(e);
                     }
                     1
                 }
@@ -188,53 +157,60 @@ impl Shell {
         }
     }
 
+    /// Runs a `SimpleCmd` to completion inside a forked pipeline-stage
+    /// child, returning its exit code. Resolution (word expansion, alias
+    /// substitution, builtin/function/external lookup) is shared with the
+    /// top-level `Shell::run_simple` path via `resolve_simple`; this
+    /// function only decides how to *run* what was resolved, since a
+    /// disposable forked child runs things differently than the continuing
+    /// shell process does: assignments are exported (not scoped/restored)
+    /// and external commands are exec'd directly instead of forked again.
     fn exec_simple_in_child(&mut self, sc: &SimpleCmd) -> i32 {
         if let Err(e) = self.apply_redirects(&sc.redirects) {
-            eprintln!("swagsh: {e}");
+            emit(e);
             return 1;
         }
-        let words = match self.expand_words(&sc.words) {
-            Ok(w) => w,
+        let (assignments, resolved) = match self.resolve_simple(sc) {
+            Ok(r) => r,
             Err(e) => {
-                eprintln!("swagsh: {e}");
+                emit(e);
                 return 1;
             }
         };
-        if words.is_empty() {
-            return 0;
-        }
-
-        let assign_count = words.iter().take_while(|w| is_assignment(w)).count();
-        let (assignments, cmd_words) = words.split_at(assign_count);
-        for a in assignments {
-            let (k, v) = a.split_once('=').unwrap();
+        for a in &assignments {
+            let (k, v) = super::split_assignment(a);
             self.env.export(k, v);
         }
-        if cmd_words.is_empty() {
-            return 0;
-        }
 
-        let (name, expanded_args) = resolve_alias(&self.env, &cmd_words[0], &cmd_words[1..]);
-        let arg_refs: Vec<&str> = expanded_args.iter().map(String::as_str).collect();
-
-        if let Some(f) = builtins::lookup_builtin(name.as_str()) {
-            return match f(self, &arg_refs) {
-                Ok(s) => s.0,
-                Err(e) => {
-                    eprintln!("swagsh: {e}");
-                    1
+        match resolved {
+            Resolved::AssignOnly => 0,
+            Resolved::Builtin(f, _, args) => {
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                match f(self, &arg_refs) {
+                    Ok(s) => s.0,
+                    Err(e) => {
+                        emit(e);
+                        1
+                    }
                 }
-            };
-        }
-
-        let mut full_words = vec![name];
-        full_words.extend(expanded_args);
-        match Self::do_exec(&full_words) {
-            Ok(_) => unreachable!(),
-            Err(e) => {
-                eprintln!("swagsh: {e}");
-                127
             }
+            Resolved::Function(body, args) => {
+                self.env.set_positional_args(args);
+                match catch_return(self.run_command(&body)) {
+                    Ok(s) => s.0,
+                    Err(e) => {
+                        emit(e);
+                        1
+                    }
+                }
+            }
+            Resolved::External(words) => match Self::do_exec(&words) {
+                Ok(_) => unreachable!(),
+                Err(e) => {
+                    emit(e);
+                    127
+                }
+            },
         }
     }
 
@@ -254,17 +230,17 @@ impl Shell {
                     let _ = setpgid(Some(my_pid), Some(my_pid));
                 }
                 for a in assignments {
-                    let (k, v) = a.split_once('=').unwrap();
+                    let (k, v) = super::split_assignment(a);
                     self.env.export(k, v);
                 }
                 if let Err(e) = self.apply_redirects(&sc.redirects) {
-                    eprintln!("swagsh: {e}");
+                    emit(e);
                     std::process::exit(1);
                 }
                 match Self::do_exec(words) {
                     Ok(_) => unreachable!(),
                     Err(e) => {
-                        eprintln!("swagsh: {e}");
+                        emit(e);
                         std::process::exit(127);
                     }
                 }
@@ -299,20 +275,18 @@ impl Shell {
         }
         let argv: Vec<CString> = words
             .iter()
-            .map(|w| CString::new(w.as_str()).map_err(|e| anyhow!(e)))
-            .collect::<Result<_>>()?;
+            .map(|w| CString::new(w.as_str()))
+            .collect::<Result<_, _>>()?;
         let errno = execvp_path(&argv);
-        bail!("{}: {}", words[0], errno);
+        bail!("{}: {}", words[0], strerror(errno));
     }
 
     pub fn wait_for_pid(&mut self, pid: Pid) -> Result<ExitStatus> {
         loop {
             match waitpid(Some(pid), WaitOptions::UNTRACED) {
                 Ok(Some((_, status))) => {
-                    if let Some(code) = status.exit_status() {
-                        return Ok(ExitStatus(code));
-                    } else if let Some(sig) = status.terminating_signal() {
-                        return Ok(ExitStatus(128 + sig));
+                    if let Some(exit) = decode_wait_status(status) {
+                        return Ok(exit);
                     } else if status.stopped() {
                         if let Some(job) = self.jobs.by_pgid_mut(pid) {
                             job.state = JobState::Stopped;
@@ -323,7 +297,7 @@ impl Shell {
                 }
                 Ok(None) => {}
                 Err(e) if e == Errno::INTR => {}
-                Err(e) => return Err(anyhow!(e)),
+                Err(e) => return Err(e.into()),
             }
         }
     }

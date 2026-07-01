@@ -1,6 +1,6 @@
 use std::os::fd::{FromRawFd, IntoRawFd};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use rustix::fd::{BorrowedFd, OwnedFd, RawFd};
 use rustix::fs::{self, Mode, OFlags};
 use rustix::io::{dup2, fcntl_dupfd_cloexec, read, write};
@@ -76,7 +76,7 @@ pub fn save_fds(fds: &[RawFd]) -> Result<Vec<(RawFd, RawFd)>> {
                 for (_, s) in saved {
                     close_raw(s);
                 }
-                return Err(anyhow!(e));
+                return Err(e.into());
             }
         }
     }
@@ -85,7 +85,7 @@ pub fn save_fds(fds: &[RawFd]) -> Result<Vec<(RawFd, RawFd)>> {
 
 pub fn restore_fds(saved: Vec<(RawFd, RawFd)>) -> Result<()> {
     for (original, saved_fd) in saved {
-        dup2_raw(saved_fd, original).map_err(|e| anyhow!(e))?;
+        dup2_raw(saved_fd, original)?;
         close_raw(saved_fd);
     }
     Ok(())

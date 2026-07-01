@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 
+use crate::errfmt::strerror;
 use crate::eval::Shell;
 use crate::expand::expand_tilde;
 use crate::jobs::ExitStatus;
@@ -13,7 +14,7 @@ pub fn builtin_cd(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     let old = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
-    std::env::set_current_dir(&target).map_err(|e| anyhow!("cd: {target}: {e}"))?;
+    std::env::set_current_dir(&target).map_err(|e| anyhow!("cd: {target}: {}", strerror(e)))?;
     shell.env.export("OLDPWD", old);
     let new = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -26,7 +27,7 @@ pub fn builtin_pwd(_shell: &mut Shell, _args: &[&str]) -> Result<ExitStatus> {
     println!(
         "{}",
         std::env::current_dir()
-            .map_err(|e| anyhow!("pwd: {e}"))?
+            .map_err(|e| anyhow!("pwd: {}", strerror(e)))?
             .display()
     );
     Ok(ExitStatus::SUCCESS)

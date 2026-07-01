@@ -2,10 +2,12 @@ use anyhow::Result;
 use rustix::runtime::{Fork, kernel_fork};
 
 use crate::ast::{AndOrList, AndOrOp, CaseClause, ForClause, GroupCmd, IfClause, WhileClause};
+use crate::errfmt::emit;
 use crate::expand::glob_match;
 use crate::jobs::ExitStatus;
+use crate::signal::restore_child_signals;
 
-use super::{Shell, is_break, is_continue};
+use super::{Shell, is_break, is_continue, is_return};
 
 impl Shell {
     pub(super) fn run_and_or(&mut self, aol: &AndOrList) -> Result<ExitStatus> {
@@ -131,7 +133,17 @@ impl Shell {
             // SAFETY: fork.
             match unsafe { kernel_fork()? } {
                 Fork::Child(_) => {
-                    let status = self.run_list(&gc.body).unwrap_or(ExitStatus::FAILURE);
+                    // SAFETY: in child, before any allocations.
+                    unsafe { restore_child_signals() };
+                    let status = match self.run_list(&gc.body) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            if !is_break(&e) && !is_continue(&e) && !is_return(&e) {
+                                emit(e);
+                            }
+                            ExitStatus::FAILURE
+                        }
+                    };
                     std::process::exit(status.0);
                 }
                 Fork::ParentOf(child) => return self.wait_for_pid(child),

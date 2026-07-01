@@ -114,7 +114,7 @@ pub enum ParamOp<'a> {
 }
 
 pub fn parse_param_op(s: &str) -> Option<ParamOp<'_>> {
-    // ${#var}: length — starts with '#' followed by a valid name or special param
+    // ${#var}: length, starts with '#' followed by a valid name or special param
     if let Some(var) = s.strip_prefix('#')
         && !var.is_empty()
     {

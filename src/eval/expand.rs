@@ -1,17 +1,19 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use rustix::io::Errno;
 use rustix::process::{WaitOptions, waitpid};
 use rustix::runtime::{Fork, kernel_fork};
 
 use crate::ast::{Command, Word};
+use crate::errfmt::emit;
 use crate::expand::{
     ParamOp, eval_arith, expand_tilde, glob_expand, parse_param_op, strip_prefix, strip_suffix,
 };
 use crate::fd::{close_raw, dup2_raw, raw_pipe, read_raw};
 use crate::jobs::ExitStatus;
 use crate::parser::parse;
+use crate::signal::restore_child_signals;
 
-use super::Shell;
+use super::{Shell, is_break, is_continue, is_return};
 
 impl Shell {
     pub fn expand_word(&mut self, word: &Word) -> Result<Vec<String>> {
@@ -63,7 +65,7 @@ impl Shell {
             }
             Word::Var(name) => Ok(self.expand_var(name)),
             Word::Arith(expr) => {
-                let expanded = self.expand_arith_vars(expr);
+                let expanded = self.expand_arith_vars(expr)?;
                 Ok(eval_arith(&expanded).to_string())
             }
             Word::CmdSub(cmd) => self.expand_cmd_sub(cmd),
@@ -78,40 +80,72 @@ impl Shell {
         }
     }
 
-    fn expand_arith_vars(&self, expr: &str) -> String {
+    /// Substitutes `$var`/`${var}` *and* bare `var` references inside a
+    /// `$(( ))` expression with their values, before handing the result to
+    /// `eval_arith`. POSIX arithmetic treats a bare identifier the same as
+    /// `$identifier`: `$(( x + 1 ))` means the same thing as
+    /// `$(( $x + 1 ))`, so both forms are recognized here; `eval_arith`'s
+    /// tokenizer has no variable lookup of its own; it treats any
+    /// identifier that reaches it as `0`, which is only correct once every
+    /// reference has already been substituted.
+    ///
+    /// Delegates each reference to `expand_var` (the same variable expander
+    /// `Word::Var` uses for ordinary word expansion) rather than reading
+    /// `self.env` directly, so parameter-expansion operators work inside
+    /// arithmetic too: `$(( ${n:-0} + 1 ))` needs the `:-` default applied,
+    /// not just a raw lookup of a variable literally named `n:-0`. Follows
+    /// dash's rule for what a substitution is allowed to be: unset (empty)
+    /// becomes `0` silently, but a variable holding non-numeric text is a
+    /// hard error (`Illegal number: <value>`) rather than a silent `0`:
+    /// dash does not recursively treat that text as another variable name
+    /// (unlike bash), it just rejects it.
+    fn expand_arith_vars(&mut self, expr: &str) -> Result<String> {
         let mut result = String::new();
         let mut chars = expr.chars().peekable();
         while let Some(c) = chars.next() {
-            if c != '$' {
-                result.push(c);
-                continue;
-            }
-            let mut var = String::new();
-            match chars.peek() {
-                Some(&'{') => {
-                    chars.next();
-                    for ch in chars.by_ref() {
-                        if ch == '}' {
-                            break;
+            let var = match c {
+                '$' => Some(match chars.peek() {
+                    Some(&'{') => {
+                        chars.next();
+                        let mut var = String::new();
+                        for ch in chars.by_ref() {
+                            if ch == '}' {
+                                break;
+                            }
+                            var.push(ch);
                         }
-                        var.push(ch);
+                        var
+                    }
+                    Some(&c2) if "@*#?-$!".contains(c2) => {
+                        chars.next();
+                        c2.to_string()
+                    }
+                    _ => take_identifier(&mut chars),
+                }),
+                c if c.is_ascii_alphabetic() || c == '_' => {
+                    let mut var = String::from(c);
+                    var.push_str(&take_identifier(&mut chars));
+                    Some(var)
+                }
+                _ => None,
+            };
+
+            match var {
+                Some(var) => {
+                    let value = self.expand_var(&var);
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        result.push('0');
+                    } else if trimmed.parse::<i64>().is_ok() {
+                        result.push_str(trimmed);
+                    } else {
+                        anyhow::bail!("Illegal number: {trimmed}");
                     }
                 }
-                Some(&'?') => {
-                    chars.next();
-                    result.push_str(&self.last_status.0.to_string());
-                    continue;
-                }
-                _ => {
-                    while matches!(chars.peek(), Some(c) if c.is_ascii_alphanumeric() || *c == '_')
-                    {
-                        var.push(chars.next().unwrap());
-                    }
-                }
+                None => result.push(c),
             }
-            result.push_str(&self.env.get(&var).unwrap_or_default());
         }
-        result
+        Ok(result)
     }
 
     pub fn expand_var(&mut self, name: &str) -> String {
@@ -193,11 +227,21 @@ impl Shell {
         // SAFETY: fork.
         match unsafe { kernel_fork()? } {
             Fork::Child(_) => {
+                // SAFETY: in child, before any allocations.
+                unsafe { restore_child_signals() };
                 close_raw(read_fd);
                 let _ = dup2_raw(write_fd, 1);
                 close_raw(write_fd);
                 let mut child = Self::new(self.env.clone(), false);
-                let status = child.run_command(cmd).unwrap_or(ExitStatus::FAILURE);
+                let status = match child.run_command(cmd) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if !is_break(&e) && !is_continue(&e) && !is_return(&e) {
+                            emit(e);
+                        }
+                        ExitStatus::FAILURE
+                    }
+                };
                 std::process::exit(status.0);
             }
             Fork::ParentOf(child) => {
@@ -209,7 +253,7 @@ impl Shell {
                         Ok(0) => break,
                         Ok(n) => output.extend_from_slice(&buf[..n]),
                         Err(e) if e == Errno::INTR => {}
-                        Err(e) => return Err(anyhow!(e)),
+                        Err(e) => return Err(e.into()),
                     }
                 }
                 close_raw(read_fd);
@@ -267,10 +311,7 @@ impl Shell {
                         chars.next();
                         result.push_str(&self.expand_var(&c2.to_string()));
                     } else {
-                        while matches!(chars.peek(), Some(ch) if ch.is_ascii_alphanumeric() || *ch == '_')
-                        {
-                            var.push(chars.next().unwrap());
-                        }
+                        var.push_str(&take_identifier(&mut chars));
                         result.push_str(&self.expand_var(&var));
                     }
                 }
@@ -282,4 +323,17 @@ impl Shell {
         }
         result
     }
+}
+
+/// Consumes a run of identifier characters (`[A-Za-z0-9_]`) from `chars`.
+/// Used wherever a bare variable name needs to be read out of already-
+/// expanded text (arithmetic expressions, here-doc bodies): the lexer
+/// handles this for source text, but these two run over materialized
+/// strings at execution time, after lexing is long done.
+fn take_identifier(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut ident = String::new();
+    while matches!(chars.peek(), Some(c) if c.is_ascii_alphanumeric() || *c == '_') {
+        ident.push(chars.next().unwrap());
+    }
+    ident
 }

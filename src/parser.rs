@@ -20,6 +20,12 @@ pub struct ParseError {
     pub line: usize,
     pub col: usize,
     pub msg: String,
+    /// Set when the parser ran out of tokens mid-construct (an unclosed
+    /// `if`/`while`/`for`/`case`/`{`/`(`, or an unterminated quote or
+    /// substitution from the lexer) rather than hitting a genuinely wrong
+    /// token. The REPL uses this to decide whether to prompt for more
+    /// input (`> `) instead of reporting a hard error.
+    pub incomplete: bool,
 }
 
 impl fmt::Display for ParseError {
@@ -36,6 +42,7 @@ impl From<LexError> for ParseError {
             line: e.line,
             col: e.col,
             msg: e.msg.to_owned(),
+            incomplete: e.incomplete,
         }
     }
 }
@@ -118,16 +125,23 @@ impl Parser {
                 line: sp.line,
                 col: sp.col,
                 msg: format!("expected `{expected}`, got `{}`", sp.token),
+                incomplete: sp.token == Token::Eof,
             })
         }
     }
 
+    /// The token the error points at ran out (`Token::Eof`): the grammar
+    /// wanted more but the input simply ended, e.g. `if true` with no
+    /// `then` yet. Every hard syntax error instead points at a real,
+    /// unexpected token, so this check alone is enough to tell the two
+    /// apart everywhere `err`/`expect` are used.
     fn err(&self, msg: impl Into<String>) -> ParseError {
         let sp = self.peek_spanned();
         ParseError {
             line: sp.line,
             col: sp.col,
             msg: msg.into(),
+            incomplete: sp.token == Token::Eof,
         }
     }
 
@@ -188,6 +202,7 @@ impl Parser {
                 | Token::Elif
                 | Token::Else
                 | Token::Then
+                | Token::Do
                 | Token::RParen
                 | Token::RBrace
                 | Token::In
@@ -571,6 +586,7 @@ fn collect_balanced(
             line: 0,
             col: 0,
             msg: format!("unterminated `{open}...{close}` in word"),
+            incomplete: true,
         });
     }
 

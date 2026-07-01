@@ -13,7 +13,7 @@ use crate::jobs::ExitStatus;
 
 pub type BuiltinFn = fn(&mut Shell, &[&str]) -> anyhow::Result<ExitStatus>;
 
-// Sorted table — binary search in lookup_builtin requires strict lexicographic order.
+// Sorted table: binary search in lookup_builtin requires strict lexicographic order.
 pub static BUILTINS: &[(&str, BuiltinFn)] = &[
     (".", flow::builtin_source),
     (":", flow::builtin_colon),

@@ -10,7 +10,7 @@ use crate::builtins::{self, BuiltinFn};
 use crate::env::Env;
 use crate::fd::{restore_fds, save_fds};
 use crate::jobs::{ExitStatus, JobTable};
-use crate::signal::sig_ign_action;
+use crate::signal::{sig_ign_action, sig_interrupt_action, take_interrupted};
 
 mod compound;
 mod exec;
@@ -48,6 +48,28 @@ impl fmt::Display for ReturnSignal {
 
 impl std::error::Error for ReturnSignal {}
 
+/// Raised at the top of `run_command` when `SIGINT` has arrived since the
+/// last check (see `signal::take_interrupted`). Unwinds through the same
+/// `anyhow::Error` control-flow path as `break`/`continue`/`return` so a
+/// `^C` mid-loop aborts the current top-level command instead of running
+/// forever: there's no forked child for the OS to deliver a fatal default
+/// `SIGINT` to in that case, since builtins/functions/loops all run
+/// in-process.
+#[derive(Debug)]
+pub struct Interrupted;
+
+impl fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("interrupted")
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
+pub fn is_interrupted(e: &Error) -> bool {
+    e.downcast_ref::<Interrupted>().is_some()
+}
+
 pub fn is_break(e: &Error) -> bool {
     matches!(e.downcast_ref::<LoopSignal>(), Some(LoopSignal::Break))
 }
@@ -58,6 +80,16 @@ pub fn is_continue(e: &Error) -> bool {
 
 pub fn is_return(e: &Error) -> bool {
     e.downcast_ref::<ReturnSignal>().is_some()
+}
+
+/// Catches a `return` propagated as an error at a function-call boundary and
+/// turns it into that function's exit status, so `return` doesn't keep
+/// unwinding past the function that should absorb it.
+fn catch_return(result: Result<ExitStatus>) -> Result<ExitStatus> {
+    match result {
+        Err(e) if is_return(&e) => Ok(ExitStatus(e.downcast::<ReturnSignal>().unwrap().0)),
+        other => other,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +116,7 @@ impl Shell {
                 let _ = kernel_sigaction(Signal::TTOU, Some(ign.clone()));
                 let _ = kernel_sigaction(Signal::TTIN, Some(ign.clone()));
                 let _ = kernel_sigaction(Signal::TSTP, Some(ign));
+                let _ = kernel_sigaction(Signal::INT, Some(sig_interrupt_action()));
             }
         }
         Self {
@@ -104,6 +137,9 @@ impl Shell {
     }
 
     pub fn run_command(&mut self, cmd: &Command) -> Result<ExitStatus> {
+        if self.interactive && take_interrupted() {
+            return Err(Error::new(Interrupted));
+        }
         match cmd {
             Command::Simple(sc) => self.run_simple(sc),
             Command::Pipeline(p) => self.run_pipeline(p),
@@ -120,36 +156,59 @@ impl Shell {
     }
 
     fn run_simple(&mut self, sc: &SimpleCmd) -> Result<ExitStatus> {
+        let (assignments, resolved) = self.resolve_simple(sc)?;
+        match resolved {
+            Resolved::AssignOnly => {
+                // Nothing to run: apply redirects (for their side effects,
+                // e.g. `> file` still truncates it), then set the vars.
+                self.with_redirects(sc, |_| Ok(()))?;
+                for assign in &assignments {
+                    let (name, value) = split_assignment(assign);
+                    self.env.set(name, value);
+                }
+                Ok(ExitStatus::SUCCESS)
+            }
+            Resolved::Builtin(f, name, args) => {
+                let special = is_special_builtin(&name);
+                self.run_builtin(sc, f, &name, &args, &assignments, special)
+            }
+            Resolved::Function(body, args) => self.run_function(sc, &body, &args, &assignments),
+            Resolved::External(words) => self.run_external(sc, &words, &assignments),
+        }
+    }
+
+    /// Expands `sc.words`, splits off any leading `VAR=val` assignment
+    /// prefix, resolves alias substitution, and looks up what kind of
+    /// command the (possibly alias-rewritten) name refers to.
+    ///
+    /// Shared by `run_simple` (which may run the result in-process or fork
+    /// once for an external command) and `exec::exec_simple_in_child`,
+    /// which is already inside a forked pipeline-stage child and just runs
+    /// the resolved command to completion before the child exits. Keeping
+    /// this resolution logic in one place means both paths agree on what
+    /// counts as a builtin, a function, or an external command.
+    fn resolve_simple(&mut self, sc: &SimpleCmd) -> Result<(Vec<String>, Resolved)> {
         let words = self.expand_words(&sc.words)?;
         let assign_count = words.iter().take_while(|w| is_assignment(w)).count();
         let (assignments, cmd_words) = words.split_at(assign_count);
+        let assignments = assignments.to_vec();
 
-        // Assignment-only statement: apply redirects, set vars, done.
         if cmd_words.is_empty() {
-            let saved = save_fds(&[0, 1, 2])?;
-            self.apply_redirects(&sc.redirects)?;
-            restore_fds(saved)?;
-            for assign in assignments {
-                let (name, value) = assign.split_once('=').unwrap();
-                self.env.set(name, value);
-            }
-            return Ok(ExitStatus::SUCCESS);
+            return Ok((assignments, Resolved::AssignOnly));
         }
 
         let (name, args) = resolve_alias(&self.env, &cmd_words[0], &cmd_words[1..]);
-        let special = is_special_builtin(&name);
 
         if let Some(f) = builtins::lookup_builtin(name.as_str()) {
-            return self.run_builtin(sc, f, &name, &args, assignments, special);
+            return Ok((assignments, Resolved::Builtin(f, name, args)));
         }
-
         if let Some(body) = self.env.get_function(&name).cloned() {
-            return self.run_function(sc, &body, &args, assignments);
+            return Ok((assignments, Resolved::Function(body, args)));
         }
 
         let mut full_words = vec![name];
         full_words.extend(args);
-        self.run_external(sc, &full_words, assignments)
+        Ok((assignments, Resolved::External(full_words)))
     }
 
     fn run_builtin(
@@ -183,29 +242,15 @@ impl Shell {
 
         let saved_vars: Vec<(String, Option<String>)> = if special {
             for a in assignments {
-                let (k, v) = a.split_once('=').unwrap();
+                let (k, v) = split_assignment(a);
                 self.env.set(k, v);
             }
             vec![]
         } else {
-            assignments
-                .iter()
-                .map(|a| {
-                    let (k, v) = a.split_once('=').unwrap();
-                    let old = self.env.get(k);
-                    self.env.set(k, v);
-                    (k.to_owned(), old)
-                })
-                .collect()
+            self.apply_temp_assignments(assignments)
         };
 
-        let saved_fds = save_fds(&[0, 1, 2])?;
-        let result = if let Err(e) = self.apply_redirects(&sc.redirects) {
-            Err(e)
-        } else {
-            f(self, &arg_refs)
-        };
-        let _ = restore_fds(saved_fds);
+        let result = self.with_redirects(sc, |shell| f(shell, &arg_refs));
         self.env.restore_vars(saved_vars);
         result
     }
@@ -217,34 +262,56 @@ impl Shell {
         args: &[String],
         assignments: &[String],
     ) -> Result<ExitStatus> {
-        let saved_vars: Vec<(String, Option<String>)> = assignments
+        let saved_vars = self.apply_temp_assignments(assignments);
+
+        let old_args = self.env.positional_args().to_vec();
+        self.env.set_positional_args(args.to_vec());
+        let result = self.with_redirects(sc, |shell| shell.run_command(body));
+        self.env.set_positional_args(old_args);
+        self.env.restore_vars(saved_vars);
+
+        catch_return(result)
+    }
+
+    /// Sets each `VAR=val` word in the environment, returning the previous
+    /// values so `Env::restore_vars` can undo them once the command the
+    /// assignments were scoped to has finished (POSIX: a `VAR=val cmd`
+    /// prefix only applies for the duration of `cmd`).
+    fn apply_temp_assignments(&mut self, assignments: &[String]) -> Vec<(String, Option<String>)> {
+        assignments
             .iter()
             .map(|a| {
-                let (k, v) = a.split_once('=').unwrap();
+                let (k, v) = split_assignment(a);
                 let old = self.env.get(k);
                 self.env.set(k, v);
                 (k.to_owned(), old)
             })
-            .collect();
-
-        let old_args = self.env.positional_args().to_vec();
-        self.env.set_positional_args(args.to_vec());
-        let saved_fds = save_fds(&[0, 1, 2])?;
-        let result = if let Err(e) = self.apply_redirects(&sc.redirects) {
-            Err(e)
-        } else {
-            self.run_command(body)
-        };
-        let _ = restore_fds(saved_fds);
-        self.env.set_positional_args(old_args);
-        self.env.restore_vars(saved_vars);
-
-        // Catch `return` at the function boundary.
-        match result {
-            Err(e) if is_return(&e) => Ok(ExitStatus(e.downcast::<ReturnSignal>().unwrap().0)),
-            other => other,
-        }
+            .collect()
     }
+
+    /// Saves fds 0/1/2, applies `sc.redirects`, runs `f`, then restores the
+    /// original fds regardless of outcome. If applying the redirects fails,
+    /// `f` doesn't run and that error is returned.
+    fn with_redirects<T>(
+        &mut self,
+        sc: &SimpleCmd,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let saved_fds = save_fds(&[0, 1, 2])?;
+        let result = self.apply_redirects(&sc.redirects).and_then(|()| f(self));
+        let _ = restore_fds(saved_fds);
+        result
+    }
+}
+
+/// What a `SimpleCmd` resolves to, per `Shell::resolve_simple`.
+enum Resolved {
+    /// No command words after expansion (e.g. a bare `FOO=bar`).
+    AssignOnly,
+    Builtin(BuiltinFn, String, Vec<String>),
+    Function(Command, Vec<String>),
+    /// `name` followed by its arguments.
+    External(Vec<String>),
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +345,12 @@ pub fn is_assignment(word: &str) -> bool {
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Splits a word already validated by `is_assignment` into `(name, value)`.
+fn split_assignment(word: &str) -> (&str, &str) {
+    word.split_once('=')
+        .expect("is_assignment guarantees `=` is present")
 }
 
 fn is_special_builtin(name: &str) -> bool {

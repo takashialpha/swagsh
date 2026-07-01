@@ -1,5 +1,6 @@
 use anyhow::{Error, Result};
 
+use crate::errfmt::strerror;
 use crate::eval::{LoopSignal, ReturnSignal, Shell};
 use crate::jobs::ExitStatus;
 
@@ -53,7 +54,8 @@ pub fn builtin_source(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     let path = args
         .first()
         .ok_or_else(|| anyhow::anyhow!("source: filename required"))?;
-    let src = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("source: {path}: {e}"))?;
+    let src = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("source: {path}: {}", strerror(e)))?;
     let program = crate::parser::parse(&src).map_err(|e| anyhow::anyhow!("source: {path}: {e}"))?;
     shell.run_program(&program)
 }
