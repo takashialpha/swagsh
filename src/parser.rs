@@ -352,7 +352,7 @@ impl Parser {
             return Ok(Word::Literal(raw.to_owned()));
         }
 
-        let parts = decompose_word(raw, self)?;
+        let parts = decompose_word(raw, self, false)?;
         if parts.len() == 1 {
             Ok(parts.into_iter().next().unwrap())
         } else {
@@ -471,7 +471,15 @@ fn parse_dollar(
     }
 }
 
-fn decompose_word(raw: &str, parser: &Parser) -> ParseResult<Vec<Word>> {
+/// Splits a lexed word buffer into `Word` parts, resolving `$`/backtick
+/// expansions and backslash escapes as it goes. `in_dquotes` selects which
+/// escape rule the trailing `'\\'` arm applies: outside quotes, `\X` always
+/// collapses to the literal `X` (any character); inside double quotes,
+/// POSIX narrows that to `\$ \` \" \\` and a trailing `\<newline>` (dropped
+/// entirely) — a backslash before anything else stays a literal backslash
+/// followed by that character, e.g. `"\t"` is the two characters `\` and
+/// `t`, not a tab.
+fn decompose_word(raw: &str, parser: &Parser, in_dquotes: bool) -> ParseResult<Vec<Word>> {
     let mut parts: Vec<Word> = Vec::new();
     let mut chars = raw.char_indices().peekable();
     let mut lit = String::new();
@@ -509,21 +517,36 @@ fn decompose_word(raw: &str, parser: &Parser) -> ParseResult<Vec<Word>> {
             '"' => {
                 flush_lit!();
                 let mut inner = String::new();
-                for (_, c) in chars.by_ref() {
-                    if c == '"' {
-                        break;
+                while let Some((_, c)) = chars.next() {
+                    match c {
+                        '"' => break,
+                        // An escaped quote can't be the closing delimiter;
+                        // consume the pair atomically so the `"` isn't
+                        // seen as anything but data here (`decompose_word`
+                        // resolves the escape itself on the second pass).
+                        '\\' => {
+                            inner.push('\\');
+                            if let Some((_, next)) = chars.next() {
+                                inner.push(next);
+                            }
+                        }
+                        // A nested `$(...)` can itself contain quotes (e.g.
+                        // `"result: $(echo "nested")"`); skip the whole
+                        // balanced span as one unit so an inner `"` isn't
+                        // mistaken for this string's closing quote. The
+                        // recursive `decompose_word` call below re-parses
+                        // it properly once `inner` is correctly bounded.
+                        '$' if chars.peek().map(|&(_, c)| c) == Some('(') => {
+                            inner.push_str(&collect_balanced(&mut chars, '(', ')')?);
+                        }
+                        _ => inner.push(c),
                     }
-                    inner.push(c);
                 }
-                let inner_word = if inner.chars().any(|c| c == '$' || c == '`') {
-                    let sub_parts = decompose_word(&inner, parser)?;
-                    if sub_parts.len() == 1 {
-                        sub_parts.into_iter().next().unwrap()
-                    } else {
-                        Word::Compound(sub_parts)
-                    }
+                let sub_parts = decompose_word(&inner, parser, true)?;
+                let inner_word = if sub_parts.len() == 1 {
+                    sub_parts.into_iter().next().unwrap()
                 } else {
-                    Word::Literal(inner)
+                    Word::Compound(sub_parts)
                 };
                 parts.push(Word::Quoted(Box::new(inner_word)));
             }
@@ -531,16 +554,30 @@ fn decompose_word(raw: &str, parser: &Parser) -> ParseResult<Vec<Word>> {
             '`' => {
                 flush_lit!();
                 let mut inner = String::new();
-                for (_, c) in chars.by_ref() {
-                    if c == '`' {
-                        break;
+                while let Some((_, c)) = chars.next() {
+                    match c {
+                        '`' => break,
+                        '\\' => {
+                            inner.push('\\');
+                            if let Some((_, next)) = chars.next() {
+                                inner.push(next);
+                            }
+                        }
+                        _ => inner.push(c),
                     }
-                    inner.push(c);
                 }
                 let sub_parser = Parser::new(&inner)?;
                 let program = sub_parser.parse()?;
                 parts.push(Word::CmdSub(Box::new(program.into_command())));
             }
+
+            '\\' if in_dquotes => match chars.peek().map(|&(_, c)| c) {
+                Some('$' | '`' | '"' | '\\') => lit.push(chars.next().unwrap().1),
+                Some('\n') => {
+                    chars.next();
+                }
+                _ => lit.push('\\'),
+            },
 
             '\\' => {
                 if let Some((_, next)) = chars.next() {

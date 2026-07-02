@@ -1,39 +1,96 @@
 use anyhow::{Result, bail};
+use clap::Parser;
 
 use crate::eval::Shell;
+use crate::expand::shell_quote;
 use crate::jobs::ExitStatus;
 
-#[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
-pub fn builtin_export(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
-    if args.is_empty() {
-        for (k, v) in shell.env.exported() {
-            println!("export {k}={v}");
-        }
-        return Ok(ExitStatus::SUCCESS);
-    }
-    for arg in args {
-        if let Some((k, v)) = arg.split_once('=') {
-            shell.env.export(k, v.to_owned());
-        } else {
-            shell.env.mark_exported(arg);
-        }
-    }
-    Ok(ExitStatus::SUCCESS)
+use super::Builtin;
+
+#[derive(Parser)]
+#[command(
+    name = "export",
+    about = "Mark variables for export to child processes"
+)]
+pub struct ExportArgs {
+    /// Remove the export attribute instead of setting it
+    #[arg(short = 'n')]
+    remove: bool,
+    names: Vec<String>,
 }
 
-#[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
-pub fn builtin_unset(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
-    for arg in args {
-        shell.env.unset(arg);
+impl Builtin for ExportArgs {
+    fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
+        if self.names.is_empty() {
+            let pairs: Vec<(String, String)> = shell
+                .env
+                .exported()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect();
+            let printed_any = !pairs.is_empty();
+            for (k, v) in pairs {
+                println!("export {k}={}", shell_quote(&v));
+            }
+            if printed_any {
+                shell.note_stdout("\n");
+            }
+            return Ok(ExitStatus::SUCCESS);
+        }
+        for name in &self.names {
+            if self.remove {
+                shell.env.unexport(name);
+            } else if let Some((k, v)) = name.split_once('=') {
+                shell.env.export(k, v.to_owned());
+            } else {
+                shell.env.mark_exported(name);
+            }
+        }
+        Ok(ExitStatus::SUCCESS)
     }
-    Ok(ExitStatus::SUCCESS)
+}
+
+#[derive(Parser)]
+#[command(name = "unset", about = "Unset variables and/or functions")]
+pub struct UnsetArgs {
+    /// Treat each NAME as a variable only
+    #[arg(short = 'v', overrides_with = "function")]
+    variable: bool,
+    /// Treat each NAME as a function only
+    #[arg(short = 'f', overrides_with = "variable")]
+    function: bool,
+    names: Vec<String>,
+}
+
+impl Builtin for UnsetArgs {
+    fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
+        let function = self.function && !self.variable;
+        for name in &self.names {
+            if function {
+                shell.env.unset_function(name);
+            } else if self.variable {
+                shell.env.unset_var(name);
+            } else {
+                shell.env.unset(name);
+            }
+        }
+        Ok(ExitStatus::SUCCESS)
+    }
 }
 
 #[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
 pub fn builtin_set(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     if args.is_empty() {
-        for (k, v) in shell.env.all_vars() {
-            println!("{k}={v}");
+        let pairs: Vec<(String, String)> = shell
+            .env
+            .all_vars()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        let printed_any = !pairs.is_empty();
+        for (k, v) in pairs {
+            println!("{k}={}", shell_quote(&v));
+        }
+        if printed_any {
+            shell.note_stdout("\n");
         }
         return Ok(ExitStatus::SUCCESS);
     }

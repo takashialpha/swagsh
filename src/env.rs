@@ -89,13 +89,40 @@ impl Env {
         self.exported.insert(name.to_owned());
     }
 
-    pub fn unset(&mut self, name: &str) {
-        self.vars.remove(name);
+    /// `export -n name`: keeps the shell variable but drops its export
+    /// attribute, so children no longer inherit it.
+    pub fn unexport(&mut self, name: &str) {
         self.exported.remove(name);
-        self.functions.remove(name);
         // SAFETY: single-threaded shell: no concurrent env mutation.
         unsafe {
             std::env::remove_var(name);
+        }
+    }
+
+    /// Removes a variable (and its export/environment-variable state) only,
+    /// leaving a same-named function untouched.
+    pub fn unset_var(&mut self, name: &str) {
+        self.vars.remove(name);
+        self.exported.remove(name);
+        // SAFETY: single-threaded shell: no concurrent env mutation.
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
+
+    /// Removes a function only, leaving a same-named variable untouched.
+    pub fn unset_function(&mut self, name: &str) {
+        self.functions.remove(name);
+    }
+
+    /// `unset name` with neither `-v` nor `-f`: POSIX has this act on a
+    /// variable if one exists, falling back to a same-named function only
+    /// when it doesn't (rather than removing both indiscriminately).
+    pub fn unset(&mut self, name: &str) {
+        if self.vars.contains_key(name) {
+            self.unset_var(name);
+        } else {
+            self.unset_function(name);
         }
     }
 
@@ -134,8 +161,10 @@ impl Env {
     pub fn get_alias(&self, name: &str) -> Option<String> {
         self.aliases.get(name).cloned()
     }
-    pub fn remove_alias(&mut self, name: &str) {
-        self.aliases.remove(name);
+    /// Removes an alias, reporting whether one by that name actually
+    /// existed (`unalias` treats a nonexistent name as an error).
+    pub fn remove_alias(&mut self, name: &str) -> bool {
+        self.aliases.remove(name).is_some()
     }
     pub fn clear_aliases(&mut self) {
         self.aliases.clear();

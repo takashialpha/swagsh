@@ -67,7 +67,13 @@ impl Shell {
         let label = describe_pipeline(pipeline);
         let (pgid, pids) = self.spawn_pipeline(pipeline)?;
         let job_id = self.jobs.add(pgid, pids, label);
-        eprintln!("[{job_id}] {pgid}");
+        // bash only announces a backgrounded job's `[N] PID` under job
+        // control (monitor mode), which is on by default for interactive
+        // shells and off for `-c`/script runs; match that instead of
+        // always printing it.
+        if self.interactive {
+            eprintln!("[{job_id}] {pgid}");
+        }
         Ok(ExitStatus::SUCCESS)
     }
 

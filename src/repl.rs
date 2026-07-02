@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use anyhow::Result;
 use rustyline::error::ReadlineError;
 use rustyline::{Config, DefaultEditor};
@@ -64,6 +66,28 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
                     }
                 }
                 shell.jobs.reap_nonblocking();
+                // `print!`/`echo -n`/`printf` never end in `\n`, so Rust's
+                // line-buffered stdout can leave their output sitting
+                // unflushed until something *else* happens to write a
+                // newline later. Left alone, that stale output surfaces at
+                // the wrong time (interleaved with a later prompt or
+                // command's output, or worse: appearing in the middle of
+                // the next line rustyline reads). Force it out before
+                // drawing the next prompt.
+                //
+                // That alone isn't enough, though: rustyline's next
+                // `readline()` call clears the current terminal line
+                // before drawing its prompt, on the assumption that line
+                // is either empty or holds its own previous prompt. If a
+                // builtin left the cursor mid-line (tracked via
+                // `Shell::at_line_start`), that clear would erase the
+                // output we just flushed before it's ever seen, so bridge
+                // onto a fresh line ourselves first.
+                if !shell.at_line_start {
+                    println!();
+                    shell.at_line_start = true;
+                }
+                let _ = std::io::stdout().flush();
             }
             Err(ReadlineError::Interrupted) => {}
             Err(ReadlineError::Eof) => break,

@@ -122,6 +122,8 @@ cargo build --release   # binary at target/release/swagsh
 - Reserved words (`done`, `fi`, `then`, etc.) cannot be passed as plain arguments.
 - No `local` builtin; functions share the caller's variable scope.
 - No `trap` builtin.
+- No `command`, `eval`, `getopts`, or `wait` builtins.
+- No `<<<` here-string redirection.
 
 ---
 

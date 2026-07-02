@@ -67,6 +67,27 @@ pub unsafe fn restore_child_signals() {
     let _ = unsafe { kernel_sigaction(Signal::TTIN, Some(dfl.clone())) };
     let _ = unsafe { kernel_sigaction(Signal::TSTP, Some(dfl.clone())) };
     let _ = unsafe { kernel_sigaction(Signal::INT, Some(dfl.clone())) };
-    let _ = unsafe { kernel_sigaction(Signal::QUIT, Some(dfl)) };
+    let _ = unsafe { kernel_sigaction(Signal::QUIT, Some(dfl.clone())) };
+    let _ = unsafe { kernel_sigaction(Signal::PIPE, Some(dfl)) };
     let _ = unsafe { kernel_sigprocmask(How::SETMASK, Some(&KernelSigSet::empty())) };
+}
+
+/// Resets `SIGPIPE` to its default (terminate) disposition for the shell's
+/// own top-level process. Rust's runtime ignores `SIGPIPE` at startup so
+/// library code sees a normal `EPIPE` I/O error instead of dying silently,
+/// which is convenient for typical CLI tools but wrong for a shell: every
+/// other program on the system (and every other shell) lets a broken pipe
+/// kill the writer outright, e.g. `while true; do echo hi; done | head -1`.
+/// Left ignored, that same broken pipe instead reaches `println!`, which
+/// treats any write error (including `EPIPE`) as fatal and panics. Forked
+/// children pick up the same disposition via `restore_child_signals`; this
+/// covers the cases that never fork (a single top-level builtin whose own
+/// stdout is a pipe). Must run before the first write that could hit a
+/// closed pipe, i.e. as early as possible in `main`.
+pub fn reset_sigpipe() {
+    // SAFETY: installs the default disposition (not a custom handler),
+    // before any other threads exist.
+    unsafe {
+        let _ = kernel_sigaction(Signal::PIPE, Some(sig_dfl_action()));
+    }
 }

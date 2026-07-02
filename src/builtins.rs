@@ -1,4 +1,5 @@
 mod alias;
+mod cli;
 mod dirs;
 mod env;
 mod flow;
@@ -13,36 +14,49 @@ use crate::jobs::ExitStatus;
 
 pub type BuiltinFn = fn(&mut Shell, &[&str]) -> anyhow::Result<ExitStatus>;
 
+/// The alternative to [`BuiltinFn`] for a builtin whose flags are worth
+/// real parsing: a `clap`-derived struct that carries its own name, flags,
+/// and help text (via `#[command(name = "...")]`/`#[arg(...)]`) and knows
+/// how to run itself. `cli::dispatch::<T>` adapts any `T: Builtin` back
+/// into a plain `BuiltinFn`, so the struct is the entire builtin: no
+/// separate wrapper function to keep in sync with it.
+pub trait Builtin: clap::Parser {
+    fn run(self, shell: &mut Shell) -> anyhow::Result<ExitStatus>;
+}
+
 // Sorted table: binary search in lookup_builtin requires strict lexicographic order.
+// Entries are either a hand-written `BuiltinFn` (builtins like `echo`/`test`
+// whose argument grammar isn't clap-shaped) or `cli::dispatch::<XArgs>` for
+// a `Builtin` flag struct.
 pub static BUILTINS: &[(&str, BuiltinFn)] = &[
-    (".", flow::builtin_source),
+    (".", cli::dispatch::<flow::SourceArgs>),
     (":", flow::builtin_colon),
     ("[", test::builtin_bracket),
-    ("alias", alias::builtin_alias),
+    ("alias", cli::dispatch::<alias::AliasArgs>),
     ("bg", jobs::builtin_bg),
     ("break", flow::builtin_break),
-    ("cd", dirs::builtin_cd),
+    ("cd", cli::dispatch::<dirs::CdArgs>),
     ("continue", flow::builtin_continue),
     ("echo", output::builtin_echo),
     ("exec", flow::builtin_exec),
     ("exit", flow::builtin_exit),
-    ("export", env::builtin_export),
+    ("export", cli::dispatch::<env::ExportArgs>),
     ("false", flow::builtin_false),
     ("fg", jobs::builtin_fg),
-    ("jobs", jobs::builtin_jobs),
+    ("jobs", cli::dispatch::<jobs::JobsArgs>),
     ("kill", jobs::builtin_kill),
     ("printf", output::builtin_printf),
-    ("pwd", dirs::builtin_pwd),
-    ("read", io::builtin_read),
+    ("pwd", cli::dispatch::<dirs::PwdArgs>),
+    ("read", cli::dispatch::<io::ReadArgs>),
     ("return", flow::builtin_return),
     ("set", env::builtin_set),
     ("shift", env::builtin_shift),
-    ("source", flow::builtin_source),
+    ("source", cli::dispatch::<flow::SourceArgs>),
     ("test", test::builtin_test),
     ("true", flow::builtin_true),
-    ("type", introspect::builtin_type),
-    ("unalias", alias::builtin_unalias),
-    ("unset", env::builtin_unset),
+    ("type", cli::dispatch::<introspect::TypeArgs>),
+    ("unalias", cli::dispatch::<alias::UnaliasArgs>),
+    ("unset", cli::dispatch::<env::UnsetArgs>),
 ];
 
 #[inline]

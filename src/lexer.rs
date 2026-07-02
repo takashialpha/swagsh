@@ -281,6 +281,23 @@ impl<'src> Lexer<'src> {
                         buf.push('\\');
                     }
                 },
+                // A `$(...)`/`${...}` here can itself contain quotes (e.g.
+                // `"result: $(echo "nested")"`), so it has to be lexed with
+                // the same nested-quote/paren-depth tracking used at the
+                // top level, not treated as literal text: otherwise the
+                // inner `"` reads as this string's own closing quote and
+                // cuts everything short.
+                Some(b'$') => match self.peek() {
+                    Some(b'(') => {
+                        self.advance();
+                        self.lex_cmd_sub(buf)?;
+                    }
+                    Some(b'{') => {
+                        self.advance();
+                        self.lex_param_expand(buf)?;
+                    }
+                    _ => buf.push('$'),
+                },
                 Some(b) if b < UTF8_CONT_START => buf.push(b as char),
                 Some(_) => self.push_utf8(buf, self.pos - 1),
             }

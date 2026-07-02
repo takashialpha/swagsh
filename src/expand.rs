@@ -1,6 +1,42 @@
 use crate::env::Env;
 
 // ---------------------------------------------------------------------------
+// Shell-quoting (for builtins that print back values a user might re-source,
+// e.g. `export`/`alias`/`set` with no arguments)
+// ---------------------------------------------------------------------------
+
+/// Quotes `s` so it round-trips as a single shell word if pasted back in:
+/// unquoted when every byte is already safe bare, single-quoted (with
+/// embedded `'` escaped via the standard `'\''` close-escape-reopen
+/// sequence) otherwise. Always single-quoting unconditionally would also be
+/// correct but produces noisy output for the common case of a plain value.
+pub fn shell_quote(s: &str) -> String {
+    let is_bare_safe = |b: u8| {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'=' | b'@')
+    };
+    if !s.is_empty() && s.bytes().all(is_bare_safe) {
+        return s.to_owned();
+    }
+    shell_quote_always(s)
+}
+
+/// Like [`shell_quote`], but always wraps in single quotes even when `s` is
+/// bare-safe, matching `alias`'s own always-quoted display convention.
+pub fn shell_quote_always(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tilde expansion
 // ---------------------------------------------------------------------------
 
@@ -66,27 +102,110 @@ fn glob_inner(p: &[char], t: &[char]) -> bool {
 // Escape sequences (for echo -e and printf)
 // ---------------------------------------------------------------------------
 
-pub fn unescape(s: &str) -> String {
+/// Consumes up to `max` leading ASCII hex digits from `chars`, stopping
+/// early at the first non-hex character (bash's `\x`/`\u`/`\U` are all
+/// non-greedy this way, e.g. `\u41 ` is just `A` followed by a space).
+fn take_hex(chars: &mut std::iter::Peekable<std::str::Chars>, max: usize) -> String {
+    let mut hex = String::new();
+    while hex.len() < max && chars.peek().is_some_and(char::is_ascii_hexdigit) {
+        hex.push(chars.next().unwrap());
+    }
+    hex
+}
+
+/// Expands bash's `echo -e`/`printf` backslash escapes. Returns the
+/// expanded text and whether a `\c` was seen: that escape means "stop all
+/// further output here", including any trailing newline `echo` would
+/// otherwise add, so callers can't just treat it as a character to insert.
+pub fn unescape(s: &str) -> (String, bool) {
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '\\' {
             out.push(c);
             continue;
         }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('0') => out.push('\0'),
-            Some('\\') | None => out.push('\\'),
+        match chars.peek().copied() {
+            Some('n') => {
+                chars.next();
+                out.push('\n');
+            }
+            Some('t') => {
+                chars.next();
+                out.push('\t');
+            }
+            Some('r') => {
+                chars.next();
+                out.push('\r');
+            }
+            Some('a') => {
+                chars.next();
+                out.push('\x07');
+            }
+            Some('b') => {
+                chars.next();
+                out.push('\x08');
+            }
+            Some('e') => {
+                chars.next();
+                out.push('\x1b');
+            }
+            Some('f') => {
+                chars.next();
+                out.push('\x0c');
+            }
+            Some('v') => {
+                chars.next();
+                out.push('\x0b');
+            }
+            Some('\\') => {
+                chars.next();
+                out.push('\\');
+            }
+            Some('c') => {
+                chars.next();
+                return (out, true);
+            }
+            Some('0') => {
+                chars.next();
+                let mut value: u32 = 0;
+                let mut digits = 0;
+                while digits < 3
+                    && let Some(d) = chars.peek().and_then(|c| c.to_digit(8))
+                {
+                    value = value * 8 + d;
+                    chars.next();
+                    digits += 1;
+                }
+                out.push(char::from_u32(value).unwrap_or('\0'));
+            }
+            Some(marker @ ('x' | 'u' | 'U')) => {
+                chars.next();
+                let max_digits = if marker == 'x' {
+                    2
+                } else if marker == 'u' {
+                    4
+                } else {
+                    8
+                };
+                let hex = take_hex(&mut chars, max_digits);
+                if hex.is_empty() {
+                    out.push('\\');
+                    out.push(marker);
+                } else {
+                    let value = u32::from_str_radix(&hex, 16).unwrap_or(0);
+                    out.push(char::from_u32(value).unwrap_or('\u{FFFD}'));
+                }
+            }
             Some(other) => {
+                chars.next();
                 out.push('\\');
                 out.push(other);
             }
+            None => out.push('\\'),
         }
     }
-    out
+    (out, false)
 }
 
 // ---------------------------------------------------------------------------

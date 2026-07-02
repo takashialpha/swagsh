@@ -8,6 +8,7 @@ use rustix::termios::{OptionalActions, Termios, tcgetattr, tcsetattr, tcsetpgrp}
 use crate::ast::{Command, Program, SimpleCmd};
 use crate::builtins::{self, BuiltinFn};
 use crate::env::Env;
+use crate::errfmt::emit;
 use crate::fd::{restore_fds, save_fds};
 use crate::jobs::{ExitStatus, JobTable};
 use crate::signal::{sig_ign_action, sig_interrupt_action, take_interrupted};
@@ -103,6 +104,15 @@ pub struct Shell {
     pub last_status: ExitStatus,
     pub interactive: bool,
     sane_termios: Option<Termios>,
+    /// Whether the cursor is at the start of a fresh terminal line, i.e.
+    /// the last thing a builtin wrote to stdout ended in `\n`. Builtins
+    /// that can print without a trailing newline (`echo -n`, `printf`, ...)
+    /// must update this via [`Shell::note_stdout`] after writing: rustyline
+    /// clears the current line before redrawing its next prompt, which
+    /// would otherwise silently erase that output before it's ever seen,
+    /// since nothing separates it onto its own line first. The REPL loop
+    /// bridges with a real newline when this is `false`.
+    pub at_line_start: bool,
 }
 
 impl Shell {
@@ -129,6 +139,17 @@ impl Shell {
             last_status: ExitStatus::SUCCESS,
             interactive,
             sane_termios,
+            at_line_start: true,
+        }
+    }
+
+    /// Records whether the text a builtin just wrote to stdout ended in a
+    /// newline. Pass the exact string that was printed (or `"\n"` for a
+    /// `println!` whose payload doesn't matter) so the check is exact
+    /// rather than assumed.
+    pub fn note_stdout(&mut self, printed: &str) {
+        if !printed.is_empty() {
+            self.at_line_start = printed.ends_with('\n');
         }
     }
 
@@ -266,7 +287,30 @@ impl Shell {
             self.apply_temp_assignments(assignments)
         };
 
-        let result = self.with_redirects(sc, |shell| f(shell, &arg_refs));
+        // A builtin's own error (bad flag, ENOENT, ...) is a normal command
+        // failure: it should set `$?` and let the script go on to the next
+        // statement, the same as an external command exiting non-zero would.
+        // `break`/`continue`/`return`/`^C` are the exception: those builtins
+        // deliberately raise this same `Result<ExitStatus>` channel to signal
+        // control flow, and must keep unwinding rather than being absorbed
+        // here. Without this, any failing builtin (e.g. `cd` into a missing
+        // directory) would `?` all the way out and abort everything after it
+        // in the current script/line, not just that one command.
+        //
+        // This has to happen *inside* the `with_redirects` closure, while
+        // any `2>...` on this command is still in effect: `with_redirects`
+        // restores the original fds as soon as the closure returns, so
+        // catching the error out here would `emit` it to the shell's real
+        // stderr regardless of what the command's own redirects said.
+        let result = self.with_redirects(sc, |shell| match f(shell, &arg_refs) {
+            Err(e)
+                if !is_break(&e) && !is_continue(&e) && !is_return(&e) && !is_interrupted(&e) =>
+            {
+                emit(e);
+                Ok(ExitStatus::FAILURE)
+            }
+            other => other,
+        });
         self.env.restore_vars(saved_vars);
         result
     }

@@ -22,6 +22,7 @@ use errfmt::{emit, strerror};
 use eval::Shell;
 
 fn main() -> Result<()> {
+    signal::reset_sigpipe();
     let argv0 = std::env::args().next().unwrap_or_default();
     let cli = Cli::parse();
 
