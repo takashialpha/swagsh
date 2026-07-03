@@ -1,7 +1,17 @@
+//! `type` and `command` share this file rather than each getting their own:
+//! `command`'s default mode *runs* something (bypassing function lookup),
+//! which on its face is a different concern from `type`'s pure
+//! introspection; but `command -v`/`-V` really are introspection, and
+//! both builtins need the exact same "is NAME a builtin, a function, or a
+//! file on PATH" classification (`classify`/`Kind`/`find_in_path` below) to
+//! answer it. Keeping them together avoids either duplicating that logic
+//! or extracting it into a third file for two callers.
+
 use anyhow::Result;
 use clap::Parser;
 
 use crate::env::Env;
+use crate::errfmt::emit;
 use crate::eval::Shell;
 use crate::jobs::ExitStatus;
 
@@ -29,7 +39,7 @@ fn classify(name: &str, env: &Env) -> Vec<Kind> {
 
 #[derive(Parser)]
 #[command(name = "type", about = "Describe how each NAME would be resolved")]
-pub struct TypeArgs {
+pub struct TypeBuiltin {
     /// Print only the type: "builtin", "function", "file" or nothing
     #[arg(short = 't')]
     type_only: bool,
@@ -42,7 +52,7 @@ pub struct TypeArgs {
     names: Vec<String>,
 }
 
-impl Builtin for TypeArgs {
+impl Builtin for TypeBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
         let mut status = ExitStatus::SUCCESS;
         let mut printed_any = false;
@@ -50,7 +60,7 @@ impl Builtin for TypeArgs {
             let mut kinds = classify(name, &shell.env);
             if kinds.is_empty() {
                 if !self.path_only && !self.type_only {
-                    eprintln!("swagsh: type: {name}: not found");
+                    emit(format!("type: {name}: not found"));
                 }
                 status = ExitStatus::FAILURE;
                 continue;
@@ -99,6 +109,99 @@ impl Builtin for TypeArgs {
         }
         Ok(status)
     }
+}
+
+/// A guaranteed-to-find-the-standard-utilities `PATH`, used by `command -p`
+/// instead of the shell's own possibly-tampered-with `$PATH`.
+const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+#[derive(Parser)]
+#[command(
+    name = "command",
+    about = "Run COMMAND, bypassing shell function lookup",
+    trailing_var_arg = true
+)]
+pub struct CommandBuiltin {
+    /// Search a default PATH guaranteed to find the standard utilities
+    #[arg(short = 'p')]
+    default_path: bool,
+    /// Print the word that would invoke COMMAND, instead of running it
+    #[arg(short = 'v')]
+    print_word: bool,
+    /// Print a fuller description of what would invoke COMMAND
+    #[arg(short = 'V')]
+    print_verbose: bool,
+    /// COMMAND followed by its own argv, kept as one trailing field (like
+    /// `exec`'s `command_and_args`) so a flag-shaped argument to COMMAND
+    /// itself (`command grep -v x`) isn't misparsed as belonging to
+    /// `command`.
+    #[arg(allow_hyphen_values = true, value_name = "COMMAND")]
+    command_and_args: Vec<String>,
+}
+
+impl Builtin for CommandBuiltin {
+    fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
+        let Some((name, rest)) = self.command_and_args.split_first() else {
+            return Ok(ExitStatus::SUCCESS);
+        };
+
+        if self.print_word || self.print_verbose {
+            return describe_command(shell, name, self.print_verbose);
+        }
+
+        // Bypassing function lookup is the entire point of `command`: a
+        // builtin still runs (`command cd` is still the `cd` builtin), but
+        // a same-named function is skipped in favor of PATH/builtin
+        // resolution, unlike plain `cd`.
+        if let Some(f) = crate::builtins::lookup_builtin(name) {
+            let arg_refs: Vec<&str> = rest.iter().map(String::as_str).collect();
+            return f(shell, &arg_refs);
+        }
+
+        let old_path = self.default_path.then(|| {
+            let old = shell.env.get("PATH");
+            shell.env.set("PATH", DEFAULT_PATH);
+            old
+        });
+        let empty_sc = crate::ast::SimpleCmd {
+            words: Vec::new(),
+            redirects: Vec::new(),
+        };
+        let result = shell.run_external(&empty_sc, &self.command_and_args, &[]);
+        if let Some(old) = old_path {
+            match old {
+                Some(p) => shell.env.set("PATH", p),
+                None => shell.env.unset_var("PATH"),
+            }
+        }
+        result
+    }
+}
+
+/// `command -v`/`-V`: unlike `type`, only the first match is ever reported
+/// (no `-a`), and `-v`'s output is a bare word rather than `type`'s "NAME
+/// is ..." sentence.
+fn describe_command(shell: &mut Shell, name: &str, verbose: bool) -> Result<ExitStatus> {
+    let Some(kind) = classify(name, &shell.env).into_iter().next() else {
+        if verbose {
+            emit(format!("command: {name}: not found"));
+        }
+        return Ok(ExitStatus::FAILURE);
+    };
+    if verbose {
+        match kind {
+            Kind::Builtin => println!("{name} is a shell builtin"),
+            Kind::Function => println!("{name} is a function"),
+            Kind::File(path) => println!("{name} is {path}"),
+        }
+    } else {
+        match kind {
+            Kind::Builtin | Kind::Function => println!("{name}"),
+            Kind::File(path) => println!("{path}"),
+        }
+    }
+    shell.note_stdout("\n");
+    Ok(ExitStatus::SUCCESS)
 }
 
 fn find_in_path(name: &str, env: &Env) -> Option<String> {

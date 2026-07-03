@@ -81,21 +81,50 @@ pub fn glob_expand(pattern: &str) -> Vec<String> {
     results
 }
 
+/// Iterative, not the textbook recursive-backtracking `*`/`?` matcher: the
+/// recursive version (`glob_inner(&p[1..], t) || glob_inner(p, &t[1..])`
+/// on a `*`) is exponential on adversarial input, e.g. pattern `*a*a*a*...`
+/// against a text that almost-but-doesn't match re-explores the same
+/// suffix under every placement of every `*` (found by fuzzing
+/// `param_expand`: a 25-star pattern against a 30-character text took ~6
+/// CPU-seconds). This shape of pattern is entirely ordinary `case`/
+/// `${var#pattern}` input, not something anyone has to construct
+/// adversarially, so it's a real hang, not just a theoretical one.
+///
+/// This is the standard single-pass wildcard-matching algorithm instead:
+/// walk `text` once, and on a mismatch, backtrack only to the *last* `*`
+/// (advancing how much of `text` it's asked to consume by one) rather than
+/// re-deriving the whole match from scratch. Bounded by `pattern.len() *
+/// text.len()` work in the worst case: polynomial, not exponential.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
-    glob_inner(
-        &pattern.chars().collect::<Vec<_>>(),
-        &text.chars().collect::<Vec<_>>(),
-    )
-}
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
 
-fn glob_inner(p: &[char], t: &[char]) -> bool {
-    match p.first() {
-        None => t.is_empty(),
-        Some('*') => glob_inner(&p[1..], t) || (!t.is_empty() && glob_inner(p, &t[1..])),
-        Some(pc) => {
-            matches!(t.first(), Some(tc) if *pc == '?' || pc == tc) && glob_inner(&p[1..], &t[1..])
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut star_match = 0usize;
+
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            star_match = ti;
+            pi += 1;
+        } else if let Some(si) = star {
+            pi = si + 1;
+            star_match += 1;
+            ti = star_match;
+        } else {
+            return false;
         }
     }
+
+    while p.get(pi) == Some(&'*') {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 // ---------------------------------------------------------------------------
@@ -103,8 +132,8 @@ fn glob_inner(p: &[char], t: &[char]) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Consumes up to `max` leading ASCII hex digits from `chars`, stopping
-/// early at the first non-hex character (bash's `\x`/`\u`/`\U` are all
-/// non-greedy this way, e.g. `\u41 ` is just `A` followed by a space).
+/// early at the first non-hex character (`\x`/`\u`/`\U` are all non-greedy
+/// this way, e.g. `\u41 ` is just `A` followed by a space).
 fn take_hex(chars: &mut std::iter::Peekable<std::str::Chars>, max: usize) -> String {
     let mut hex = String::new();
     while hex.len() < max && chars.peek().is_some_and(char::is_ascii_hexdigit) {
@@ -113,7 +142,7 @@ fn take_hex(chars: &mut std::iter::Peekable<std::str::Chars>, max: usize) -> Str
     hex
 }
 
-/// Expands bash's `echo -e`/`printf` backslash escapes. Returns the
+/// Expands `echo -e`/`printf`'s backslash escapes. Returns the
 /// expanded text and whether a `\c` was seen: that escape means "stop all
 /// further output here", including any trailing newline `echo` would
 /// otherwise add, so callers can't just treat it as a character to insert.
@@ -399,11 +428,18 @@ fn arith_tokenize(s: &str) -> Vec<Tok> {
             '0'..='9' => {
                 let mut n = c as i64 - '0' as i64;
                 while matches!(chars.peek(), Some('0'..='9')) {
-                    n = n * 10 + chars.next().unwrap() as i64 - '0' as i64;
+                    let d = chars.next().unwrap() as i64 - '0' as i64;
+                    // `wrapping_*`, not a plain `*`/`+`: matches the same
+                    // overflow convention `arith_add`/`arith_mul` already
+                    // use below, and a literal with enough digits to
+                    // overflow `i64` (found by fuzzing `eval_arith`) would
+                    // otherwise panic here in any build with overflow
+                    // checks on, before evaluation even starts.
+                    n = n.wrapping_mul(10).wrapping_add(d);
                 }
                 toks.push(Tok::Num(n));
             }
-            // Identifiers/unexpanded vars → 0
+            // Identifiers/unexpanded vars: 0
             'a'..='z' | 'A'..='Z' | '_' => {
                 while matches!(chars.peek(), Some(ch) if ch.is_ascii_alphanumeric() || *ch == '_') {
                     chars.next();

@@ -1,52 +1,11 @@
 use anyhow::{Result, bail};
+use clap::Parser;
 
 use crate::eval::Shell;
 use crate::expand::unescape;
 use crate::jobs::ExitStatus;
 
-/// bash's `echo` treats a word as an option cluster only if it starts with
-/// `-` and every character after that is `n`/`e`/`E` (so `-ne`, `-en`, and
-/// repeats like `-nnee` all count, but `-x` or `-en3` don't): the first
-/// word that doesn't qualify, option-looking or not, ends option scanning
-/// and starts the output instead.
-fn is_echo_option(arg: &str) -> bool {
-    arg.len() > 1 && arg.starts_with('-') && arg[1..].chars().all(|c| matches!(c, 'n' | 'e' | 'E'))
-}
-
-#[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
-pub fn builtin_echo(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
-    let mut interpret_escapes = false;
-    let mut no_newline = false;
-    let mut start = 0;
-    for arg in args {
-        if !is_echo_option(arg) {
-            break;
-        }
-        for c in arg[1..].chars() {
-            match c {
-                'n' => no_newline = true,
-                'e' => interpret_escapes = true,
-                'E' => interpret_escapes = false,
-                _ => unreachable!("is_echo_option only admits n/e/E"),
-            }
-        }
-        start += 1;
-    }
-    let output = args[start..].join(" ");
-    let (output, stopped_early) = if interpret_escapes {
-        unescape(&output)
-    } else {
-        (output, false)
-    };
-    if no_newline || stopped_early {
-        print!("{output}");
-        shell.note_stdout(&output);
-    } else {
-        println!("{output}");
-        shell.note_stdout("\n");
-    }
-    Ok(ExitStatus::SUCCESS)
-}
+use super::Builtin;
 
 /// A parsed `%[flags][width][.precision]conv` conversion.
 struct Spec {
@@ -131,8 +90,8 @@ fn signed(n: i64, plus_sign: bool) -> String {
 }
 
 /// Renders one conversion, consuming its argument (if any) from `args`.
-/// Missing arguments default the same way bash's `printf` does: `""` for
-/// `%s`/`%c`, `0` for every numeric conversion.
+/// Missing arguments default conventionally: `""` for `%s`/`%c`, `0` for
+/// every numeric conversion.
 fn format_conv(spec: &Spec, args: &mut std::iter::Peekable<std::slice::Iter<&str>>) -> String {
     match spec.conv {
         '%' => "%".to_owned(),
@@ -228,7 +187,7 @@ fn format_conv(spec: &Spec, args: &mut std::iter::Peekable<std::slice::Iter<&str
 
 /// Whether `fmt` contains any argument-consuming conversion (anything but
 /// `%%`): a format with none never reuses arguments, no matter how many
-/// are left over, matching bash (`printf "hi\n" a b c` prints `hi` once).
+/// are left over (`printf "hi\n" a b c` prints `hi` once, not three times).
 fn has_arg_conversions(fmt: &str) -> bool {
     let mut chars = fmt.chars().peekable();
     while let Some(c) = chars.next() {
@@ -258,28 +217,69 @@ fn format_once(fmt: &str, args: &mut std::iter::Peekable<std::slice::Iter<&str>>
     out
 }
 
-pub fn builtin_printf(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
-    if args.is_empty() {
-        bail!("printf: missing format string");
-    }
-    let (fmt, _stopped_early) = unescape(args[0]);
-    let cycles = if has_arg_conversions(&fmt) {
-        // Reuse the format until every argument's been consumed, the same
-        // way bash's printf spreads a format across a whole argument list
-        // (e.g. `printf "%s\n" a b c` prints three lines, not one).
-        args[1..].len().max(1)
-    } else {
-        1
-    };
-    let mut arg_iter = args[1..].iter().peekable();
-    let mut output = String::new();
-    for _ in 0..cycles {
-        output.push_str(&format_once(&fmt, &mut arg_iter));
-        if arg_iter.peek().is_none() {
-            break;
+// `printf`'s one real flag (`-v var`, assign the output to a shell
+// variable instead of printing it) goes through clap like any other
+// builtin's flags; FORMAT's own mini-language (`%s`, `%-10.3f`, `%b`, ...)
+// is not an argument grammar at all, it's what `printf` computes, not how
+// it was invoked, so that part (`unescape`/`format_once`/
+// `has_arg_conversions` above) stays hand-written, the same as `test`'s
+// expression evaluator or `getopts`'s option-matching state machine.
+//
+// FORMAT and ARGUMENTS share one trailing field rather than a separate
+// `format: String` + `arguments: Vec<String>`, for the same reason `exec`
+// and `command` do: split across two positional fields, clap resumes
+// trying to recognize flags (`printf "-n"` would misparse as `-n` itself)
+// for everything after the first one, even with `allow_hyphen_values` on
+// both.
+//
+// (Plain `//`, not `///`: a multi-paragraph `///` doc comment here becomes
+// clap's `long_about` even with an explicit `about =` set below, dumping
+// this whole rationale into `printf --help` instead of just "Format and
+// print data".)
+#[derive(Parser)]
+#[command(
+    name = "printf",
+    about = "Format and print data",
+    trailing_var_arg = true
+)]
+pub struct PrintfBuiltin {
+    /// Assign the output to shell variable VAR instead of printing it
+    #[arg(short = 'v')]
+    var: Option<String>,
+    #[arg(allow_hyphen_values = true, value_name = "FORMAT")]
+    format_and_args: Vec<String>,
+}
+
+impl Builtin for PrintfBuiltin {
+    fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
+        let Some((fmt_raw, arguments)) = self.format_and_args.split_first() else {
+            bail!("printf: missing format string");
+        };
+        let (fmt, _stopped_early) = unescape(fmt_raw);
+        let cycles = if has_arg_conversions(&fmt) {
+            // Reuse the format until every argument's been consumed,
+            // spreading it across the whole argument list (e.g.
+            // `printf "%s\n" a b c` prints three lines).
+            arguments.len().max(1)
+        } else {
+            1
+        };
+        let arg_refs: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        let mut arg_iter = arg_refs.iter().peekable();
+        let mut output = String::new();
+        for _ in 0..cycles {
+            output.push_str(&format_once(&fmt, &mut arg_iter));
+            if arg_iter.peek().is_none() {
+                break;
+            }
         }
+        match self.var {
+            Some(name) => shell.env.set(&name, output),
+            None => {
+                print!("{output}");
+                shell.note_stdout(&output);
+            }
+        }
+        Ok(ExitStatus::SUCCESS)
     }
-    print!("{output}");
-    shell.note_stdout(&output);
-    Ok(ExitStatus::SUCCESS)
 }

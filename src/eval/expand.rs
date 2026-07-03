@@ -69,7 +69,7 @@ impl Shell {
                     Ok(s.clone())
                 }
             }
-            Word::Var(name) => Ok(self.expand_var(name)),
+            Word::Var(name) => self.expand_var(name),
             Word::Arith(expr) => {
                 let expanded = self.expand_arith_vars(expr)?;
                 Ok(eval_arith(&expanded).to_string())
@@ -102,9 +102,8 @@ impl Shell {
     /// not just a raw lookup of a variable literally named `n:-0`. Follows
     /// dash's rule for what a substitution is allowed to be: unset (empty)
     /// becomes `0` silently, but a variable holding non-numeric text is a
-    /// hard error (`Illegal number: <value>`) rather than a silent `0`:
-    /// dash does not recursively treat that text as another variable name
-    /// (unlike bash), it just rejects it.
+    /// hard error (`Illegal number: <value>`) rather than a silent `0` or
+    /// being recursively re-interpreted as yet another variable name.
     fn expand_arith_vars(&mut self, expr: &str) -> Result<String> {
         let mut result = String::new();
         let mut chars = expr.chars().peekable();
@@ -138,7 +137,7 @@ impl Shell {
 
             match var {
                 Some(var) => {
-                    let value = self.expand_var(&var);
+                    let value = self.expand_var(&var)?;
                     let trimmed = value.trim();
                     if trimmed.is_empty() {
                         result.push('0');
@@ -154,63 +153,76 @@ impl Shell {
         Ok(result)
     }
 
-    pub fn expand_var(&mut self, name: &str) -> String {
+    pub fn expand_var(&mut self, name: &str) -> Result<String> {
         match name {
-            "?" | "$" | "0" | "@" | "*" | "#" => self.resolve_param(name),
-            n if n.chars().all(|c| c.is_ascii_digit()) => self.resolve_param(n),
+            "?" | "$" | "0" | "@" | "*" | "#" => self.resolve_param_checked(name),
+            n if n.chars().all(|c| c.is_ascii_digit()) => self.resolve_param_checked(n),
             name => match parse_param_op(name) {
-                Some(ParamOp::Length(var)) => self.resolve_param(var).len().to_string(),
+                Some(ParamOp::Length(var)) => {
+                    Ok(self.resolve_param_checked(var)?.len().to_string())
+                }
                 Some(ParamOp::PrefixStrip { var, pat, greedy }) => {
-                    let val = self.resolve_param(var);
-                    strip_prefix(&val, pat, greedy)
+                    let val = self.resolve_param_checked(var)?;
+                    Ok(strip_prefix(&val, pat, greedy))
                 }
                 Some(ParamOp::SuffixStrip { var, pat, greedy }) => {
-                    let val = self.resolve_param(var);
-                    strip_suffix(&val, pat, greedy)
+                    let val = self.resolve_param_checked(var)?;
+                    Ok(strip_suffix(&val, pat, greedy))
                 }
                 Some(ParamOp::Conditional { var, op, word }) => {
+                    // Unchecked (`resolve_param`, not `_checked`): `:-`,
+                    // `:=`, `:+`, and `:?` all explicitly handle `var`
+                    // being unset themselves, so they're exempt from
+                    // `nounset` on `var` specifically, even though every
+                    // other reference to it is not.
                     let val = self.resolve_param(var);
+                    // `word` is raw, unexpanded source text (`parse_param_op`
+                    // only slices it out, it never parses it); a `$ref`
+                    // inside it needs the same substitution any other word
+                    // gets, e.g. `${X:-$Y}` must expand `$Y`, not use it
+                    // literally.
                     match op {
                         ":-" => {
                             if val.is_empty() {
-                                word.to_owned()
+                                self.expand_raw_text(word)
                             } else {
-                                val
+                                Ok(val)
                             }
                         }
                         ":+" => {
                             if val.is_empty() {
-                                String::new()
+                                Ok(String::new())
                             } else {
-                                word.to_owned()
+                                self.expand_raw_text(word)
                             }
                         }
                         ":?" => {
                             if val.is_empty() {
                                 let msg = if word.is_empty() {
-                                    "parameter not set"
+                                    "parameter not set".to_owned()
                                 } else {
-                                    word
+                                    self.expand_raw_text(word)?
                                 };
-                                eprintln!("swagsh: {var}: {msg}");
+                                emit(format!("{var}: {msg}"));
                                 if !self.interactive {
                                     std::process::exit(1);
                                 }
                             }
-                            val
+                            Ok(val)
                         }
                         ":=" => {
                             if val.is_empty() {
-                                self.env.set(var, word);
-                                word.to_owned()
+                                let expanded = self.expand_raw_text(word)?;
+                                self.env.set(var, &expanded);
+                                Ok(expanded)
                             } else {
-                                val
+                                Ok(val)
                             }
                         }
-                        _ => val,
+                        _ => Ok(val),
                     }
                 }
-                None => self.resolve_param(name),
+                None => self.resolve_param_checked(name),
             },
         }
     }
@@ -225,9 +237,19 @@ impl Shell {
     /// "unset" (positional args and the other special parameters aren't
     /// stored in `self.env`, so a raw lookup by that literal name never
     /// finds them).
+    ///
+    /// Never fails: `""` for anything unset, regardless of `nounset`. Only
+    /// `resolve_param_checked` (below) enforces that; this raw accessor is
+    /// what the `:-`/`:=`/`:+`/`:?` operators call directly, since a
+    /// variable they're already handling the unset-case of is by
+    /// definition exempt from `nounset` on that reference.
     fn resolve_param(&self, name: &str) -> String {
         match name {
             "?" => self.last_status.0.to_string(),
+            "!" => self
+                .last_bg_pid
+                .map(|p| p.as_raw_nonzero().to_string())
+                .unwrap_or_default(),
             "$" => std::process::id().to_string(),
             "0" => std::env::args().next().unwrap_or_default(),
             n if n.chars().all(|c| c.is_ascii_digit()) => {
@@ -242,6 +264,48 @@ impl Shell {
             "#" => self.env.positional_args().len().to_string(),
             name => self.env.get(name).unwrap_or_default(),
         }
+    }
+
+    /// Whether `name` counts as "set" for `nounset` purposes: the special
+    /// parameters are always set (even `$!` before any background job has
+    /// run), a positional parameter is set only within `$#`'s current
+    /// range (`$5` with only 3 positional params given *does* trigger
+    /// `nounset`), and anything else is set iff `Env` actually has it.
+    fn is_param_set(&self, name: &str) -> bool {
+        match name {
+            "?" | "!" | "$" | "0" | "@" | "*" | "#" => true,
+            n if n.chars().all(|c| c.is_ascii_digit()) => {
+                let idx: usize = n.parse().unwrap_or(0);
+                idx >= 1 && idx <= self.env.positional_args().len()
+            }
+            name => self.env.get(name).is_some(),
+        }
+    }
+
+    /// Like `resolve_param`, but honors `-u`/`nounset`: errors instead of
+    /// silently returning `""` if `name` is genuinely unset. This is the
+    /// path every *direct* parameter reference goes through (bare `$var`,
+    /// `${var}`, `${#var}`, `${var#pat}`/`${var%pat}`); the one exception
+    /// (`:-`/`:=`/`:+`/`:?`'s own tested variable) calls `resolve_param`
+    /// directly instead, see its call site above.
+    ///
+    /// A non-interactive shell exits outright on this, the same "this
+    /// isn't a normal command failure, abort the script" treatment a real
+    /// syntax error gets; an interactive shell just fails the current
+    /// command and returns to the prompt, so that case is a normal
+    /// `bail!` for the usual catch-and-continue path to handle. The exit
+    /// code itself is 127 normally, but 1 if `errexit` is *also* set:
+    /// `set -u` alone exits 127 on an unbound variable, `set -eu` exits 1
+    /// for the identical failure.
+    fn resolve_param_checked(&self, name: &str) -> Result<String> {
+        if self.nounset && !self.is_param_set(name) {
+            if self.interactive {
+                anyhow::bail!("{name}: unbound variable");
+            }
+            emit(format!("{name}: unbound variable"));
+            std::process::exit(if self.errexit { 1 } else { 127 });
+        }
+        Ok(self.resolve_param(name))
     }
 
     fn expand_cmd_sub(&self, cmd: &Command) -> Result<String> {
@@ -287,9 +351,25 @@ impl Shell {
         }
     }
 
-    pub fn expand_heredoc_body(&mut self, body: &str) -> String {
-        let mut result = String::with_capacity(body.len());
-        let mut chars = body.chars().peekable();
+    pub fn expand_heredoc_body(&mut self, body: &str) -> Result<String> {
+        let mut result = self.expand_raw_text(body)?;
+        if !result.ends_with('\n') {
+            result.push('\n');
+        }
+        Ok(result)
+    }
+
+    /// Expands `$var`/`${...}`/`$(...)` references in already-materialized
+    /// text, as opposed to the `Word` AST nodes the parser produces:
+    /// wherever raw text picked up after parsing needs the same
+    /// substitutions applied by hand. Used for here-doc bodies and for the
+    /// default/alternate word in `${var:-word}`-style parameter-expansion
+    /// operators (`parse_param_op` hands that word back as an unexpanded
+    /// slice of the original source, since it's only extracted, never
+    /// parsed into `Word`s).
+    fn expand_raw_text(&mut self, text: &str) -> Result<String> {
+        let mut result = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
         while let Some(c) = chars.next() {
             if c != '$' {
                 result.push(c);
@@ -305,7 +385,7 @@ impl Shell {
                         }
                         var.push(ch);
                     }
-                    result.push_str(&self.expand_var(&var));
+                    result.push_str(&self.expand_var(&var)?);
                 }
                 Some('(') => {
                     chars.next();
@@ -331,19 +411,16 @@ impl Shell {
                 Some(c2) if c2.is_ascii_alphanumeric() || c2 == '_' || "@*#?-$!".contains(c2) => {
                     if "@*#?-$!".contains(c2) {
                         chars.next();
-                        result.push_str(&self.expand_var(&c2.to_string()));
+                        result.push_str(&self.expand_var(&c2.to_string())?);
                     } else {
                         var.push_str(&take_identifier(&mut chars));
-                        result.push_str(&self.expand_var(&var));
+                        result.push_str(&self.expand_var(&var)?);
                     }
                 }
                 _ => result.push('$'),
             }
         }
-        if !result.ends_with('\n') {
-            result.push('\n');
-        }
-        result
+        Ok(result)
     }
 }
 

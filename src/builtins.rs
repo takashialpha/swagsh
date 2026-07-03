@@ -1,62 +1,73 @@
 mod alias;
-mod cli;
+pub mod cli;
 mod dirs;
+mod echo;
 mod env;
-mod flow;
+pub mod flow;
+mod getopts;
 mod introspect;
-mod io;
 mod jobs;
-mod output;
+mod kill;
+mod printf;
+mod read;
+pub mod script;
 mod test;
+mod wait;
 
 use crate::eval::Shell;
 use crate::jobs::ExitStatus;
+
+use cli::dispatch;
 
 pub type BuiltinFn = fn(&mut Shell, &[&str]) -> anyhow::Result<ExitStatus>;
 
 /// The alternative to [`BuiltinFn`] for a builtin whose flags are worth
 /// real parsing: a `clap`-derived struct that carries its own name, flags,
 /// and help text (via `#[command(name = "...")]`/`#[arg(...)]`) and knows
-/// how to run itself. `cli::dispatch::<T>` adapts any `T: Builtin` back
-/// into a plain `BuiltinFn`, so the struct is the entire builtin: no
-/// separate wrapper function to keep in sync with it.
+/// how to run itself. `dispatch::<T>` adapts any `T: Builtin` back into a
+/// plain `BuiltinFn`, so the struct is the entire builtin: no separate
+/// wrapper function to keep in sync with it.
 pub trait Builtin: clap::Parser {
     fn run(self, shell: &mut Shell) -> anyhow::Result<ExitStatus>;
 }
 
 // Sorted table: binary search in lookup_builtin requires strict lexicographic order.
 // Entries are either a hand-written `BuiltinFn` (builtins like `echo`/`test`
-// whose argument grammar isn't clap-shaped) or `cli::dispatch::<XArgs>` for
-// a `Builtin` flag struct.
+// whose argument grammar isn't clap-shaped, each such case is documented at
+// its definition) or `dispatch::<XBuiltin>` for a `Builtin` flag struct.
 pub static BUILTINS: &[(&str, BuiltinFn)] = &[
-    (".", cli::dispatch::<flow::SourceArgs>),
+    (".", dispatch::<script::SourceBuiltin>),
     (":", flow::builtin_colon),
     ("[", test::builtin_bracket),
-    ("alias", cli::dispatch::<alias::AliasArgs>),
-    ("bg", jobs::builtin_bg),
-    ("break", flow::builtin_break),
-    ("cd", cli::dispatch::<dirs::CdArgs>),
-    ("continue", flow::builtin_continue),
-    ("echo", output::builtin_echo),
-    ("exec", flow::builtin_exec),
-    ("exit", flow::builtin_exit),
-    ("export", cli::dispatch::<env::ExportArgs>),
+    ("alias", dispatch::<alias::AliasBuiltin>),
+    ("bg", dispatch::<jobs::BgBuiltin>),
+    ("break", dispatch::<flow::BreakBuiltin>),
+    ("cd", dispatch::<dirs::CdBuiltin>),
+    ("command", dispatch::<introspect::CommandBuiltin>),
+    ("continue", dispatch::<flow::ContinueBuiltin>),
+    ("echo", echo::builtin_echo),
+    ("eval", dispatch::<script::EvalBuiltin>),
+    ("exec", script::builtin_exec_unreachable),
+    ("exit", dispatch::<flow::ExitBuiltin>),
+    ("export", dispatch::<env::ExportBuiltin>),
     ("false", flow::builtin_false),
-    ("fg", jobs::builtin_fg),
-    ("jobs", cli::dispatch::<jobs::JobsArgs>),
-    ("kill", jobs::builtin_kill),
-    ("printf", output::builtin_printf),
-    ("pwd", cli::dispatch::<dirs::PwdArgs>),
-    ("read", cli::dispatch::<io::ReadArgs>),
-    ("return", flow::builtin_return),
+    ("fg", dispatch::<jobs::FgBuiltin>),
+    ("getopts", dispatch::<getopts::GetoptsBuiltin>),
+    ("jobs", dispatch::<jobs::JobsBuiltin>),
+    ("kill", dispatch::<kill::KillBuiltin>),
+    ("printf", dispatch::<printf::PrintfBuiltin>),
+    ("pwd", dispatch::<dirs::PwdBuiltin>),
+    ("read", dispatch::<read::ReadBuiltin>),
+    ("return", dispatch::<flow::ReturnBuiltin>),
     ("set", env::builtin_set),
-    ("shift", env::builtin_shift),
-    ("source", cli::dispatch::<flow::SourceArgs>),
+    ("shift", dispatch::<env::ShiftBuiltin>),
+    ("source", dispatch::<script::SourceBuiltin>),
     ("test", test::builtin_test),
     ("true", flow::builtin_true),
-    ("type", cli::dispatch::<introspect::TypeArgs>),
-    ("unalias", cli::dispatch::<alias::UnaliasArgs>),
-    ("unset", cli::dispatch::<env::UnsetArgs>),
+    ("type", dispatch::<introspect::TypeBuiltin>),
+    ("unalias", dispatch::<alias::UnaliasBuiltin>),
+    ("unset", dispatch::<env::UnsetBuiltin>),
+    ("wait", dispatch::<wait::WaitBuiltin>),
 ];
 
 #[inline]

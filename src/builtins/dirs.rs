@@ -11,7 +11,7 @@ use super::Builtin;
 /// Collapses `.`/`..` components in `base/target` purely as text, without
 /// touching the filesystem, so a directory reached through a symlink keeps
 /// the traversed (not resolved) path in `$PWD` by default: the same
-/// `-L`/`-P` distinction `cd`/`pwd` make in bash.
+/// `-L`/`-P` distinction `cd`/`pwd` make.
 fn normalize_logical(base: &str, target: &str) -> String {
     let joined = if target.starts_with('/') {
         target.to_owned()
@@ -35,7 +35,7 @@ fn normalize_logical(base: &str, target: &str) -> String {
 
 #[derive(Parser)]
 #[command(name = "cd", about = "Change the shell working directory")]
-pub struct CdArgs {
+pub struct CdBuiltin {
     /// Resolve symlinks after processing `..` in DIR (default)
     #[arg(short = 'L', overrides_with = "physical")]
     logical: bool,
@@ -45,13 +45,13 @@ pub struct CdArgs {
     /// With -P, exit non-zero if the new working directory can't be read back
     #[arg(short = 'e')]
     exit_on_fail: bool,
-    /// Accepted for bash compatibility; extended-attribute directories aren't a Linux concept
+    /// Accepted for compatibility; extended-attribute directories aren't a Linux concept
     #[arg(short = '@')]
     xattr: bool,
     dir: Option<String>,
 }
 
-impl Builtin for CdArgs {
+impl Builtin for CdBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
         let _ = self.xattr;
         let physical = self.physical && !self.logical;
@@ -88,7 +88,7 @@ impl Builtin for CdArgs {
 
 #[derive(Parser)]
 #[command(name = "pwd", about = "Print the current working directory")]
-pub struct PwdArgs {
+pub struct PwdBuiltin {
     /// Print $PWD as-is, without resolving symlinks (default)
     #[arg(short = 'L', overrides_with = "physical")]
     logical: bool,
@@ -97,7 +97,7 @@ pub struct PwdArgs {
     physical: bool,
 }
 
-impl Builtin for PwdArgs {
+impl Builtin for PwdBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
         let physical = self.physical && !self.logical;
         if !physical && let Some(pwd) = shell.env.get("PWD").filter(|p| !p.is_empty()) {

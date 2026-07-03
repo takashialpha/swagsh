@@ -6,7 +6,7 @@ use rustyline::{Config, DefaultEditor};
 
 use crate::ast::Program;
 use crate::cli::Cli;
-use crate::errfmt::{emit, strerror};
+use crate::errfmt::emit;
 use crate::eval::{Shell, is_interrupted};
 use crate::jobs::ExitStatus;
 use crate::parser::ParseError;
@@ -45,12 +45,21 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
                 if line.is_empty() {
                     continue;
                 }
-                if !cli.private {
-                    let _ = rl.add_history_entry(line);
-                }
 
                 take_interrupted();
-                match read_program(line, &mut rl) {
+                let (full_text, program_result) = read_program(line, &mut rl);
+                // Recorded once the whole (possibly multi-line) command has
+                // been read, as one entry holding every line, rather than
+                // just `line` alone: adding only the first line here (before
+                // `read_program`) is what a plain `for ...; do` loop entered
+                // over several `> `-continued lines used to do, silently
+                // losing every line after the first from history instead of
+                // recalling the whole command on one Up-arrow press.
+                if !cli.private {
+                    let _ = rl.add_history_entry(full_text.trim());
+                }
+
+                match program_result {
                     Err(e) => emit(e),
                     Ok(program) => {
                         if !cli.no_execute
@@ -92,7 +101,7 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
             Err(ReadlineError::Interrupted) => {}
             Err(ReadlineError::Eof) => break,
             Err(e) => {
-                eprintln!("swagsh: readline: {}", strerror(e));
+                emit(format!("readline: {e}"));
                 break;
             }
         }
@@ -102,11 +111,7 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
         && let Some(ref p) = history_path
         && let Err(e) = rl.save_history(p)
     {
-        eprintln!(
-            "swagsh: history: could not save to {}: {}",
-            p.display(),
-            strerror(e)
-        );
+        emit(format!("history: could not save to {}: {e}", p.display()));
     }
     Ok(())
 }
@@ -128,7 +133,7 @@ fn source_if_exists(shell: &mut Shell, path: &std::path::Path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
-            eprintln!("swagsh: {}: {}", path.display(), strerror(e));
+            emit(format!("{}: {e}", path.display()));
             return;
         }
     };
@@ -136,7 +141,7 @@ fn source_if_exists(shell: &mut Shell, path: &std::path::Path) {
         Ok(program) => {
             let _ = shell.run_program(&program);
         }
-        Err(e) => eprintln!("swagsh: {}: {e}", path.display()),
+        Err(e) => emit(format!("{}: {e}", path.display())),
     }
 }
 
@@ -156,14 +161,17 @@ fn source_if_exists(shell: &mut Shell, path: &std::path::Path) {
 /// has already stripped the newline it needed to see, so there's no
 /// `incomplete` signal to react to, and it has to be resolved before
 /// parsing is even attempted.
-fn read_program(first_line: &str, rl: &mut DefaultEditor) -> Result<Program, ParseError> {
+/// Returns the full raw text read (every physical line, joined by `\n`)
+/// alongside the parse result, so the caller can record the *whole* command
+/// as a single history entry regardless of how many lines it took.
+fn read_program(first_line: &str, rl: &mut DefaultEditor) -> (String, Result<Program, ParseError>) {
     let mut buf = collect_heredoc_input(&join_backslash_continuations(first_line, rl), rl);
     loop {
         match crate::parser::parse(&buf) {
-            Ok(program) => return Ok(program),
+            Ok(program) => return (buf, Ok(program)),
             Err(e) if e.incomplete => {
                 let Ok(next_line) = rl.readline("> ") else {
-                    return Err(e);
+                    return (buf, Err(e));
                 };
                 let next_line = join_backslash_continuations(&next_line, rl);
                 if !buf.ends_with('\n') {
@@ -171,7 +179,7 @@ fn read_program(first_line: &str, rl: &mut DefaultEditor) -> Result<Program, Par
                 }
                 buf.push_str(&collect_heredoc_input(&next_line, rl));
             }
-            Err(e) => return Err(e),
+            Err(e) => return (buf, Err(e)),
         }
     }
 }

@@ -3,7 +3,7 @@ use crate::ast::{
 };
 use crate::lexer::Token;
 
-use super::{ParseResult, Parser};
+use super::{ParseResult, Parser, keyword_text};
 
 impl Parser {
     pub(super) fn parse_if(&mut self) -> ParseResult<Command> {
@@ -48,6 +48,7 @@ impl Parser {
 
         let var = match self.advance().clone() {
             Token::Word(name) => name,
+            other if keyword_text(&other).is_some() => keyword_text(&other).unwrap().to_owned(),
             other => {
                 return Err(self.err(format!("expected variable name after `for`, got `{other}`")));
             }
@@ -96,6 +97,7 @@ impl Parser {
 
         let word_raw = match self.advance().clone() {
             Token::Word(w) => w,
+            other if keyword_text(&other).is_some() => keyword_text(&other).unwrap().to_owned(),
             other => return Err(self.err(format!("expected word after `case`, got `{other}`"))),
         };
         let word = self.parse_word_str(&word_raw)?;
@@ -117,6 +119,14 @@ impl Parser {
             loop {
                 match self.advance().clone() {
                     Token::Word(p) => patterns.push(self.parse_word_str(&p)?),
+                    // A case pattern is always plain text, never a
+                    // reserved word, regardless of what precedes it
+                    // (`in`, `;;`, `|` all precede a pattern here):
+                    // `case $x in done) ...` is completely standard.
+                    other if keyword_text(&other).is_some() => {
+                        let text = keyword_text(&other).unwrap().to_owned();
+                        patterns.push(self.parse_word_str(&text)?);
+                    }
                     other => {
                         return Err(
                             self.err(format!("expected pattern in case arm, got `{other}`"))

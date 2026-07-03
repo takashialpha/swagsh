@@ -1,11 +1,23 @@
+//! Control-flow builtins: the trivial no-ops (`:`/`true`/`false`) and the
+//! signals that unwind through `run_command`'s `anyhow::Error` channel
+//! (`break`/`continue`/`return`/`exit`). `eval`/`exec`/`source` (dynamic
+//! execution rather than control flow) live in `script.rs`.
+
 use anyhow::{Error, Result};
 use clap::Parser;
 
-use crate::errfmt::strerror;
+use crate::errfmt::emit;
 use crate::eval::{LoopSignal, ReturnSignal, Shell};
 use crate::jobs::ExitStatus;
 
 use super::Builtin;
+
+// `:`/`true`/`false` stay plain functions, not clap: they ignore every
+// argument unconditionally, `--help` included (`true --help` exits 0
+// silently, and `false --help` exits 1: a clap wrapper's generic `--help`
+// handling always returns 0, which would be a real, wrong exit code for
+// `false`, not just different text). Their entire job is to do nothing
+// with whatever they're given.
 
 #[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
 pub const fn builtin_colon(_: &mut Shell, _: &[&str]) -> Result<ExitStatus> {
@@ -22,91 +34,90 @@ pub const fn builtin_false(_: &mut Shell, _: &[&str]) -> Result<ExitStatus> {
     Ok(ExitStatus::FAILURE)
 }
 
-#[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
-pub fn builtin_break(_: &mut Shell, _: &[&str]) -> Result<ExitStatus> {
-    Err(Error::new(LoopSignal::Break))
+/// Not inside any loop (of the current function call) is only a warning,
+/// not an abort: it prints the message and execution just continues on to
+/// the next statement, exit status 0.
+fn not_in_loop(name: &str) -> Result<ExitStatus> {
+    emit(format!(
+        "{name}: only meaningful in a `for', `while', or `until' loop"
+    ));
+    Ok(ExitStatus::SUCCESS)
 }
 
-#[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
-pub fn builtin_continue(_: &mut Shell, _: &[&str]) -> Result<ExitStatus> {
-    Err(Error::new(LoopSignal::Continue))
+/// `break`/`continue`'s `N` (how many enclosing loops to unwind) has to be a
+/// positive integer; `clap::value_parser!(u32).range(1..)` rejects `0`,
+/// negative numbers, and non-numeric tokens uniformly, the same UsageError
+/// path (exit 2, nothing unwound) every other clap-backed builtin's bad
+/// argument already takes. Bash instead special-cases these as "still
+/// unwind one level despite the error," a real (minor) divergence, traded
+/// for not hand-parsing this at all.
+#[derive(Parser)]
+#[command(
+    name = "break",
+    about = "Exit from an enclosing for, while, or until loop",
+    allow_negative_numbers = true
+)]
+pub struct BreakBuiltin {
+    #[arg(value_parser = clap::value_parser!(u32).range(1..))]
+    level: Option<u32>,
 }
 
-pub fn builtin_return(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
-    let code = args
-        .first()
-        .and_then(|s| s.parse::<i32>().ok())
-        .unwrap_or(shell.last_status.0);
-    Err(Error::new(ReturnSignal(code)))
-}
-
-pub fn builtin_exit(_: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
-    std::process::exit(args.first().and_then(|s| s.parse().ok()).unwrap_or(0));
-}
-
-pub fn builtin_exec(_: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
-    if args.is_empty() {
-        return Ok(ExitStatus::SUCCESS);
+impl Builtin for BreakBuiltin {
+    fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
+        if shell.loop_depth == 0 {
+            return not_in_loop("break");
+        }
+        let n = self.level.unwrap_or(1).min(shell.loop_depth);
+        Err(Error::new(LoopSignal::Break(n)))
     }
-    let words: Vec<String> = args.iter().map(ToString::to_string).collect();
-    crate::eval::Shell::do_exec(&words)?;
-    unreachable!()
 }
 
 #[derive(Parser)]
 #[command(
-    name = "source",
-    about = "Execute commands from a file in the current shell"
+    name = "continue",
+    about = "Resume the next iteration of an enclosing for, while, or until loop",
+    allow_negative_numbers = true
 )]
-pub struct SourceArgs {
-    /// Search PATH (colon-separated) for FILENAME instead of $PATH
-    #[arg(short = 'p')]
-    path: Option<String>,
-    filename: String,
-    arguments: Vec<String>,
+pub struct ContinueBuiltin {
+    #[arg(value_parser = clap::value_parser!(u32).range(1..))]
+    level: Option<u32>,
 }
 
-/// Resolves `filename` the way bash's `source` does: used as-is if it
-/// contains a `/` or exists relative to the current directory, otherwise
-/// searched for as a bare name across `search_path` (`-p`'s argument, or
-/// `$PATH` if `-p` wasn't given) the same way an external command is.
-fn resolve_source_path(filename: &str, search_path: Option<&str>, shell: &Shell) -> String {
-    if filename.contains('/') || std::path::Path::new(filename).exists() {
-        return filename.to_owned();
-    }
-    let search_path = search_path
-        .map(str::to_owned)
-        .or_else(|| shell.env.get("PATH"))
-        .unwrap_or_default();
-    for dir in search_path.split(':') {
-        let candidate = format!("{dir}/{filename}");
-        if std::path::Path::new(&candidate).exists() {
-            return candidate;
-        }
-    }
-    filename.to_owned()
-}
-
-impl Builtin for SourceArgs {
+impl Builtin for ContinueBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
-        let resolved = resolve_source_path(&self.filename, self.path.as_deref(), shell);
-        let src = std::fs::read_to_string(&resolved)
-            .map_err(|e| anyhow::anyhow!("source: {resolved}: {}", strerror(e)))?;
-        let program =
-            crate::parser::parse(&src).map_err(|e| anyhow::anyhow!("source: {resolved}: {e}"))?;
-
-        // Extra arguments become $1, $2, ... only for this run, restored
-        // afterward; with none given, the caller's own positional params
-        // stay visible to the sourced script, same as bash.
-        let old_args = (!self.arguments.is_empty()).then(|| {
-            let old = shell.env.positional_args().to_vec();
-            shell.env.set_positional_args(self.arguments.clone());
-            old
-        });
-        let result = shell.run_program(&program);
-        if let Some(old) = old_args {
-            shell.env.set_positional_args(old);
+        if shell.loop_depth == 0 {
+            return not_in_loop("continue");
         }
-        result
+        let n = self.level.unwrap_or(1).min(shell.loop_depth);
+        Err(Error::new(LoopSignal::Continue(n)))
+    }
+}
+
+#[derive(Parser)]
+#[command(
+    name = "return",
+    about = "Return from a shell function or sourced script",
+    allow_negative_numbers = true
+)]
+pub struct ReturnBuiltin {
+    code: Option<i32>,
+}
+
+impl Builtin for ReturnBuiltin {
+    fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
+        let code = self.code.unwrap_or(shell.last_status.0);
+        Err(Error::new(ReturnSignal(code)))
+    }
+}
+
+#[derive(Parser)]
+#[command(name = "exit", about = "Exit the shell", allow_negative_numbers = true)]
+pub struct ExitBuiltin {
+    code: Option<i32>,
+}
+
+impl Builtin for ExitBuiltin {
+    fn run(self, _shell: &mut Shell) -> Result<ExitStatus> {
+        std::process::exit(self.code.unwrap_or(0));
     }
 }

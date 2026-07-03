@@ -119,14 +119,47 @@ cargo build --release   # binary at target/release/swagsh
 
 ## Known limitations
 
-- Reserved words (`done`, `fi`, `then`, etc.) cannot be passed as plain arguments.
-- No `local` builtin; functions share the caller's variable scope.
-- No `trap` builtin.
-- No `command`, `eval`, `getopts`, or `wait` builtins.
-- No `<<<` here-string redirection.
+- No shell arrays (`arr=(a b c)`, `${arr[@]}`); a language-level gap, not a
+  missing builtin, but it's why `declare`/`mapfile`/`readarray` aren't in
+  the list below either: they'd need this first.
+
+### Missing builtins:
+
+  - `local`: functions currently share the caller's variable scope entirely.
+  - `trap`: no signal or exit-handler registration.
+  - `umask`, `readonly`: straightforward, just not done yet.
+  - `hash`: PATH-lookup cache (`hash`/`hash -r`); still genuinely useful, not
+    legacy, worth doing alongside `command`/`type`.
+  - `builtin`: forces NAME to resolve to an actual builtin, erroring instead
+    of falling through to PATH if it isn't one (`command` already bypasses a
+    same-named function to reach a builtin, so `builtin` is a narrower,
+    stricter tool on top of that, not a replacement for it; mainly useful
+    inside a function that shadows a builtin's name and needs to call the
+    real one, e.g. a `cd` wrapper calling `builtin cd "$@"`).
+  - `help`: planned. Every builtin will implement a shared `Help` trait, with
+    a default impl derived from its existing `clap` command so most builtins
+    get this for free; the hand-written non-`clap` builtins (`:`, `true`,
+    `false`, `[`, `test`) and `help` itself provide their own impl. Falling
+    through to `man`/`tldr` for names that aren't builtins is a likely
+    follow-up once the builtin-only version exists.
+  - `ulimit`: resource limits.
+  - `times`: POSIX-specified cumulative shell/children CPU time; just not
+    done yet. Distinct from `time` below (which times one pipeline).
+  - `fc`: POSIX-specified, but its re-edit-and-rerun-from-history workflow is
+    already covered by line-editing and arrow-key recall; low priority.
+- Not POSIX, but common enough to be worth adding later: `pushd`/`popd`/`dirs`
+  (directory stack), `declare`/`typeset` (blocked on array support above),
+  `disown`, `let` (thin wrapper around the arithmetic evaluator `$(( ))`
+  already uses internally), `history` (list/clear persistent history; today
+  history is file-backed only, with no builtin to inspect or manage it from
+  the shell itself), `time` (times a single pipeline; ubiquitous in
+  interactive use despite not being POSIX-specified as a builtin).
 
 ---
 
 ## Contributing
 
 Issues and pull requests are welcome. Open an issue before starting work on a large change.
+
+The parser and other pure interpreter internals are fuzz-tested; see
+[`fuzz/README.md`](fuzz/README.md) for targets and how to run them.

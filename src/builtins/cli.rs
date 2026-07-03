@@ -22,7 +22,7 @@ use crate::jobs::ExitStatus;
 /// missing file, ...) so [`dispatch`] can give usage mistakes the
 /// conventional exit status 2 while runtime failures still get 1, the same
 /// distinction most Unix tools make.
-enum ParsedArgs<T> {
+pub enum ParsedArgs<T> {
     Ok(T),
     Help,
     UsageError,
@@ -30,7 +30,7 @@ enum ParsedArgs<T> {
 
 /// Adapts any [`Builtin`] into the plain
 /// `fn(&mut Shell, &[&str]) -> Result<ExitStatus>` shape the `BUILTINS`
-/// lookup table stores. `dispatch::<CdArgs>` slots directly into that
+/// lookup table stores. `dispatch::<CdBuiltin>` slots directly into that
 /// table in place of a hand-written wrapper function.
 pub fn dispatch<B: Builtin>(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     match parse_args::<B>(args)? {
@@ -45,7 +45,13 @@ fn command_for<T: Parser>() -> Command {
 }
 
 /// Parses `args` as `T`, using `T`'s own command name for error text.
-fn parse_args<T: Parser>(args: &[&str]) -> Result<ParsedArgs<T>> {
+///
+/// `exec` calls this directly (see `Shell::run_exec_builtin`) instead of
+/// going through the normal [`dispatch`]/`with_redirects` path: a bare
+/// `exec` (no COMMAND) must keep its redirects applied permanently instead
+/// of scoping them to one call, something the generic dispatch flow has no
+/// way to ask for.
+pub fn parse_args<T: Parser>(args: &[&str]) -> Result<ParsedArgs<T>> {
     let cmd = command_for::<T>();
     let name = cmd.get_name().to_owned();
     match cmd.try_get_matches_from(args) {

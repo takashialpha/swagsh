@@ -21,17 +21,22 @@ mod expand;
 // Control-flow signals: propagate through the call stack via anyhow::Error.
 // ---------------------------------------------------------------------------
 
+/// The `u32` is how many enclosing loops remain to unwind through: `break 2`
+/// starts as `Break(2)`, and each loop that catches it either absorbs it
+/// (count was 1) or exits and re-raises `Break(count - 1)` to the next loop
+/// out. `continue N` follows the same decrement, except the loop that
+/// finally absorbs it re-runs its condition instead of exiting.
 #[derive(Debug)]
 pub enum LoopSignal {
-    Break,
-    Continue,
+    Break(u32),
+    Continue(u32),
 }
 
 impl fmt::Display for LoopSignal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Break => f.write_str("break outside loop"),
-            Self::Continue => f.write_str("continue outside loop"),
+            Self::Break(_) => f.write_str("break outside loop"),
+            Self::Continue(_) => f.write_str("continue outside loop"),
         }
     }
 }
@@ -72,11 +77,25 @@ pub fn is_interrupted(e: &Error) -> bool {
 }
 
 pub fn is_break(e: &Error) -> bool {
-    matches!(e.downcast_ref::<LoopSignal>(), Some(LoopSignal::Break))
+    matches!(e.downcast_ref::<LoopSignal>(), Some(LoopSignal::Break(_)))
 }
 
 pub fn is_continue(e: &Error) -> bool {
-    matches!(e.downcast_ref::<LoopSignal>(), Some(LoopSignal::Continue))
+    matches!(
+        e.downcast_ref::<LoopSignal>(),
+        Some(LoopSignal::Continue(_))
+    )
+}
+
+/// Levels left to unwind for a caught `break`/`continue`, i.e. the `N` in
+/// `break N`/`continue N` minus however many enclosing loops already passed
+/// it along. Only meaningful once `is_break`/`is_continue` confirmed the
+/// variant, so callers that already checked can safely default to `1`.
+pub fn loop_signal_level(e: &Error) -> u32 {
+    match e.downcast_ref::<LoopSignal>() {
+        Some(LoopSignal::Break(n) | LoopSignal::Continue(n)) => *n,
+        None => 1,
+    }
 }
 
 pub fn is_return(e: &Error) -> bool {
@@ -113,6 +132,45 @@ pub struct Shell {
     /// since nothing separates it onto its own line first. The REPL loop
     /// bridges with a real newline when this is `false`.
     pub at_line_start: bool,
+    /// The `$!` special parameter: pid of the last process in the most
+    /// recently backgrounded pipeline. `None` (expands empty) until the
+    /// first `&` command runs.
+    pub last_bg_pid: Option<Pid>,
+    /// How many `for`/`while`/`until` loops currently enclose execution,
+    /// scoped per function call (see `run_function`). `break`/`continue`
+    /// clamp their `N` argument to this so a level exceeding the actual
+    /// nesting just unwinds everything instead of escaping as an error, and
+    /// treat `0` as "not in a loop at all" (the "only meaningful in a
+    /// `for', `while', or `until' loop" case).
+    pub loop_depth: u32,
+    /// `getopts`'s position within the *current* `$OPTIND` word: how many
+    /// of its option characters have already been consumed by prior calls
+    /// (`0` means start that word fresh). `getopts` calls are one-option-
+    /// per-call, so this has to persist somewhere between them; unlike
+    /// `$OPTIND` itself, this part isn't exposed as a shell variable, so
+    /// it lives on `Shell` instead. See `builtins::getopts`.
+    pub getopts_state: GetoptsState,
+    /// `set -e`/`+e`: exit the shell when a command that isn't otherwise
+    /// exempt (see `Shell::check_errexit`) fails.
+    pub errexit: bool,
+    /// `set -x`/`+x`: print each simple command to stderr, expanded, before
+    /// running it.
+    pub xtrace: bool,
+    /// `set -u`/`+u`: expanding an unset (not just empty) variable is an
+    /// error instead of silently becoming `""`.
+    pub nounset: bool,
+    /// How many `if`/`while`/`until` *condition* lists currently enclose
+    /// execution: `errexit` doesn't apply inside one (a command's failure
+    /// there is "explicitly tested", not a script-ending error), the same
+    /// way `loop_depth` scopes `break`/`continue`. A counter, not a bool,
+    /// since conditions can nest (`if while false; do :; done`).
+    pub condition_depth: u32,
+}
+
+#[derive(Default)]
+pub struct GetoptsState {
+    pub optind: i64,
+    pub offset: usize,
 }
 
 impl Shell {
@@ -140,6 +198,13 @@ impl Shell {
             interactive,
             sane_termios,
             at_line_start: true,
+            last_bg_pid: None,
+            loop_depth: 0,
+            getopts_state: GetoptsState::default(),
+            errexit: false,
+            xtrace: false,
+            nounset: false,
+            condition_depth: 0,
         }
     }
 
@@ -150,6 +215,23 @@ impl Shell {
     pub fn note_stdout(&mut self, printed: &str) {
         if !printed.is_empty() {
             self.at_line_start = printed.ends_with('\n');
+        }
+    }
+
+    /// `set -e`: exits the shell if `status` is a failure that isn't
+    /// exempt. Exemptions: inside an `if`/`while`/`until` condition
+    /// (`condition_depth > 0`, the caller's job to track), and a pipeline
+    /// ending in `!` (`negated`) regardless of its resulting status, since
+    /// negation counts as "explicitly tested" even when the negated result
+    /// is still a failure (`! true` does not exit under `-e`, despite
+    /// `! true` itself being status 1). Called once per `AndOrList` (a
+    /// `&&`/`||` chain), on the last item actually executed: short-
+    /// circuiting already means every earlier item's failure was
+    /// "explicitly tested" by the operator that follows it, so only the
+    /// chain's final outcome is a candidate to exit on.
+    pub fn check_errexit(&self, status: ExitStatus, negated: bool) {
+        if self.errexit && self.condition_depth == 0 && !negated && !status.is_success() {
+            std::process::exit(status.0);
         }
     }
 
@@ -194,6 +276,9 @@ impl Shell {
 
     fn run_simple(&mut self, sc: &SimpleCmd) -> Result<ExitStatus> {
         let (assignments, resolved) = self.resolve_simple(sc)?;
+        if self.xtrace {
+            self.print_xtrace(&assignments, &resolved);
+        }
         match resolved {
             Resolved::AssignOnly => {
                 // Nothing to run: apply redirects (for their side effects,
@@ -209,8 +294,32 @@ impl Shell {
                 let special = is_special_builtin(&name);
                 self.run_builtin(sc, f, &name, &args, &assignments, special)
             }
-            Resolved::Function(body, args) => self.run_function(sc, &body, &args, &assignments),
+            Resolved::Function(_, body, args) => self.run_function(sc, &body, &args, &assignments),
             Resolved::External(words) => self.run_external(sc, &words, &assignments),
+        }
+    }
+
+    /// `set -x`: prints the fully-expanded command about to run, prefixed
+    /// with `$PS4` (defaulting to `"+ "`), before it runs. Values are
+    /// space-joined without re-quoting: simple, not always round-trippable,
+    /// but that's the conventional shell `-x` trace format.
+    fn print_xtrace(&self, assignments: &[String], resolved: &Resolved) {
+        let mut argv: Vec<&str> = assignments.iter().map(String::as_str).collect();
+        match resolved {
+            Resolved::AssignOnly => {}
+            Resolved::Builtin(_, name, args) => {
+                argv.push(name);
+                argv.extend(args.iter().map(String::as_str));
+            }
+            Resolved::Function(name, _, args) => {
+                argv.push(name);
+                argv.extend(args.iter().map(String::as_str));
+            }
+            Resolved::External(words) => argv.extend(words.iter().map(String::as_str)),
+        }
+        if !argv.is_empty() {
+            let ps4 = self.env.get("PS4").unwrap_or_else(|| "+ ".to_owned());
+            eprintln!("{ps4}{}", argv.join(" "));
         }
     }
 
@@ -240,7 +349,7 @@ impl Shell {
             return Ok((assignments, Resolved::Builtin(f, name, args)));
         }
         if let Some(body) = self.env.get_function(&name) {
-            return Ok((assignments, Resolved::Function(body, args)));
+            return Ok((assignments, Resolved::Function(name, body, args)));
         }
 
         let mut full_words = vec![name];
@@ -287,6 +396,14 @@ impl Shell {
             self.apply_temp_assignments(assignments)
         };
 
+        // `exec`'s redirect handling can't go through the generic
+        // `with_redirects` path below: a bare `exec` (no COMMAND) applies
+        // its redirects permanently to this shell instead of scoping them
+        // to one call. See `run_exec_builtin`'s doc comment.
+        if name == "exec" {
+            return self.run_exec_builtin(&arg_refs, &sc.redirects);
+        }
+
         // A builtin's own error (bad flag, ENOENT, ...) is a normal command
         // failure: it should set `$?` and let the script go on to the next
         // statement, the same as an external command exiting non-zero would.
@@ -326,7 +443,13 @@ impl Shell {
 
         let old_args = self.env.positional_args().to_vec();
         self.env.set_positional_args(args.to_vec());
+        // `break`/`continue` don't reach through a function call into a
+        // loop the caller happens to be inside: each function body has its
+        // own independent loop nesting, so hide the caller's depth for the
+        // duration of this call.
+        let outer_loop_depth = std::mem::take(&mut self.loop_depth);
         let result = self.with_redirects(sc, |shell| shell.run_command(body));
+        self.loop_depth = outer_loop_depth;
         self.env.set_positional_args(old_args);
         self.env.restore_vars(saved_vars);
 
@@ -381,7 +504,10 @@ enum Resolved {
     /// No command words after expansion (e.g. a bare `FOO=bar`).
     AssignOnly,
     Builtin(BuiltinFn, String, Vec<String>),
-    Function(std::rc::Rc<Command>, Vec<String>),
+    /// The function's own name, kept around for `xtrace` display (`run_function`
+    /// itself doesn't need it: a function's `$0` stays whatever the caller's
+    /// was, unlike positional args) alongside its body and arguments.
+    Function(String, std::rc::Rc<Command>, Vec<String>),
     /// `name` followed by its arguments.
     External(Vec<String>),
 }
@@ -431,6 +557,7 @@ fn is_special_builtin(name: &str) -> bool {
         "." | ":"
             | "break"
             | "continue"
+            | "eval"
             | "exec"
             | "exit"
             | "export"

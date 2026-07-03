@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 
+use crate::errfmt::emit;
 use crate::eval::Shell;
 use crate::expand::shell_quote_always;
 use crate::jobs::ExitStatus;
@@ -9,12 +10,12 @@ use super::Builtin;
 
 #[derive(Parser)]
 #[command(name = "alias", about = "Define or print aliases")]
-pub struct AliasArgs {
+pub struct AliasBuiltin {
     /// NAME=VALUE to define, or a bare NAME to print its current definition
     names: Vec<String>,
 }
 
-impl Builtin for AliasArgs {
+impl Builtin for AliasBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
         if self.names.is_empty() {
             let mut pairs: Vec<(&str, &str)> = shell.env.all_aliases().collect();
@@ -28,6 +29,11 @@ impl Builtin for AliasArgs {
             }
             return Ok(ExitStatus::SUCCESS);
         }
+        // Every NAME is tried even after an earlier one wasn't found
+        // (`alias bad1 ll bad2` reports both `bad1` and `bad2` missing,
+        // not just the first), so this tracks failure and keeps going
+        // rather than returning on the first miss.
+        let mut status = ExitStatus::SUCCESS;
         for arg in &self.names {
             if let Some((k, v)) = arg.split_once('=') {
                 shell.env.set_alias(k.to_owned(), v.to_owned());
@@ -35,24 +41,24 @@ impl Builtin for AliasArgs {
                 println!("alias {arg}={}", shell_quote_always(&v));
                 shell.note_stdout("\n");
             } else {
-                eprintln!("swagsh: alias: {arg}: not found");
-                return Ok(ExitStatus::FAILURE);
+                emit(format!("alias: {arg}: not found"));
+                status = ExitStatus::FAILURE;
             }
         }
-        Ok(ExitStatus::SUCCESS)
+        Ok(status)
     }
 }
 
 #[derive(Parser)]
 #[command(name = "unalias", about = "Remove aliases")]
-pub struct UnaliasArgs {
+pub struct UnaliasBuiltin {
     /// Remove every alias
     #[arg(short = 'a')]
     all: bool,
     names: Vec<String>,
 }
 
-impl Builtin for UnaliasArgs {
+impl Builtin for UnaliasBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
         if self.all {
             shell.env.clear_aliases();
@@ -61,7 +67,7 @@ impl Builtin for UnaliasArgs {
         let mut status = ExitStatus::SUCCESS;
         for name in &self.names {
             if !shell.env.remove_alias(name) {
-                eprintln!("swagsh: unalias: {name}: not found");
+                emit(format!("unalias: {name}: not found"));
                 status = ExitStatus::FAILURE;
             }
         }

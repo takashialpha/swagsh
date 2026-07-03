@@ -1,25 +1,11 @@
-mod ast;
-mod builtins;
-mod cli;
-mod env;
-mod errfmt;
-mod eval;
-mod expand;
-mod fd;
-mod jobs;
-mod lexer;
-mod parser;
-mod prompt;
-mod repl;
-mod signal;
-
 use anyhow::{Result, anyhow};
 use clap::Parser as _;
 
-use cli::Cli;
-use env::Env;
-use errfmt::{emit, strerror};
-use eval::Shell;
+use swagsh::cli::Cli;
+use swagsh::env::Env;
+use swagsh::errfmt::{emit, strerror};
+use swagsh::eval::Shell;
+use swagsh::{parser, repl, signal};
 
 fn main() -> Result<()> {
     signal::reset_sigpipe();

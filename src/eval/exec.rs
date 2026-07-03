@@ -66,8 +66,9 @@ impl Shell {
     pub fn run_pipeline_async(&mut self, pipeline: &Pipeline) -> Result<ExitStatus> {
         let label = describe_pipeline(pipeline);
         let (pgid, pids) = self.spawn_pipeline(pipeline)?;
+        self.last_bg_pid = pids.last().copied();
         let job_id = self.jobs.add(pgid, pids, label);
-        // bash only announces a backgrounded job's `[N] PID` under job
+        // A backgrounded job's `[N] PID` is only announced under job
         // control (monitor mode), which is on by default for interactive
         // shells and off for `-c`/script runs; match that instead of
         // always printing it.
@@ -188,6 +189,9 @@ impl Shell {
             let (k, v) = super::split_assignment(a);
             self.env.export(k, v);
         }
+        if self.xtrace {
+            self.print_xtrace(&assignments, &resolved);
+        }
 
         match resolved {
             Resolved::AssignOnly => 0,
@@ -201,7 +205,7 @@ impl Shell {
                     }
                 }
             }
-            Resolved::Function(body, args) => {
+            Resolved::Function(_, body, args) => {
                 self.env.set_positional_args(args);
                 match catch_return(self.run_command(&body)) {
                     Ok(s) => s.0,
@@ -221,7 +225,13 @@ impl Shell {
         }
     }
 
-    pub(super) fn run_external(
+    /// `pub` rather than `pub(super)` (the norm for this `impl Shell` block)
+    /// so the `command` builtin can run its resolved external command
+    /// through the same fork/job-control path as every other external
+    /// command, without duplicating it: `command` deliberately skips
+    /// *function* lookup but still needs the exact same spawn/wait/
+    /// foreground-pgid handling as an ordinary external command.
+    pub fn run_external(
         &mut self,
         sc: &SimpleCmd,
         words: &[String],
@@ -285,8 +295,66 @@ impl Shell {
             .iter()
             .map(|w| CString::new(w.as_str()))
             .collect::<Result<_, _>>()?;
-        let errno = execvp_path(&argv);
+        let errno = execvp_path(&argv, None, false);
         bail!("{}: {}", words[0], strerror(errno));
+    }
+
+    /// The `exec` builtin's no-COMMAND form applies its redirections
+    /// permanently to the current shell instead of scoping them to a single
+    /// call, the one case where `exec` doesn't replace the process image at
+    /// all. Called directly from `run_builtin` instead of going through the
+    /// usual `with_redirects`-wrapped `BuiltinFn` dispatch, since that
+    /// always restores the original fds once the call returns.
+    pub(super) fn run_exec_builtin(
+        &mut self,
+        args: &[&str],
+        redirects: &[Redirect],
+    ) -> Result<ExitStatus> {
+        use crate::builtins::cli::{ParsedArgs, parse_args};
+        use crate::builtins::script::ExecBuiltin;
+
+        let parsed = match parse_args::<ExecBuiltin>(args)? {
+            ParsedArgs::Ok(a) => a,
+            ParsedArgs::Help => return Ok(ExitStatus::SUCCESS),
+            ParsedArgs::UsageError => return Ok(ExitStatus(2)),
+        };
+
+        if parsed.command_and_args.is_empty() {
+            return match self.apply_redirects(redirects) {
+                Ok(()) => Ok(ExitStatus::SUCCESS),
+                Err(e) => {
+                    emit(e);
+                    Ok(ExitStatus::FAILURE)
+                }
+            };
+        }
+        if let Err(e) = self.apply_redirects(redirects) {
+            emit(e);
+            return Ok(ExitStatus::FAILURE);
+        }
+
+        let words = parsed.command_and_args;
+
+        let display_name = match (&parsed.name, parsed.login) {
+            (Some(name), true) => Some(format!("-{name}")),
+            (Some(name), false) => Some(name.clone()),
+            (None, true) => Some(format!("-{}", words[0])),
+            (None, false) => None,
+        };
+
+        let argv: Vec<CString> = words
+            .iter()
+            .map(|w| CString::new(w.as_str()))
+            .collect::<Result<_, _>>()?;
+        let display_cstring = display_name.map(CString::new).transpose()?;
+        let errno = execvp_path(&argv, display_cstring.as_ref(), parsed.clear_env);
+        emit(format!("exec: {}: {}", words[0], strerror(errno)));
+        // A non-interactive shell exits outright when `exec`'s COMMAND
+        // can't be run (no `execfail` option here to opt out of that).
+        if !self.interactive {
+            std::process::exit(127);
+        }
+        Ok(ExitStatus(127))
     }
 
     pub fn wait_for_pid(&mut self, pid: Pid) -> Result<ExitStatus> {
@@ -348,16 +416,21 @@ impl Shell {
                         }
                         s
                     } else {
-                        self.expand_heredoc_body(raw_body)
+                        self.expand_heredoc_body(raw_body)?
                     };
                     write_herestring(&content)?;
                 }
                 RedirectKind::HereString => {
-                    let raw = match &r.target {
-                        Word::Literal(s) => s.clone(),
-                        other => self.expand_word_to_string(other)?,
-                    };
-                    let content = self.expand_heredoc_body(&raw);
+                    // `<<<`'s operand is an ordinary word by the time it
+                    // gets here (`parser::parse_redirect` already ran it
+                    // through the normal word-decomposition path), so it
+                    // just needs the normal word-expansion + a trailing
+                    // newline (always appended, even if the word already
+                    // ends with its own).
+                    let mut content = self.expand_word_to_string(&r.target)?;
+                    if !content.ends_with('\n') {
+                        content.push('\n');
+                    }
                     write_herestring(&content)?;
                 }
             }
@@ -457,18 +530,34 @@ fn describe_word(word: &Word) -> String {
     }
 }
 
-fn execvp_path(argv: &[CString]) -> rustix::io::Errno {
+/// `display_argv0`, when given, is what the exec'd program sees as its own
+/// `argv[0]` (`exec -a name`/`-l`) instead of whatever name/path was used to
+/// locate it on disk; those are independent by design in every Unix exec
+/// family. `empty_env` is `exec -c`: run with no inherited environment at
+/// all rather than the shell's own.
+fn execvp_path(
+    argv: &[CString],
+    display_argv0: Option<&CString>,
+    empty_env: bool,
+) -> rustix::io::Errno {
     let mut argv_ptrs: Vec<*const u8> = argv.iter().map(|s| s.as_ptr().cast::<u8>()).collect();
     argv_ptrs.push(std::ptr::null());
+    if let Some(d) = display_argv0 {
+        argv_ptrs[0] = d.as_ptr().cast::<u8>();
+    }
 
-    let env_cstrings: Vec<CString> = std::env::vars_os()
-        .filter_map(|(k, v)| {
-            let mut kv = k.into_encoded_bytes();
-            kv.push(b'=');
-            kv.extend(v.into_encoded_bytes());
-            CString::new(kv).ok()
-        })
-        .collect();
+    let env_cstrings: Vec<CString> = if empty_env {
+        Vec::new()
+    } else {
+        std::env::vars_os()
+            .filter_map(|(k, v)| {
+                let mut kv = k.into_encoded_bytes();
+                kv.push(b'=');
+                kv.extend(v.into_encoded_bytes());
+                CString::new(kv).ok()
+            })
+            .collect()
+    };
     let mut envp_ptrs: Vec<*const u8> = env_cstrings
         .iter()
         .map(|s| s.as_ptr().cast::<u8>())
@@ -490,7 +579,9 @@ fn execvp_path(argv: &[CString]) -> rustix::io::Errno {
         let mut full = dir;
         full.push(std::str::from_utf8(name_bytes).unwrap_or(""));
         if let Ok(candidate) = CString::new(full.as_os_str().as_encoded_bytes()) {
-            argv_ptrs[0] = candidate.as_ptr().cast::<u8>();
+            if display_argv0.is_none() {
+                argv_ptrs[0] = candidate.as_ptr().cast::<u8>();
+            }
             // SAFETY: null-terminated arrays of valid CString data.
             let err = unsafe { execve(&candidate, argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
             if err != rustix::io::Errno::NOENT && err != rustix::io::Errno::NOTDIR {

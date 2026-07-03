@@ -4,8 +4,8 @@
 //! pairing the `strerror(3)` text with the raw errno, e.g.
 //! `"No such file or directory (os error 2)"`. That's the right call for a
 //! general-purpose Rust `Display` impl, but it reads oddly on a shell's
-//! stderr: every Unix shell (bash, zsh, dash) prints just the `strerror(3)`
-//! text (`bash: nope: No such file or directory`) and never surfaces the
+//! stderr: every Unix shell prints just the `strerror(3)` text
+//! (`swagsh: nope: No such file or directory`) and never surfaces the
 //! numeric errno to the user. This module keeps swagsh's error output on
 //! that convention.
 

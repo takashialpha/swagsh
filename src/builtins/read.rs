@@ -52,7 +52,7 @@ impl Drop for EchoGuard {
 ///
 /// Returns the bytes read and whether `delim` was actually seen (`false`
 /// means EOF cut the read short, the caller's cue to report failure while
-/// still assigning whatever partial data came through, as bash does).
+/// still assigning whatever partial data came through).
 fn read_until_delim(delim: u8, raw: bool) -> std::io::Result<(Vec<u8>, bool)> {
     let mut stdin = std::io::stdin().lock();
     let mut out = Vec::new();
@@ -116,7 +116,7 @@ fn split_fields(line: &str, ifs: &str, n_vars: usize, raw: bool) -> Vec<String> 
     name = "read",
     about = "Read a line from standard input into variables"
 )]
-pub struct ReadArgs {
+pub struct ReadBuiltin {
     /// Don't treat backslash as an escape character
     #[arg(short = 'r')]
     raw: bool,
@@ -132,7 +132,7 @@ pub struct ReadArgs {
     names: Vec<String>,
 }
 
-impl Builtin for ReadArgs {
+impl Builtin for ReadBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
         let delim = self
             .delim

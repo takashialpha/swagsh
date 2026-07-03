@@ -1,0 +1,43 @@
+[package]
+name = "swagsh-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.swagsh]
+path = ".."
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "eval_arith"
+path = "fuzz_targets/eval_arith.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unescape"
+path = "fuzz_targets/unescape.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "param_expand"
+path = "fuzz_targets/param_expand.rs"
+test = false
+doc = false
+bench = false

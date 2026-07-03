@@ -1,3 +1,16 @@
+//! `test`/`[` can't go through clap: this isn't a command with flags, it's
+//! a small boolean-expression grammar (`-a`/`-o`/`!`/`(...)` combining
+//! unary file-test and binary comparison operators, arbitrary operand
+//! counts depending on which operator is in play, `[` additionally
+//! requiring a trailing `]`). clap parses "which flags were passed," not
+//! "evaluate this expression tree": there's no flag surface here for it
+//! to take over, the same way there's none for `printf`'s format-string
+//! interpreter or `getopts`'s option-matching loop. This extends to
+//! `--help` too: `test --help`/`[ --help ]` don't show help, they
+//! evaluate `--help` as an ordinary (truthy, non-empty) string operand
+//! and exit 0, the same as `test`/`[` with any other single non-empty
+//! argument.
+
 use std::os::unix::fs::FileTypeExt;
 
 use anyhow::{Result, bail};

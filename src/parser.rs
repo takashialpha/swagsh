@@ -67,7 +67,19 @@ struct Spanned {
 pub struct Parser {
     tokens: Vec<Spanned>,
     pos: usize,
+    /// Current `parse_command` nesting depth; see `MAX_PARSE_DEPTH`.
+    depth: usize,
 }
+
+/// Every level of nested compound command (`{ }`, `( )`, `if`/`while`/...)
+/// recurses through `parse_command` exactly once, so bounding this bounds
+/// the whole parse_command -> parse_pipeline -> parse_and_or -> parse_list
+/// -> parse_command cycle (found unbounded by fuzzing, see fuzz/README.md:
+/// a few hundred levels of `{ }` nesting overflowed the native stack).
+/// A power of two, both well below the observed crash point (a few
+/// hundred levels) and far deeper than any script would plausibly nest by
+/// hand.
+const MAX_PARSE_DEPTH: usize = 256;
 
 impl Parser {
     pub fn new(src: &str) -> ParseResult<Self> {
@@ -90,7 +102,11 @@ impl Parser {
             }
         }
 
-        Ok(Self { tokens, pos: 0 })
+        Ok(Self {
+            tokens,
+            pos: 0,
+            depth: 0,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -283,7 +299,24 @@ impl Parser {
     // Command  ::=  CompoundCommand | FunctionDef | SimpleCommand
     // ------------------------------------------------------------------
 
+    // Depth-limited wrapper around the real parser below: see
+    // `MAX_PARSE_DEPTH`. Found by fuzzing `parser::parse` (see
+    // fuzz/README.md) as an uncontrolled stack-overflow crash on deeply
+    // nested compound commands; not a memory-safety bug like the UTF-8
+    // escape bug that same fuzzing pass found and fixed elsewhere, just an
+    // uncontrolled crash on adversarial/pathological input.
     fn parse_command(&mut self) -> ParseResult<Command> {
+        self.depth += 1;
+        let result = if self.depth > MAX_PARSE_DEPTH {
+            Err(self.err("too deeply nested"))
+        } else {
+            self.parse_command_inner()
+        };
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_command_inner(&mut self) -> ParseResult<Command> {
         match self.peek() {
             Token::If => self.parse_if(),
             Token::For => self.parse_for(),
@@ -316,17 +349,31 @@ impl Parser {
         let mut redirects = Vec::new();
 
         loop {
-            match self.peek() {
-                Token::Word(_) => {
-                    if let Token::Word(w) = self.advance().clone() {
-                        words.push(self.parse_word_str(&w)?);
-                    }
-                }
-                Token::Redir(_) | Token::HereString(_) | Token::HereDoc { .. } => {
-                    redirects.push(self.parse_redirect()?);
-                }
-                _ => break,
+            if let Token::Word(w) = self.peek().clone() {
+                self.advance();
+                words.push(self.parse_word_str(&w)?);
+                continue;
             }
+            if matches!(
+                self.peek(),
+                Token::Redir(_) | Token::HereString(_) | Token::HereDoc { .. }
+            ) {
+                redirects.push(self.parse_redirect()?);
+                continue;
+            }
+            // A reserved word is only reserved as a command's *first*
+            // word; past that it's just text like any other argument
+            // (`echo done` prints `done`, it doesn't need a loop to
+            // close). `words` non-empty is exactly "not the first word."
+            if !words.is_empty()
+                && let Some(text) = keyword_text(self.peek())
+            {
+                let text = text.to_owned();
+                self.advance();
+                words.push(self.parse_word_str(&text)?);
+                continue;
+            }
+            break;
         }
 
         if words.is_empty() && redirects.is_empty() {
@@ -374,6 +421,12 @@ impl Parser {
                         self.advance();
                         word
                     }
+                    ref tok if keyword_text(tok).is_some() => {
+                        let text = keyword_text(tok).unwrap().to_owned();
+                        let word = self.parse_word_str(&text)?;
+                        self.advance();
+                        word
+                    }
                     _ => return Err(self.err("expected filename after redirection")),
                 };
 
@@ -404,7 +457,11 @@ impl Parser {
             Token::HereString(s) => Ok(Redirect {
                 kind: RedirectKind::HereString,
                 fd: 0,
-                target: Word::Literal(s),
+                // `<<<`'s operand is an ordinary word (quote removal,
+                // parameter/command substitution, ...), not a heredoc body:
+                // `parse_word_str` is what every other redirect target
+                // above already goes through for exactly that reason.
+                target: self.parse_word_str(&s)?,
             }),
 
             other => Err(self.err(format!("expected redirection, got `{other}`"))),
@@ -469,6 +526,41 @@ fn parse_dollar(
             Ok(Some(Word::Var(var)))
         }
     }
+}
+
+/// The word each reserved-word `Token` variant was lexed from: the text to
+/// fall back to at a grammar position that expects a plain word (a
+/// command's 2nd+ word, a case pattern, a `for` loop's variable, a case
+/// subject, a redirection target) but got a reserved-word token instead.
+///
+/// The lexer recognizes reserved words unconditionally, with no notion of
+/// where commands start and end, since it tokenizes one character at a
+/// time with no lookback. That's *right* for the position that actually
+/// matters, the first word of a new command (`if`/`while`/`done`/... need
+/// to be reserved there, unconditionally, for the grammar to work at all),
+/// but wrong everywhere else: `echo done` should print `done`, not fail to
+/// parse, and `case $x in done) ...` needs `done` as a pattern. Each call
+/// site above already knows from its own grammatical position that a
+/// reserved-word token here can only mean the plain text it was lexed
+/// from, so they fall back to it via this function instead of erroring.
+fn keyword_text(tok: &Token) -> Option<&'static str> {
+    Some(match tok {
+        Token::If => "if",
+        Token::Then => "then",
+        Token::Else => "else",
+        Token::Elif => "elif",
+        Token::Fi => "fi",
+        Token::For => "for",
+        Token::In => "in",
+        Token::Do => "do",
+        Token::Done => "done",
+        Token::While => "while",
+        Token::Until => "until",
+        Token::Case => "case",
+        Token::Esac => "esac",
+        Token::Function => "function",
+        _ => return None,
+    })
 }
 
 /// Splits a lexed word buffer into `Word` parts, resolving `$`/backtick

@@ -549,9 +549,23 @@ impl<'src> Lexer<'src> {
                     match self.advance() {
                         None => break,
                         Some(b'\n') => {}
-                        Some(b) => {
+                        Some(b) if b < UTF8_CONT_START => {
                             buf.push('\\');
                             buf.push(b as char);
+                        }
+                        // A multi-byte character right after the escaping
+                        // backslash: `b` is only its *lead* byte, so
+                        // casting it straight to `char` (as the ASCII arm
+                        // above does) would both corrupt the character
+                        // and orphan its continuation byte(s) at the next
+                        // `self.pos`, producing invalid UTF-8 that a later
+                        // `unsafe` `str::from_utf8_unchecked` (`push_utf8`)
+                        // would then read as if it were valid. Route
+                        // through `push_utf8` instead, which consumes the
+                        // rest of the sequence properly.
+                        Some(_) => {
+                            buf.push('\\');
+                            self.push_utf8(buf, self.pos - 1);
                         }
                     }
                 }
