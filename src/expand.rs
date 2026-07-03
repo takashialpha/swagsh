@@ -321,33 +321,60 @@ pub fn parse_param_op(s: &str) -> Option<ParamOp<'_>> {
     None
 }
 
+/// `${var#pat}`/`${var%pat}`-family patterns are ordinary text far more
+/// often than they're an actual glob (`${path%.txt}`, `${url#http://}`,
+/// ...): `*`/`?` are `glob_match`'s only metacharacters (no bracket-
+/// expression support, see its own doc comment), so their absence means
+/// `pat` can only ever match at one specific length, greedy or not, and
+/// `strip_prefix`/`strip_suffix` below use this to skip the candidate
+/// search entirely in that case.
+fn has_glob_meta(pat: &str) -> bool {
+    pat.contains(['*', '?'])
+}
+
+/// Byte offsets of every char boundary in `s`, including its end: the
+/// candidate split points `strip_prefix`/`strip_suffix`'s glob-pattern
+/// path below tries, one per loop iteration.
+fn char_boundaries(s: &str) -> impl DoubleEndedIterator<Item = usize> {
+    s.char_indices().map(|(i, _)| i).chain([s.len()])
+}
+
 pub fn strip_prefix(val: &str, pat: &str, greedy: bool) -> String {
-    let chars: Vec<char> = val.chars().collect();
-    let range: Box<dyn Iterator<Item = usize>> = if greedy {
-        Box::new((0..=chars.len()).rev())
+    if !has_glob_meta(pat) {
+        return val.strip_prefix(pat).unwrap_or(val).to_owned();
+    }
+    // Slices of the original `val`, not a `Vec<char>` collected fresh
+    // (and re-collected into a new `String` per candidate): the length
+    // being tried changes every iteration, but the text underneath it
+    // never does, so there's nothing to copy until an actual match is
+    // found.
+    let boundaries: Vec<usize> = char_boundaries(val).collect();
+    let candidates: Box<dyn Iterator<Item = &usize>> = if greedy {
+        Box::new(boundaries.iter().rev())
     } else {
-        Box::new(0..=chars.len())
+        Box::new(boundaries.iter())
     };
-    for len in range {
-        let prefix: String = chars[..len].iter().collect();
-        if glob_match(pat, &prefix) {
-            return chars[len..].iter().collect();
+    for &len in candidates {
+        if glob_match(pat, &val[..len]) {
+            return val[len..].to_owned();
         }
     }
     val.to_owned()
 }
 
 pub fn strip_suffix(val: &str, pat: &str, greedy: bool) -> String {
-    let chars: Vec<char> = val.chars().collect();
-    let range: Box<dyn Iterator<Item = usize>> = if greedy {
-        Box::new(0..=chars.len())
+    if !has_glob_meta(pat) {
+        return val.strip_suffix(pat).unwrap_or(val).to_owned();
+    }
+    let boundaries: Vec<usize> = char_boundaries(val).collect();
+    let candidates: Box<dyn Iterator<Item = &usize>> = if greedy {
+        Box::new(boundaries.iter())
     } else {
-        Box::new((0..=chars.len()).rev())
+        Box::new(boundaries.iter().rev())
     };
-    for start in range {
-        let suffix: String = chars[start..].iter().collect();
-        if glob_match(pat, &suffix) {
-            return chars[..start].iter().collect();
+    for &start in candidates {
+        if glob_match(pat, &val[start..]) {
+            return val[..start].to_owned();
         }
     }
     val.to_owned()

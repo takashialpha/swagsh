@@ -116,7 +116,7 @@ pub struct FunctionDef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupCmd {
     pub body: Vec<AndOrList>,
-    /// `true` → subshell `( )`, `false` → brace group `{ }`.
+    /// `true`: subshell `( )`; `false`: brace group `{ }`.
     pub subshell: bool,
 }
 

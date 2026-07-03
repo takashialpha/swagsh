@@ -59,7 +59,7 @@ impl Parser {
         let items = if self.eat(&Token::In) {
             let mut words = Vec::new();
             while let Token::Word(w) = self.peek().clone() {
-                let word = self.parse_word_str(&w)?;
+                let word = self.parse_word_str(w)?;
                 self.advance();
                 words.push(word);
             }
@@ -100,7 +100,7 @@ impl Parser {
             other if keyword_text(&other).is_some() => keyword_text(&other).unwrap().to_owned(),
             other => return Err(self.err(format!("expected word after `case`, got `{other}`"))),
         };
-        let word = self.parse_word_str(&word_raw)?;
+        let word = self.parse_word_str(word_raw)?;
 
         self.skip_newlines();
         self.expect(&Token::In)?;
@@ -118,14 +118,14 @@ impl Parser {
             let mut patterns = Vec::new();
             loop {
                 match self.advance().clone() {
-                    Token::Word(p) => patterns.push(self.parse_word_str(&p)?),
+                    Token::Word(p) => patterns.push(self.parse_word_str(p)?),
                     // A case pattern is always plain text, never a
                     // reserved word, regardless of what precedes it
                     // (`in`, `;;`, `|` all precede a pattern here):
                     // `case $x in done) ...` is completely standard.
                     other if keyword_text(&other).is_some() => {
                         let text = keyword_text(&other).unwrap().to_owned();
-                        patterns.push(self.parse_word_str(&text)?);
+                        patterns.push(self.parse_word_str(text)?);
                     }
                     other => {
                         return Err(

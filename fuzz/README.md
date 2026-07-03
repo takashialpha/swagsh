@@ -76,3 +76,7 @@ One consequence worth knowing: **`cargo clean` at the repo root does not
 free the space `fuzz/target` uses.** Run `cargo clean` from inside `fuzz/`
 (or `cargo clean --manifest-path fuzz/Cargo.toml` from the root) to reclaim
 that separately; it can get large (sanitizer builds are not small).
+
+That still only clears `target/`, though: `corpus/`, `artifacts/`, and
+`coverage/` are cargo-fuzz's own accumulation, not cargo's, and outlive
+any `cargo clean`. `./clean.sh` clears all four in one go.

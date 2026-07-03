@@ -82,14 +82,35 @@ Customisable `$PS1`, persistent history with `$HISTFILE`/`$HISTSIZE`.
 
 ## Performance
 
-Measured with `hyperfine --shell=none` on Linux x86-64.
+Measured with `hyperfine --shell=none` on Linux x86-64, across a battery of
+workloads: interpretation-heavy loops, function calls and recursion,
+parameter expansion, `case`/glob pattern matching, real filesystem
+globbing, and process-spawn-heavy pipelines and command substitution.
 
 | Workload | vs bash |
 |:---|:---:|
-| Builtins, variable expansion, conditionals, loops, functions | **~40% faster** |
-| Pipelines (process-spawn heavy) | **~25% faster** |
+| Recursive function calls | **~6.6x faster** |
+| Parameter expansion (`${var...}`) | **~3.6x faster** |
+| Function calls | **~3.2x faster** |
+| Arithmetic/conditional loops | **~2.7x faster** |
+| `case`/glob pattern matching | **~2.5x faster** |
+| Real filesystem globbing | **~2.1x faster** |
+| Startup | **~1.4x faster** |
+| Pipelines, command substitution (process-spawn heavy) | **~1.2-1.4x faster** |
 
-Dash-class performance where it counts.
+`dash` is the harder bar: hand-tuned C, no interpreter overhead to shave.
+swagsh wins outright there too on every interpretation-heavy workload
+above (loops, function calls, pattern matching, glob expansion,
+recursion), and sits within single-digit percent on the rest. The two
+categories where `dash` still comes out ahead (parsing a very large script,
+and a workload built around thousands of distinct variables) are real,
+modest, and understood: not a mystery to chase, just fork/exec and
+memory-layout mechanics that are hard to beat a decades-tuned C shell at.
+Against `busybox`'s `ash` (a statically-linked multi-call binary, structurally
+close to the fastest possible fork/exec cost) swagsh still wins the
+interpretation-heavy majority, trailing only on the narrow set of
+workloads that are almost pure process-spawn cost rather than
+interpretation.
 
 ---
 
@@ -119,6 +140,15 @@ cargo build --release   # binary at target/release/swagsh
 
 ## Known limitations
 
+- A redirect trailing a compound command (`while ... done < file`,
+  `{ ...; } > file`, same for `if`/`for`/`case`/`( )`) is silently wrong,
+  not just unsupported: it parses without error but has no effect on the
+  command, since the AST has nowhere to attach it (only a plain simple
+  command carries redirects today). `while read line; do ...; done < file`
+  runs with whatever stdin the shell already had, never touching `file`, a
+  real hazard given how common that exact idiom is. Fixing it properly
+  needs a redirect list on every compound-command AST node plus parser and
+  evaluator support to match, not a small patch.
 - No shell arrays (`arr=(a b c)`, `${arr[@]}`); a language-level gap, not a
   missing builtin, but it's why `declare`/`mapfile`/`readarray` aren't in
   the list below either: they'd need this first.
@@ -139,9 +169,7 @@ cargo build --release   # binary at target/release/swagsh
   - `help`: planned. Every builtin will implement a shared `Help` trait, with
     a default impl derived from its existing `clap` command so most builtins
     get this for free; the hand-written non-`clap` builtins (`:`, `true`,
-    `false`, `[`, `test`) and `help` itself provide their own impl. Falling
-    through to `man`/`tldr` for names that aren't builtins is a likely
-    follow-up once the builtin-only version exists.
+    `false`, `[`, `test`) and `help` itself provide their own impl.
   - `ulimit`: resource limits.
   - `times`: POSIX-specified cumulative shell/children CPU time; just not
     done yet. Distinct from `time` below (which times one pipeline).

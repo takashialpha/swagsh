@@ -314,7 +314,7 @@ impl Shell {
         match unsafe { kernel_fork()? } {
             Fork::Child(_) => {
                 // SAFETY: in child, before any allocations.
-                unsafe { restore_child_signals() };
+                unsafe { restore_child_signals(self.interactive) };
                 close_raw(read_fd);
                 let _ = dup2_raw(write_fd, 1);
                 close_raw(write_fd);

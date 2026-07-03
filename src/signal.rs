@@ -57,16 +57,29 @@ pub fn sig_dfl_action() -> KernelSigaction {
 
 /// Restore default signal dispositions and unblock all signals in a forked child.
 ///
+/// `interactive` gates `TTOU`/`TTIN`/`TSTP`/`INT`: `Shell::new` only ever
+/// moves those away from their default disposition in the first place when
+/// `interactive` is true (see its own `if interactive { ... }` block), so
+/// resetting them in a non-interactive shell's children is resetting
+/// something that was never touched. That's not wrong, just 4 wasted
+/// `rt_sigaction` calls per fork; found via `strace -c` on a command-
+/// substitution-heavy benchmark, where they were a measurable share of
+/// every fork's cost. `PIPE` (see `reset_sigpipe`'s own doc comment for
+/// why it matters even non-interactively) and the mask reset stay
+/// unconditional.
+///
 /// # Safety
 /// Must only be called immediately after `fork`, in the child process, before
 /// any allocator or async-signal-unsafe code runs.
 #[inline]
-pub unsafe fn restore_child_signals() {
+pub unsafe fn restore_child_signals(interactive: bool) {
     let dfl = sig_dfl_action();
-    let _ = unsafe { kernel_sigaction(Signal::TTOU, Some(dfl.clone())) };
-    let _ = unsafe { kernel_sigaction(Signal::TTIN, Some(dfl.clone())) };
-    let _ = unsafe { kernel_sigaction(Signal::TSTP, Some(dfl.clone())) };
-    let _ = unsafe { kernel_sigaction(Signal::INT, Some(dfl.clone())) };
+    if interactive {
+        let _ = unsafe { kernel_sigaction(Signal::TTOU, Some(dfl.clone())) };
+        let _ = unsafe { kernel_sigaction(Signal::TTIN, Some(dfl.clone())) };
+        let _ = unsafe { kernel_sigaction(Signal::TSTP, Some(dfl.clone())) };
+        let _ = unsafe { kernel_sigaction(Signal::INT, Some(dfl.clone())) };
+    }
     let _ = unsafe { kernel_sigaction(Signal::QUIT, Some(dfl.clone())) };
     let _ = unsafe { kernel_sigaction(Signal::PIPE, Some(dfl)) };
     let _ = unsafe { kernel_sigprocmask(How::SETMASK, Some(&KernelSigSet::empty())) };

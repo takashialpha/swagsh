@@ -11,6 +11,7 @@ repository = "https://github.com/takashialpha/swagsh"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 rustyline = "18"
+rustc-hash = "2"
 rustix = { version = "1", features = [
   "fs",
   "pipe",

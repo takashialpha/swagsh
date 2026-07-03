@@ -131,7 +131,7 @@ impl Shell {
         match unsafe { kernel_fork()? } {
             Fork::Child(_) => {
                 // SAFETY: in child, before any allocations.
-                unsafe { restore_child_signals() };
+                unsafe { restore_child_signals(self.interactive) };
                 let my_pid = getpid();
                 let group = pgid.unwrap_or(my_pid);
                 let _ = setpgid(Some(my_pid), Some(group));
@@ -241,7 +241,7 @@ impl Shell {
         match unsafe { kernel_fork()? } {
             Fork::Child(_) => {
                 // SAFETY: in child, before any allocations.
-                unsafe { restore_child_signals() };
+                unsafe { restore_child_signals(self.interactive) };
                 if self.interactive {
                     let my_pid = getpid();
                     let _ = setpgid(Some(my_pid), Some(my_pid));

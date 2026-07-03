@@ -206,7 +206,7 @@ impl Shell {
             match unsafe { kernel_fork()? } {
                 Fork::Child(_) => {
                     // SAFETY: in child, before any allocations.
-                    unsafe { restore_child_signals() };
+                    unsafe { restore_child_signals(self.interactive) };
                     let status = match self.run_list(&gc.body) {
                         Ok(s) => s,
                         Err(e) => {

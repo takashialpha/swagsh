@@ -1,5 +1,22 @@
-use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+
+// `rustc-hash`, not `std::collections::HashMap`'s default `SipHash`:
+// `SipHash`'s whole point is DoS-resistance against an attacker who
+// controls the keys going into a hash table this process doesn't fully
+// trust, e.g. a network service hashing request headers. A shell's own
+// variable table has no such adversary: whoever can set enough variables
+// to try to degrade this table already has arbitrary code execution in
+// the shell, so there's nothing to defend against and no reason to pay
+// for it. Benchmarked head-to-head against `ahash` and `foldhash` (both
+// also DoS-resistant-by-default, also candidates for this exact reason);
+// all three perform identically for the short, ordinary keys these tables
+// hold (variable/function/alias names), so the deciding factor is
+// implementation weight: `rustc-hash` is what it sounds like, rustc's own
+// hasher for compiler-internal symbol tables (the same shape of problem
+// as this one), a couple hundred lines, no `unsafe`, no runtime feature
+// detection, no per-process random seed to generate. `Env::get`/`set` sit
+// on every variable read and write, so this is a genuinely hot path.
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::ast::Command;
 
@@ -16,8 +33,8 @@ impl Env {
     pub fn from_process() -> Self {
         let raw: Vec<(String, String)> = std::env::vars().collect();
         let cap = raw.len() + 8;
-        let mut vars = HashMap::with_capacity(cap);
-        let mut exported = HashSet::with_capacity(cap);
+        let mut vars = HashMap::with_capacity_and_hasher(cap, Default::default());
+        let mut exported = HashSet::with_capacity_and_hasher(cap, Default::default());
         for (k, v) in raw {
             exported.insert(k.clone());
             vars.insert(k, v);
@@ -39,8 +56,8 @@ impl Env {
         Self {
             vars,
             exported,
-            functions: HashMap::new(),
-            aliases: HashMap::new(),
+            functions: HashMap::default(),
+            aliases: HashMap::default(),
             positional: Vec::new(),
         }
     }
