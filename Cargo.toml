@@ -6,6 +6,8 @@ description = "A fast, minimal, modern Linux shell. Named after swag, slang for 
 authors = ["takashialpha <takashialpha@protonmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/takashialpha/swagsh"
+keywords = ["shell", "cli", "linux", "terminal"]
+categories = ["command-line-utilities", "os::linux-apis"]
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
