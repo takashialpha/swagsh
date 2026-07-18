@@ -70,7 +70,7 @@ impl Builtin for TypeBuiltin {
             }
             for kind in kinds {
                 match kind {
-                    Kind::Builtin if self.path_only => {}
+                    Kind::Builtin | Kind::Function if self.path_only => {}
                     Kind::Builtin if self.type_only => {
                         println!("builtin");
                         printed_any = true;
@@ -79,7 +79,6 @@ impl Builtin for TypeBuiltin {
                         println!("{name} is a shell builtin");
                         printed_any = true;
                     }
-                    Kind::Function if self.path_only => {}
                     Kind::Function if self.type_only => {
                         println!("function");
                         printed_any = true;
@@ -146,7 +145,7 @@ impl Builtin for CommandBuiltin {
         };
 
         if self.print_word || self.print_verbose {
-            return describe_command(shell, name, self.print_verbose);
+            return Ok(describe_command(shell, name, self.print_verbose));
         }
 
         // Bypassing function lookup is the entire point of `command`: a
@@ -181,12 +180,12 @@ impl Builtin for CommandBuiltin {
 /// `command -v`/`-V`: unlike `type`, only the first match is ever reported
 /// (no `-a`), and `-v`'s output is a bare word rather than `type`'s "NAME
 /// is ..." sentence.
-fn describe_command(shell: &mut Shell, name: &str, verbose: bool) -> Result<ExitStatus> {
+fn describe_command(shell: &mut Shell, name: &str, verbose: bool) -> ExitStatus {
     let Some(kind) = classify(name, &shell.env).into_iter().next() else {
         if verbose {
             emit(format!("command: {name}: not found"));
         }
-        return Ok(ExitStatus::FAILURE);
+        return ExitStatus::FAILURE;
     };
     if verbose {
         match kind {
@@ -201,7 +200,7 @@ fn describe_command(shell: &mut Shell, name: &str, verbose: bool) -> Result<Exit
         }
     }
     shell.note_stdout("\n");
-    Ok(ExitStatus::SUCCESS)
+    ExitStatus::SUCCESS
 }
 
 fn find_in_path(name: &str, env: &Env) -> Option<String> {

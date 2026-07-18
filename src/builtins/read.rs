@@ -30,7 +30,7 @@ impl EchoGuard {
     /// real terminal), as opposed to being a no-op because stdin is piped:
     /// the caller only owes the user a compensating newline in the former
     /// case, since piped input was never echoed in the first place.
-    fn is_active(&self) -> bool {
+    const fn is_active(&self) -> bool {
         self.0.is_some()
     }
 }
@@ -53,6 +53,10 @@ impl Drop for EchoGuard {
 /// Returns the bytes read and whether `delim` was actually seen (`false`
 /// means EOF cut the read short, the caller's cue to report failure while
 /// still assigning whatever partial data came through).
+// False positive: every path through the loop below is a `return`
+// immediately after `stdin`'s last use, so there's no unnecessary
+// contention window for `drop(stdin)` to shorten.
+#[allow(clippy::significant_drop_tightening)]
 fn read_until_delim(delim: u8, raw: bool) -> std::io::Result<(Vec<u8>, bool)> {
     let mut stdin = std::io::stdin().lock();
     let mut out = Vec::new();

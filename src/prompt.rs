@@ -10,6 +10,7 @@ const GREEN: &str = "\x01\x1b[1;32m\x02";
 const RED: &str = "\x01\x1b[1;31m\x02";
 const RESET: &str = "\x01\x1b[0m\x02";
 
+#[must_use]
 pub fn build_prompt(shell: &Shell) -> String {
     let ps1 = shell.env.get("PS1").unwrap_or_default();
     if !ps1.is_empty() {
@@ -92,6 +93,7 @@ pub fn current_dir_display(env: &Env) -> String {
     }
 }
 
+#[must_use]
 pub fn history_file(env: &Env) -> Option<std::path::PathBuf> {
     if let Some(raw) = env.get("HISTFILE") {
         if raw.is_empty() {

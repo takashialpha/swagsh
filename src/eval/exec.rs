@@ -17,6 +17,9 @@ use crate::signal::restore_child_signals;
 use super::{Resolved, Shell, catch_return, is_break, is_continue, is_return};
 
 impl Shell {
+    /// # Errors
+    ///
+    /// Returns an error if forking or waiting for any stage fails.
     pub fn run_pipeline(&mut self, pipeline: &Pipeline) -> Result<ExitStatus> {
         let n = pipeline.commands.len();
 
@@ -63,6 +66,9 @@ impl Shell {
         Ok(last_status)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if forking any stage fails.
     pub fn run_pipeline_async(&mut self, pipeline: &Pipeline) -> Result<ExitStatus> {
         let label = describe_pipeline(pipeline);
         let (pgid, pids) = self.spawn_pipeline(pipeline)?;
@@ -117,7 +123,10 @@ impl Shell {
             prev_read = pipe_read;
         }
 
-        Ok((pgid.unwrap(), pids))
+        let Some(pgid) = pgid else {
+            bail!("internal error: spawn_pipeline called with an empty pipeline");
+        };
+        Ok((pgid, pids))
     }
 
     fn fork_command(
@@ -216,7 +225,7 @@ impl Shell {
                 }
             }
             Resolved::External(words) => match Self::do_exec(&words) {
-                Ok(_) => unreachable!(),
+                Ok(never) => match never {},
                 Err(e) => {
                     emit(e);
                     127
@@ -231,6 +240,10 @@ impl Shell {
     /// command, without duplicating it: `command` deliberately skips
     /// *function* lookup but still needs the exact same spawn/wait/
     /// foreground-pgid handling as an ordinary external command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if forking or waiting for the child fails.
     pub fn run_external(
         &mut self,
         sc: &SimpleCmd,
@@ -255,7 +268,7 @@ impl Shell {
                     std::process::exit(1);
                 }
                 match Self::do_exec(words) {
-                    Ok(_) => unreachable!(),
+                    Ok(never) => match never {},
                     Err(e) => {
                         emit(e);
                         std::process::exit(127);
@@ -287,6 +300,10 @@ impl Shell {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error (never returns `Ok`) if `words` is empty or `execvp`
+    /// fails to replace the process image.
     pub fn do_exec(words: &[String]) -> Result<std::convert::Infallible> {
         if words.is_empty() {
             bail!("exec: no command");
@@ -342,12 +359,12 @@ impl Shell {
             (None, false) => None,
         };
 
-        let argv: Vec<CString> = words
+        let exec_argv: Vec<CString> = words
             .iter()
             .map(|w| CString::new(w.as_str()))
             .collect::<Result<_, _>>()?;
         let display_cstring = display_name.map(CString::new).transpose()?;
-        let errno = execvp_path(&argv, display_cstring.as_ref(), parsed.clear_env);
+        let errno = execvp_path(&exec_argv, display_cstring.as_ref(), parsed.clear_env);
         emit(format!("exec: {}: {}", words[0], strerror(errno)));
         // A non-interactive shell exits outright when `exec`'s COMMAND
         // can't be run (no `execfail` option here to opt out of that).
@@ -357,6 +374,9 @@ impl Shell {
         Ok(ExitStatus(127))
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying `waitpid` syscall fails.
     pub fn wait_for_pid(&mut self, pid: Pid) -> Result<ExitStatus> {
         loop {
             match waitpid(Some(pid), WaitOptions::UNTRACED) {

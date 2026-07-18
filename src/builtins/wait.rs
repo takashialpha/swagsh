@@ -28,17 +28,16 @@ fn find_job_by_pid_or_spec(shell: &Shell, spec: &str) -> Option<usize> {
 /// Blocks until job `id` terminates (or returns immediately if it already
 /// has, per `reap_nonblocking`), removing it from the job table either way.
 fn wait_one(shell: &mut Shell, id: usize) -> Option<ExitStatus> {
-    let (pgid, already_done) = {
+    let (pgid, done_status) = {
         let job = shell.jobs.iter().find(|j| j.id == id)?;
-        (job.pgid, matches!(job.state, JobState::Done(_)))
-    };
-    let status = if already_done {
-        match shell.jobs.iter().find(|j| j.id == id)?.state {
-            JobState::Done(s) => s,
-            JobState::Running | JobState::Stopped => unreachable!("checked above"),
+        match job.state {
+            JobState::Done(s) => (job.pgid, Some(s)),
+            JobState::Running | JobState::Stopped => (job.pgid, None),
         }
-    } else {
-        shell.wait_for_pid(pgid).ok()?
+    };
+    let status = match done_status {
+        Some(s) => s,
+        None => shell.wait_for_pid(pgid).ok()?,
     };
     shell.jobs.remove(id);
     Some(status)
@@ -75,12 +74,11 @@ impl Builtin for WaitBuiltin {
             targets.extend(shell.jobs.iter().map(|j| j.id));
         } else {
             for spec in &self.ids {
-                match find_job_by_pid_or_spec(shell, spec) {
-                    Some(id) => targets.push(id),
-                    None => {
-                        emit(format!("wait: pid {spec} is not a child of this shell"));
-                        return Ok(ExitStatus(127));
-                    }
+                if let Some(id) = find_job_by_pid_or_spec(shell, spec) {
+                    targets.push(id);
+                } else {
+                    emit(format!("wait: pid {spec} is not a child of this shell"));
+                    return Ok(ExitStatus(127));
                 }
             }
         }

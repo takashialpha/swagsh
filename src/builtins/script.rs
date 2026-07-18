@@ -1,11 +1,13 @@
 //! Dynamic-execution builtins: `eval` (parse and run a string in the
 //! current shell), `exec` (replace the shell's own process image), and
-//! `source`/`.` (run a file's commands in the current shell). Grouped
+//! `source`/`.` (run a file's commands in the current shell).
+//!
+//! Grouped
 //! separately from `flow.rs`'s loop/function control-flow signals since
 //! this is a different concern: each of these runs *new* code rather than
 //! altering control flow through code already running.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Parser;
 
 use crate::errfmt::strerror;
@@ -16,7 +18,9 @@ use super::Builtin;
 
 /// `eval` has no real flags of its own (just `eval [arg ...]`), but still
 /// goes through clap for the same reasons every other flagless-but-variadic
-/// builtin does: uniform `--help` (confirmed `eval --help` should show this
+/// builtin does.
+///
+/// Uniform `--help` (confirmed `eval --help` should show this
 /// exact text, not try to run `--help` as a command), and uniform
 /// bad-argument handling. `allow_hyphen_values` +
 /// `trailing_var_arg` keep a `-`-led word (`eval "echo -n hi"` has none,
@@ -45,7 +49,9 @@ impl Builtin for EvalBuiltin {
 }
 
 /// `exec`'s flags, parsed via `cli::parse_args` directly rather than the
-/// usual `Builtin`/`dispatch` path: a bare `exec` (no COMMAND) needs its
+/// usual `Builtin`/`dispatch` path.
+///
+/// A bare `exec` (no COMMAND) needs its
 /// redirects applied *permanently* to the current shell rather than scoped
 /// to a single call the way every other builtin's redirects are, which only
 /// `Shell::run_exec_builtin` (in `eval/exec.rs`, where `apply_redirects`
@@ -76,11 +82,18 @@ pub struct ExecBuiltin {
     pub command_and_args: Vec<String>,
 }
 
-/// Placeholder for the `BUILTINS` table: `eval::Shell::run_builtin`
+/// Placeholder for the `BUILTINS` table.
+///
+/// `eval::Shell::run_builtin`
 /// special-cases the name `"exec"` before ever calling the resolved
 /// `BuiltinFn`, so this never actually runs (see `ExecBuiltin`'s doc comment).
+/// Returns an error rather than panicking if that invariant is ever broken.
+///
+/// # Errors
+///
+/// Always returns an error: this placeholder is never meant to run.
 pub fn builtin_exec_unreachable(_: &mut Shell, _: &[&str]) -> Result<ExitStatus> {
-    unreachable!("exec is special-cased in Shell::run_builtin")
+    bail!("internal error: exec builtin reached without being special-cased")
 }
 
 #[derive(Parser)]

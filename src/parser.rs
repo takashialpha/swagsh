@@ -73,15 +73,20 @@ pub struct Parser {
 
 /// Every level of nested compound command (`{ }`, `( )`, `if`/`while`/...)
 /// recurses through `parse_command` exactly once, so bounding this bounds
-/// the whole parse_command -> parse_pipeline -> parse_and_or -> parse_list
-/// -> parse_command cycle (found unbounded by fuzzing, see fuzz/README.md:
-/// a few hundred levels of `{ }` nesting overflowed the native stack).
+/// the whole `parse_command` -> `parse_pipeline` -> `parse_and_or` ->
+/// `parse_list` -> `parse_command` cycle (found unbounded by fuzzing, see
+/// fuzz/README.md: a few hundred levels of `{ }` nesting overflowed the
+/// native stack).
 /// A power of two, both well below the observed crash point (a few
 /// hundred levels) and far deeper than any script would plausibly nest by
 /// hand.
 const MAX_PARSE_DEPTH: usize = 256;
 
 impl Parser {
+    /// # Errors
+    ///
+    /// Returns an error if `src` contains a lex error (e.g. an unterminated
+    /// quote or substitution).
     pub fn new(src: &str) -> ParseResult<Self> {
         use crate::lexer::Lexer;
 
@@ -185,6 +190,9 @@ impl Parser {
     // Top-level entry point
     // ------------------------------------------------------------------
 
+    /// # Errors
+    ///
+    /// Returns an error if the token stream doesn't form a valid program.
     pub fn parse(mut self) -> ParseResult<Program> {
         let body = self.parse_list()?;
         if *self.peek() != Token::Eof {
@@ -427,12 +435,13 @@ impl Parser {
             return Ok(Word::Literal(raw));
         }
 
-        let parts = decompose_word(&raw, self, false)?;
-        if parts.len() == 1 {
-            Ok(parts.into_iter().next().unwrap())
-        } else {
-            Ok(Word::Compound(parts))
+        let mut parts = decompose_word(&raw, self, false)?;
+        if parts.len() == 1
+            && let Some(part) = parts.pop()
+        {
+            return Ok(part);
         }
+        Ok(Word::Compound(parts))
     }
 
     // ------------------------------------------------------------------
@@ -449,9 +458,8 @@ impl Parser {
                         self.advance();
                         word
                     }
-                    ref tok if keyword_text(tok).is_some() => {
-                        let text = keyword_text(tok).unwrap().to_owned();
-                        let word = self.parse_word_str(text)?;
+                    ref tok if let Some(text) = keyword_text(tok) => {
+                        let word = self.parse_word_str(text.to_owned())?;
                         self.advance();
                         word
                     }
@@ -534,10 +542,14 @@ fn parse_dollar(
             let mut var = String::new();
             match chars.peek().map(|(_, c)| *c) {
                 Some('@' | '*' | '#' | '?' | '-' | '$' | '!') => {
-                    var.push(chars.next().unwrap().1);
+                    if let Some((_, c)) = chars.next() {
+                        var.push(c);
+                    }
                 }
                 Some(c) if c.is_ascii_digit() => {
-                    var.push(chars.next().unwrap().1);
+                    if let Some((_, c)) = chars.next() {
+                        var.push(c);
+                    }
                 }
                 Some(c) if c.is_ascii_alphabetic() || c == '_' => {
                     while let Some(&(_, c)) = chars.peek() {
@@ -571,7 +583,7 @@ fn parse_dollar(
 /// site above already knows from its own grammatical position that a
 /// reserved-word token here can only mean the plain text it was lexed
 /// from, so they fall back to it via this function instead of erroring.
-fn keyword_text(tok: &Token) -> Option<&'static str> {
+const fn keyword_text(tok: &Token) -> Option<&'static str> {
     Some(match tok {
         Token::If => "if",
         Token::Then => "then",
@@ -662,9 +674,9 @@ fn decompose_word(raw: &str, parser: &Parser, in_dquotes: bool) -> ParseResult<V
                         _ => inner.push(c),
                     }
                 }
-                let sub_parts = decompose_word(&inner, parser, true)?;
+                let mut sub_parts = decompose_word(&inner, parser, true)?;
                 let inner_word = if sub_parts.len() == 1 {
-                    sub_parts.into_iter().next().unwrap()
+                    sub_parts.pop().map_or(Word::Compound(sub_parts), |w| w)
                 } else {
                     Word::Compound(sub_parts)
                 };
@@ -692,7 +704,11 @@ fn decompose_word(raw: &str, parser: &Parser, in_dquotes: bool) -> ParseResult<V
             }
 
             '\\' if in_dquotes => match chars.peek().map(|&(_, c)| c) {
-                Some('$' | '`' | '"' | '\\') => lit.push(chars.next().unwrap().1),
+                Some('$' | '`' | '"' | '\\') => {
+                    if let Some((_, c)) = chars.next() {
+                        lit.push(c);
+                    }
+                }
                 Some('\n') => {
                     chars.next();
                 }
@@ -754,6 +770,9 @@ fn collect_balanced(
 // Public convenience
 // ---------------------------------------------------------------------------
 
+/// # Errors
+///
+/// Returns an error if `src` fails to lex or parse.
 pub fn parse(src: &str) -> ParseResult<Program> {
     Parser::new(src)?.parse()
 }

@@ -13,6 +13,9 @@ use crate::parser::ParseError;
 use crate::prompt::{build_prompt, history_file};
 use crate::signal::take_interrupted;
 
+/// # Errors
+///
+/// Returns an error if the line editor fails to initialize.
 pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
     let histsize: usize = shell
         .env

@@ -21,11 +21,12 @@ mod expand;
 // Control-flow signals: propagate through the call stack via anyhow::Error.
 // ---------------------------------------------------------------------------
 
-/// The `u32` is how many enclosing loops remain to unwind through: `break 2`
-/// starts as `Break(2)`, and each loop that catches it either absorbs it
-/// (count was 1) or exits and re-raises `Break(count - 1)` to the next loop
-/// out. `continue N` follows the same decrement, except the loop that
-/// finally absorbs it re-runs its condition instead of exiting.
+/// The `u32` is how many enclosing loops remain to unwind through.
+///
+/// `break 2` starts as `Break(2)`, and each loop that catches it either
+/// absorbs it (count was 1) or exits and re-raises `Break(count - 1)` to the
+/// next loop out. `continue N` follows the same decrement, except the loop
+/// that finally absorbs it re-runs its condition instead of exiting.
 #[derive(Debug)]
 pub enum LoopSignal {
     Break(u32),
@@ -55,7 +56,9 @@ impl fmt::Display for ReturnSignal {
 impl std::error::Error for ReturnSignal {}
 
 /// Raised at the top of `run_command` when `SIGINT` has arrived since the
-/// last check (see `signal::take_interrupted`). Unwinds through the same
+/// last check (see `signal::take_interrupted`).
+///
+/// Unwinds through the same
 /// `anyhow::Error` control-flow path as `break`/`continue`/`return` so a
 /// `^C` mid-loop aborts the current top-level command instead of running
 /// forever: there's no forked child for the OS to deliver a fatal default
@@ -72,14 +75,17 @@ impl fmt::Display for Interrupted {
 
 impl std::error::Error for Interrupted {}
 
+#[must_use]
 pub fn is_interrupted(e: &Error) -> bool {
     e.downcast_ref::<Interrupted>().is_some()
 }
 
+#[must_use]
 pub fn is_break(e: &Error) -> bool {
     matches!(e.downcast_ref::<LoopSignal>(), Some(LoopSignal::Break(_)))
 }
 
+#[must_use]
 pub fn is_continue(e: &Error) -> bool {
     matches!(
         e.downcast_ref::<LoopSignal>(),
@@ -87,10 +93,13 @@ pub fn is_continue(e: &Error) -> bool {
     )
 }
 
-/// Levels left to unwind for a caught `break`/`continue`, i.e. the `N` in
-/// `break N`/`continue N` minus however many enclosing loops already passed
-/// it along. Only meaningful once `is_break`/`is_continue` confirmed the
-/// variant, so callers that already checked can safely default to `1`.
+/// Levels left to unwind for a caught `break`/`continue`.
+///
+/// I.e. the `N` in `break N`/`continue N` minus however many enclosing loops
+/// already passed it along. Only meaningful once `is_break`/`is_continue`
+/// confirmed the variant, so callers that already checked can safely
+/// default to `1`.
+#[must_use]
 pub fn loop_signal_level(e: &Error) -> u32 {
     match e.downcast_ref::<LoopSignal>() {
         Some(LoopSignal::Break(n) | LoopSignal::Continue(n)) => *n,
@@ -98,6 +107,7 @@ pub fn loop_signal_level(e: &Error) -> u32 {
     }
 }
 
+#[must_use]
 pub fn is_return(e: &Error) -> bool {
     e.downcast_ref::<ReturnSignal>().is_some()
 }
@@ -107,7 +117,10 @@ pub fn is_return(e: &Error) -> bool {
 /// unwinding past the function that should absorb it.
 fn catch_return(result: Result<ExitStatus>) -> Result<ExitStatus> {
     match result {
-        Err(e) if is_return(&e) => Ok(ExitStatus(e.downcast::<ReturnSignal>().unwrap().0)),
+        Err(e) if is_return(&e) => match e.downcast::<ReturnSignal>() {
+            Ok(sig) => Ok(ExitStatus(sig.0)),
+            Err(e) => Err(e),
+        },
         other => other,
     }
 }
@@ -116,6 +129,11 @@ fn catch_return(result: Result<ExitStatus>) -> Result<ExitStatus> {
 // Shell: the shared execution context.
 // ---------------------------------------------------------------------------
 
+// Each bool is an independently-named, independently-documented piece of
+// shell state (`interactive`, `errexit`, `xtrace`, ...), set one field at a
+// time via `set`/`Shell::new`, never constructed positionally, so there's no
+// risk of the "which bool means what" confusion this lint guards against.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Shell {
     pub env: Env,
     pub jobs: JobTable,
@@ -140,8 +158,8 @@ pub struct Shell {
     /// scoped per function call (see `run_function`). `break`/`continue`
     /// clamp their `N` argument to this so a level exceeding the actual
     /// nesting just unwinds everything instead of escaping as an error, and
-    /// treat `0` as "not in a loop at all" (the "only meaningful in a
-    /// `for', `while', or `until' loop" case).
+    /// treat `0` as "not in a loop at all" (the `"only meaningful in a
+    /// 'for', 'while', or 'until' loop"` case).
     pub loop_depth: u32,
     /// `getopts`'s position within the *current* `$OPTIND` word: how many
     /// of its option characters have already been consumed by prior calls
@@ -174,6 +192,7 @@ pub struct GetoptsState {
 }
 
 impl Shell {
+    #[must_use]
     pub fn new(env: Env, interactive: bool) -> Self {
         let pgid = getpid();
         let mut sane_termios = None;
@@ -247,6 +266,9 @@ impl Shell {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if running any statement in `program` fails.
     pub fn run_program(&mut self, program: &Program) -> Result<ExitStatus> {
         let mut status = ExitStatus::SUCCESS;
         for aol in &program.body {
@@ -255,6 +277,11 @@ impl Shell {
         Ok(status)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if running `cmd` fails, or (via the same
+    /// `anyhow::Error` control-flow path) to propagate `break`/`continue`/
+    /// `return`/an interrupt.
     pub fn run_command(&mut self, cmd: &Command) -> Result<ExitStatus> {
         if self.interactive && take_interrupted() {
             return Err(Error::new(Interrupted));
@@ -304,22 +331,18 @@ impl Shell {
     /// space-joined without re-quoting: simple, not always round-trippable,
     /// but that's the conventional shell `-x` trace format.
     fn print_xtrace(&self, assignments: &[String], resolved: &Resolved) {
-        let mut argv: Vec<&str> = assignments.iter().map(String::as_str).collect();
+        let mut trace: Vec<&str> = assignments.iter().map(String::as_str).collect();
         match resolved {
             Resolved::AssignOnly => {}
-            Resolved::Builtin(_, name, args) => {
-                argv.push(name);
-                argv.extend(args.iter().map(String::as_str));
+            Resolved::Builtin(_, name, args) | Resolved::Function(name, _, args) => {
+                trace.push(name);
+                trace.extend(args.iter().map(String::as_str));
             }
-            Resolved::Function(name, _, args) => {
-                argv.push(name);
-                argv.extend(args.iter().map(String::as_str));
-            }
-            Resolved::External(words) => argv.extend(words.iter().map(String::as_str)),
+            Resolved::External(words) => trace.extend(words.iter().map(String::as_str)),
         }
-        if !argv.is_empty() {
+        if !trace.is_empty() {
             let ps4 = self.env.get("PS4").unwrap_or_else(|| "+ ".to_owned());
-            eprintln!("{ps4}{}", argv.join(" "));
+            eprintln!("{ps4}{}", trace.join(" "));
         }
     }
 
@@ -532,6 +555,7 @@ fn resolve_alias(env: &Env, raw: &str, rest: &[String]) -> (String, Vec<String>)
     )
 }
 
+#[must_use]
 pub fn is_assignment(word: &str) -> bool {
     let Some(eq) = word.find('=') else {
         return false;
@@ -546,9 +570,10 @@ pub fn is_assignment(word: &str) -> bool {
 }
 
 /// Splits a word already validated by `is_assignment` into `(name, value)`.
+/// Falls back to treating the whole word as the name if that invariant is
+/// ever violated, rather than panicking a live shell over an internal bug.
 fn split_assignment(word: &str) -> (&str, &str) {
-    word.split_once('=')
-        .expect("is_assignment guarantees `=` is present")
+    word.split_once('=').unwrap_or((word, ""))
 }
 
 fn is_special_builtin(name: &str) -> bool {

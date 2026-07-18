@@ -29,6 +29,11 @@ pub(super) fn find_job(shell: &Shell, id: usize) -> Option<&Job> {
 
 #[derive(Parser)]
 #[command(name = "jobs", about = "List active jobs")]
+// Each bool is an independent clap-derived CLI flag (`-l`/`-p`/`-r`/`-s`),
+// always constructed by clap from named flags rather than positionally, so
+// there's no risk of the "which bool means what" confusion this lint guards
+// against.
+#[allow(clippy::struct_excessive_bools)]
 pub struct JobsBuiltin {
     /// Also list each job's process group id
     #[arg(short = 'l')]

@@ -133,6 +133,7 @@ pub struct Lexer<'src> {
 }
 
 impl<'src> Lexer<'src> {
+    #[must_use]
     pub const fn new(src: &'src str) -> Self {
         Self {
             src: src.as_bytes(),
@@ -145,6 +146,7 @@ impl<'src> Lexer<'src> {
     /// Current source position: called by the parser before each token advance
     /// to attach accurate span information.
     #[inline]
+    #[must_use]
     pub const fn position(&self) -> (usize, usize) {
         (self.line, self.col)
     }
@@ -213,6 +215,10 @@ impl<'src> Lexer<'src> {
         while matches!(self.peek(), Some(UTF8_CONT_START..=UTF8_CONT_END)) {
             self.advance();
         }
+        // SAFETY: `self.src` is from a valid `&str`, so any run of bytes
+        // starting with a non-continuation byte and followed only by
+        // continuation bytes is a complete, valid UTF-8 scalar; slicing at
+        // these positions is safe.
         buf.push_str(unsafe { std::str::from_utf8_unchecked(&self.src[start..self.pos]) });
     }
 
@@ -481,10 +487,13 @@ impl<'src> Lexer<'src> {
     // Redirection
     // ------------------------------------------------------------------
 
+    /// Callers only ever invoke this with the cursor on `<`, `>`, or an `&`
+    /// that is confirmed (via `peek`/`peek2`) to be followed by `>`; the
+    /// error path below exists only to keep this total rather than panic if
+    /// that invariant is ever violated.
     fn lex_redir(&mut self, fd: Option<u32>) -> Result<Token, LexError> {
-        let first = self.advance().unwrap();
-        let kind = match first {
-            b'>' => {
+        let kind = match self.advance() {
+            Some(b'>') => {
                 if self.peek() == Some(b'>') {
                     self.advance();
                     RedirKind::Append
@@ -495,7 +504,7 @@ impl<'src> Lexer<'src> {
                     RedirKind::Out
                 }
             }
-            b'<' => match self.peek() {
+            Some(b'<') => match self.peek() {
                 Some(b'<') => {
                     self.advance();
                     if self.peek() == Some(b'<') {
@@ -512,15 +521,11 @@ impl<'src> Lexer<'src> {
                 }
                 _ => RedirKind::In,
             },
-            b'&' => {
-                if self.peek() == Some(b'>') {
-                    self.advance();
-                    RedirKind::BothOut
-                } else {
-                    unreachable!("lex_redir called for plain &");
-                }
+            Some(b'&') if self.peek() == Some(b'>') => {
+                self.advance();
+                RedirKind::BothOut
             }
-            _ => unreachable!(),
+            _ => return Err(self.err("internal error: lex_redir called on a non-redirection")),
         };
         Ok(Token::Redir(RedirToken { kind, fd }))
     }
@@ -529,6 +534,10 @@ impl<'src> Lexer<'src> {
     // Word accumulation
     // ------------------------------------------------------------------
 
+    /// # Errors
+    ///
+    /// Returns an error if a quote or substitution inside the word is
+    /// malformed or left unclosed.
     pub fn lex_word_into(&mut self, buf: &mut String) -> Result<(), LexError> {
         loop {
             match self.peek() {
@@ -596,14 +605,18 @@ impl<'src> Lexer<'src> {
                                 Some(
                                     b'@' | b'*' | b'#' | b'?' | b'-' | b'$' | b'!' | b'0'..=b'9',
                                 ) => {
-                                    buf.push(self.advance().unwrap() as char);
+                                    if let Some(b) = self.advance() {
+                                        buf.push(b as char);
+                                    }
                                 }
                                 Some(b'a'..=b'z' | b'A'..=b'Z' | b'_') => {
                                     while matches!(
                                         self.peek(),
                                         Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
                                     ) {
-                                        buf.push(self.advance().unwrap() as char);
+                                        if let Some(b) = self.advance() {
+                                            buf.push(b as char);
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -633,6 +646,10 @@ impl<'src> Lexer<'src> {
     // Public interface
     // ------------------------------------------------------------------
 
+    /// # Errors
+    ///
+    /// Returns an error if the next token is malformed (e.g. an unclosed
+    /// quote, substitution, or here-doc).
     pub fn next_token(&mut self) -> Result<Token, LexError> {
         self.skip_whitespace();
 

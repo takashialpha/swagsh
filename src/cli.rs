@@ -35,6 +35,7 @@ pub struct Cli {
 
 impl Cli {
     /// Returns `(script_path, positional_args)` split from `positionals`.
+    #[must_use]
     pub fn split_positionals(&self) -> (Option<std::path::PathBuf>, Vec<String>) {
         if self.command.is_some() || self.positionals.is_empty() {
             (None, self.positionals.clone())
@@ -47,6 +48,7 @@ impl Cli {
     }
 
     /// True if argv[0] starts with `-`, the convention used by login programs.
+    #[must_use]
     pub fn is_login_shell(argv0: &str) -> bool {
         argv0.starts_with('-')
     }

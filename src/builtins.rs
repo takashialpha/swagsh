@@ -22,12 +22,17 @@ use cli::dispatch;
 pub type BuiltinFn = fn(&mut Shell, &[&str]) -> anyhow::Result<ExitStatus>;
 
 /// The alternative to [`BuiltinFn`] for a builtin whose flags are worth
-/// real parsing: a `clap`-derived struct that carries its own name, flags,
+/// real parsing.
+///
+/// A `clap`-derived struct that carries its own name, flags,
 /// and help text (via `#[command(name = "...")]`/`#[arg(...)]`) and knows
 /// how to run itself. `dispatch::<T>` adapts any `T: Builtin` back into a
 /// plain `BuiltinFn`, so the struct is the entire builtin: no separate
 /// wrapper function to keep in sync with it.
 pub trait Builtin: clap::Parser {
+    /// # Errors
+    ///
+    /// Returns an error if the builtin fails.
     fn run(self, shell: &mut Shell) -> anyhow::Result<ExitStatus>;
 }
 

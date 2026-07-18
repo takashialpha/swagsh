@@ -15,14 +15,16 @@ extern "C" fn handle_sigint(_signum: core::ffi::c_int) {
     INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
-/// The interactive shell's own disposition for `SIGINT`, installed once at
-/// startup (see `Shell::new`) so a `^C` typed while a builtin loop or
-/// function is running (i.e. no forked child to absorb the default
-/// terminate action) sets a flag the interpreter can notice instead of
-/// killing the whole shell. `readline()` calls temporarily swap in their
+/// The interactive shell's own disposition for `SIGINT`.
+///
+/// Installed once at startup (see `Shell::new`) so a `^C` typed while a
+/// builtin loop or function is running (i.e. no forked child to absorb the
+/// default terminate action) sets a flag the interpreter can notice instead
+/// of killing the whole shell. `readline()` calls temporarily swap in their
 /// own `SIGINT` handler for the duration of each call and restore whatever
 /// was active beforehand when they return; since this is installed before
 /// the first such call, that restore always lands back on this handler.
+#[must_use]
 pub fn sig_interrupt_action() -> KernelSigaction {
     KernelSigaction {
         sa_handler_kernel: Some(handle_sigint),
@@ -37,6 +39,7 @@ pub fn take_interrupted() -> bool {
     INTERRUPTED.swap(false, Ordering::SeqCst)
 }
 
+#[must_use]
 pub fn sig_ign_action() -> KernelSigaction {
     KernelSigaction {
         sa_handler_kernel: kernel_sig_ign(),
@@ -46,6 +49,7 @@ pub fn sig_ign_action() -> KernelSigaction {
     }
 }
 
+#[must_use]
 pub fn sig_dfl_action() -> KernelSigaction {
     KernelSigaction {
         sa_handler_kernel: KERNEL_SIG_DFL,
@@ -75,18 +79,28 @@ pub fn sig_dfl_action() -> KernelSigaction {
 pub unsafe fn restore_child_signals(interactive: bool) {
     let dfl = sig_dfl_action();
     if interactive {
+        // SAFETY: see this function's own `# Safety` doc: called only just
+        // after `fork`, in the child, before any async-signal-unsafe code.
         let _ = unsafe { kernel_sigaction(Signal::TTOU, Some(dfl.clone())) };
+        // SAFETY: see this function's own `# Safety` doc.
         let _ = unsafe { kernel_sigaction(Signal::TTIN, Some(dfl.clone())) };
+        // SAFETY: see this function's own `# Safety` doc.
         let _ = unsafe { kernel_sigaction(Signal::TSTP, Some(dfl.clone())) };
+        // SAFETY: see this function's own `# Safety` doc.
         let _ = unsafe { kernel_sigaction(Signal::INT, Some(dfl.clone())) };
     }
+    // SAFETY: see this function's own `# Safety` doc.
     let _ = unsafe { kernel_sigaction(Signal::QUIT, Some(dfl.clone())) };
+    // SAFETY: see this function's own `# Safety` doc.
     let _ = unsafe { kernel_sigaction(Signal::PIPE, Some(dfl)) };
+    // SAFETY: see this function's own `# Safety` doc.
     let _ = unsafe { kernel_sigprocmask(How::SETMASK, Some(&KernelSigSet::empty())) };
 }
 
 /// Resets `SIGPIPE` to its default (terminate) disposition for the shell's
-/// own top-level process. Rust's runtime ignores `SIGPIPE` at startup so
+/// own top-level process.
+///
+/// Rust's runtime ignores `SIGPIPE` at startup so
 /// library code sees a normal `EPIPE` I/O error instead of dying silently,
 /// which is convenient for typical CLI tools but wrong for a shell: every
 /// other program on the system (and every other shell) lets a broken pipe

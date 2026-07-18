@@ -20,6 +20,20 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::ast::Command;
 
+/// Sets a process environment variable. Single-threaded shell: no concurrent
+/// env mutation, so this is always safe to call.
+fn set_process_var(name: &str, value: &str) {
+    // SAFETY: single-threaded shell: no concurrent env mutation.
+    unsafe { std::env::set_var(name, value) }
+}
+
+/// Removes a process environment variable. Single-threaded shell: no
+/// concurrent env mutation, so this is always safe to call.
+fn remove_process_var(name: &str) {
+    // SAFETY: single-threaded shell: no concurrent env mutation.
+    unsafe { std::env::remove_var(name) }
+}
+
 #[derive(Debug, Clone)]
 pub struct Env {
     vars: HashMap<String, String>,
@@ -30,11 +44,12 @@ pub struct Env {
 }
 
 impl Env {
+    #[must_use]
     pub fn from_process() -> Self {
         let raw: Vec<(String, String)> = std::env::vars().collect();
         let cap = raw.len() + 8;
-        let mut vars = HashMap::with_capacity_and_hasher(cap, Default::default());
-        let mut exported = HashSet::with_capacity_and_hasher(cap, Default::default());
+        let mut vars = HashMap::with_capacity_and_hasher(cap, rustc_hash::FxBuildHasher);
+        let mut exported = HashSet::with_capacity_and_hasher(cap, rustc_hash::FxBuildHasher);
         for (k, v) in raw {
             exported.insert(k.clone());
             vars.insert(k, v);
@@ -67,10 +82,12 @@ impl Env {
     // ------------------------------------------------------------------
 
     #[inline]
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<String> {
         self.vars.get(name).cloned()
     }
     #[inline]
+    #[must_use]
     pub fn get_or_empty(&self, name: &str) -> String {
         self.vars.get(name).cloned().unwrap_or_default()
     }
@@ -78,10 +95,7 @@ impl Env {
     pub fn set(&mut self, name: &str, value: impl Into<String>) {
         let value = value.into();
         if self.exported.contains(name) {
-            // SAFETY: single-threaded shell: no concurrent env mutation.
-            unsafe {
-                std::env::set_var(name, &value);
-            }
+            set_process_var(name, &value);
         }
         self.vars.insert(name.to_owned(), value);
     }
@@ -89,20 +103,14 @@ impl Env {
     pub fn export(&mut self, name: impl Into<String>, value: impl Into<String>) {
         let name = name.into();
         let value = value.into();
-        // SAFETY: single-threaded shell: no concurrent env mutation.
-        unsafe {
-            std::env::set_var(&name, &value);
-        }
+        set_process_var(&name, &value);
         self.exported.insert(name.clone());
         self.vars.insert(name, value);
     }
 
     pub fn mark_exported(&mut self, name: &str) {
         let value = self.vars.entry(name.to_owned()).or_default().clone();
-        // SAFETY: single-threaded shell: no concurrent env mutation.
-        unsafe {
-            std::env::set_var(name, &value);
-        }
+        set_process_var(name, &value);
         self.exported.insert(name.to_owned());
     }
 
@@ -110,10 +118,7 @@ impl Env {
     /// attribute, so children no longer inherit it.
     pub fn unexport(&mut self, name: &str) {
         self.exported.remove(name);
-        // SAFETY: single-threaded shell: no concurrent env mutation.
-        unsafe {
-            std::env::remove_var(name);
-        }
+        remove_process_var(name);
     }
 
     /// Removes a variable (and its export/environment-variable state) only,
@@ -121,10 +126,7 @@ impl Env {
     pub fn unset_var(&mut self, name: &str) {
         self.vars.remove(name);
         self.exported.remove(name);
-        // SAFETY: single-threaded shell: no concurrent env mutation.
-        unsafe {
-            std::env::remove_var(name);
-        }
+        remove_process_var(name);
     }
 
     /// Removes a function only, leaving a same-named variable untouched.
@@ -164,6 +166,7 @@ impl Env {
     /// callers need an owned value to run while `self` is mutably borrowed
     /// for the call, and an `Rc` clone (a refcount bump) is what makes that
     /// affordable on every invocation instead of deep-cloning the AST.
+    #[must_use]
     pub fn get_function(&self, name: &str) -> Option<Rc<Command>> {
         self.functions.get(name).cloned()
     }
@@ -175,6 +178,7 @@ impl Env {
     pub fn set_alias(&mut self, name: String, value: String) {
         self.aliases.insert(name, value);
     }
+    #[must_use]
     pub fn get_alias(&self, name: &str) -> Option<String> {
         self.aliases.get(name).cloned()
     }
@@ -195,6 +199,7 @@ impl Env {
     // ------------------------------------------------------------------
 
     #[inline]
+    #[must_use]
     pub fn positional_args(&self) -> &[String] {
         &self.positional
     }

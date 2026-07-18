@@ -1,5 +1,6 @@
 //! Control-flow builtins: the trivial no-ops (`:`/`true`/`false`) and the
-//! signals that unwind through `run_command`'s `anyhow::Error` channel
+//! signals that unwind through `run_command`'s `anyhow::Error` channel.
+//!
 //! (`break`/`continue`/`return`/`exit`). `eval`/`exec`/`source` (dynamic
 //! execution rather than control flow) live in `script.rs`.
 
@@ -19,16 +20,25 @@ use super::Builtin;
 // `false`, not just different text). Their entire job is to do nothing
 // with whatever they're given.
 
+/// # Errors
+///
+/// Never fails; the `Result` is required by [`super::BuiltinFn`]'s signature.
 #[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
 pub const fn builtin_colon(_: &mut Shell, _: &[&str]) -> Result<ExitStatus> {
     Ok(ExitStatus::SUCCESS)
 }
 
+/// # Errors
+///
+/// Never fails; the `Result` is required by [`super::BuiltinFn`]'s signature.
 #[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
 pub const fn builtin_true(_: &mut Shell, _: &[&str]) -> Result<ExitStatus> {
     Ok(ExitStatus::SUCCESS)
 }
 
+/// # Errors
+///
+/// Never fails; the `Result` is required by [`super::BuiltinFn`]'s signature.
 #[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
 pub const fn builtin_false(_: &mut Shell, _: &[&str]) -> Result<ExitStatus> {
     Ok(ExitStatus::FAILURE)
@@ -37,16 +47,18 @@ pub const fn builtin_false(_: &mut Shell, _: &[&str]) -> Result<ExitStatus> {
 /// Not inside any loop (of the current function call) is only a warning,
 /// not an abort: it prints the message and execution just continues on to
 /// the next statement, exit status 0.
-fn not_in_loop(name: &str) -> Result<ExitStatus> {
+fn not_in_loop(name: &str) -> ExitStatus {
     emit(format!(
-        "{name}: only meaningful in a `for', `while', or `until' loop"
+        "{name}: only meaningful in a 'for', 'while', or 'until' loop"
     ));
-    Ok(ExitStatus::SUCCESS)
+    ExitStatus::SUCCESS
 }
 
 /// `break`/`continue`'s `N` (how many enclosing loops to unwind) has to be a
-/// positive integer; `clap::value_parser!(u32).range(1..)` rejects `0`,
-/// negative numbers, and non-numeric tokens uniformly, the same UsageError
+/// positive integer.
+///
+/// `clap::value_parser!(u32).range(1..)` rejects `0`,
+/// negative numbers, and non-numeric tokens uniformly, the same `UsageError`
 /// path (exit 2, nothing unwound) every other clap-backed builtin's bad
 /// argument already takes. Bash instead special-cases these as "still
 /// unwind one level despite the error," a real (minor) divergence, traded
@@ -65,7 +77,7 @@ pub struct BreakBuiltin {
 impl Builtin for BreakBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
         if shell.loop_depth == 0 {
-            return not_in_loop("break");
+            return Ok(not_in_loop("break"));
         }
         let n = self.level.unwrap_or(1).min(shell.loop_depth);
         Err(Error::new(LoopSignal::Break(n)))
@@ -86,7 +98,7 @@ pub struct ContinueBuiltin {
 impl Builtin for ContinueBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
         if shell.loop_depth == 0 {
-            return not_in_loop("continue");
+            return Ok(not_in_loop("continue"));
         }
         let n = self.level.unwrap_or(1).min(shell.loop_depth);
         Err(Error::new(LoopSignal::Continue(n)))

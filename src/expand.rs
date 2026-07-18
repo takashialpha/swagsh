@@ -5,11 +5,13 @@ use crate::env::Env;
 // e.g. `export`/`alias`/`set` with no arguments)
 // ---------------------------------------------------------------------------
 
-/// Quotes `s` so it round-trips as a single shell word if pasted back in:
-/// unquoted when every byte is already safe bare, single-quoted (with
+/// Quotes `s` so it round-trips as a single shell word if pasted back in.
+///
+/// Unquoted when every byte is already safe bare, single-quoted (with
 /// embedded `'` escaped via the standard `'\''` close-escape-reopen
 /// sequence) otherwise. Always single-quoting unconditionally would also be
 /// correct but produces noisy output for the common case of a plain value.
+#[must_use]
 pub fn shell_quote(s: &str) -> String {
     let is_bare_safe = |b: u8| {
         b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'=' | b'@')
@@ -22,6 +24,7 @@ pub fn shell_quote(s: &str) -> String {
 
 /// Like [`shell_quote`], but always wraps in single quotes even when `s` is
 /// bare-safe, matching `alias`'s own always-quoted display convention.
+#[must_use]
 pub fn shell_quote_always(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
@@ -40,6 +43,7 @@ pub fn shell_quote_always(s: &str) -> String {
 // Tilde expansion
 // ---------------------------------------------------------------------------
 
+#[must_use]
 pub fn expand_tilde(s: &str, env: &Env) -> String {
     if s == "~" {
         return env.get("HOME").unwrap_or_else(|| "/".into());
@@ -81,8 +85,9 @@ pub fn glob_expand(pattern: &str) -> Vec<String> {
     results
 }
 
-/// Iterative, not the textbook recursive-backtracking `*`/`?` matcher: the
-/// recursive version (`glob_inner(&p[1..], t) || glob_inner(p, &t[1..])`
+/// Iterative, not the textbook recursive-backtracking `*`/`?` matcher.
+///
+/// The recursive version (`glob_inner(&p[1..], t) || glob_inner(p, &t[1..])`
 /// on a `*`) is exponential on adversarial input, e.g. pattern `*a*a*a*...`
 /// against a text that almost-but-doesn't match re-explores the same
 /// suffix under every placement of every `*` (found by fuzzing
@@ -96,6 +101,7 @@ pub fn glob_expand(pattern: &str) -> Vec<String> {
 /// (advancing how much of `text` it's asked to consume by one) rather than
 /// re-deriving the whole match from scratch. Bounded by `pattern.len() *
 /// text.len()` work in the worst case: polynomial, not exponential.
+#[must_use]
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
@@ -134,18 +140,24 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 /// Consumes up to `max` leading ASCII hex digits from `chars`, stopping
 /// early at the first non-hex character (`\x`/`\u`/`\U` are all non-greedy
 /// this way, e.g. `\u41 ` is just `A` followed by a space).
-fn take_hex(chars: &mut std::iter::Peekable<std::str::Chars>, max: usize) -> String {
+fn take_hex(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, max: usize) -> String {
     let mut hex = String::new();
-    while hex.len() < max && chars.peek().is_some_and(char::is_ascii_hexdigit) {
-        hex.push(chars.next().unwrap());
+    while hex.len() < max {
+        match chars.next_if(char::is_ascii_hexdigit) {
+            Some(c) => hex.push(c),
+            None => break,
+        }
     }
     hex
 }
 
-/// Expands `echo -e`/`printf`'s backslash escapes. Returns the
-/// expanded text and whether a `\c` was seen: that escape means "stop all
-/// further output here", including any trailing newline `echo` would
-/// otherwise add, so callers can't just treat it as a character to insert.
+/// Expands `echo -e`/`printf`'s backslash escapes.
+///
+/// Returns the expanded text and whether a `\c` was seen: that escape means
+/// "stop all further output here", including any trailing newline `echo`
+/// would otherwise add, so callers can't just treat it as a character to
+/// insert.
+#[must_use]
 pub fn unescape(s: &str) -> (String, bool) {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -261,6 +273,7 @@ pub enum ParamOp<'a> {
     },
 }
 
+#[must_use]
 pub fn parse_param_op(s: &str) -> Option<ParamOp<'_>> {
     // ${#var}: length, starts with '#' followed by a valid name or special param
     if let Some(var) = s.strip_prefix('#')
@@ -339,6 +352,7 @@ fn char_boundaries(s: &str) -> impl DoubleEndedIterator<Item = usize> {
     s.char_indices().map(|(i, _)| i).chain([s.len()])
 }
 
+#[must_use]
 pub fn strip_prefix(val: &str, pat: &str, greedy: bool) -> String {
     if !has_glob_meta(pat) {
         return val.strip_prefix(pat).unwrap_or(val).to_owned();
@@ -362,6 +376,7 @@ pub fn strip_prefix(val: &str, pat: &str, greedy: bool) -> String {
     val.to_owned()
 }
 
+#[must_use]
 pub fn strip_suffix(val: &str, pat: &str, greedy: bool) -> String {
     if !has_glob_meta(pat) {
         return val.strip_suffix(pat).unwrap_or(val).to_owned();
@@ -386,6 +401,7 @@ pub fn strip_suffix(val: &str, pat: &str, greedy: bool) -> String {
 // Variables are pre-substituted by the caller (Shell::expand_var).
 // ---------------------------------------------------------------------------
 
+#[must_use]
 pub fn eval_arith(expr: &str) -> i64 {
     let tokens = arith_tokenize(expr.trim());
     let mut pos = 0;
@@ -454,8 +470,8 @@ fn arith_tokenize(s: &str) -> Vec<Tok> {
             }
             '0'..='9' => {
                 let mut n = c as i64 - '0' as i64;
-                while matches!(chars.peek(), Some('0'..='9')) {
-                    let d = chars.next().unwrap() as i64 - '0' as i64;
+                while let Some(next) = chars.next_if(char::is_ascii_digit) {
+                    let d = next as i64 - '0' as i64;
                     // `wrapping_*`, not a plain `*`/`+`: matches the same
                     // overflow convention `arith_add`/`arith_mul` already
                     // use below, and a literal with enough digits to
@@ -502,26 +518,18 @@ fn arith_and(t: &[Tok], p: &mut usize) -> Option<i64> {
 fn arith_cmp(t: &[Tok], p: &mut usize) -> Option<i64> {
     let mut v = arith_add(t, p)?;
     loop {
-        let op = match t.get(*p) {
-            Some(Tok::Eq) => "==",
-            Some(Tok::Ne) => "!=",
-            Some(Tok::Lt) => "<",
-            Some(Tok::Le) => "<=",
-            Some(Tok::Gt) => ">",
-            Some(Tok::Ge) => ">=",
+        let cmp: fn(i64, i64) -> bool = match t.get(*p) {
+            Some(Tok::Eq) => |a, b| a == b,
+            Some(Tok::Ne) => |a, b| a != b,
+            Some(Tok::Lt) => |a, b| a < b,
+            Some(Tok::Le) => |a, b| a <= b,
+            Some(Tok::Gt) => |a, b| a > b,
+            Some(Tok::Ge) => |a, b| a >= b,
             _ => break,
         };
         *p += 1;
         let r = arith_add(t, p)?;
-        v = i64::from(match op {
-            "==" => v == r,
-            "!=" => v != r,
-            "<" => v < r,
-            "<=" => v <= r,
-            ">" => v > r,
-            ">=" => v >= r,
-            _ => unreachable!(),
-        });
+        v = i64::from(cmp(v, r));
     }
     Some(v)
 }

@@ -100,7 +100,7 @@ impl Builtin for UnsetBuiltin {
 #[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
 pub fn builtin_set(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     if args.is_empty() {
-        return print_all_vars(shell);
+        return Ok(print_all_vars(shell));
     }
     let (remaining, saw_double_dash) = match apply_set_flags(shell, args) {
         Ok(r) => r,
@@ -116,7 +116,7 @@ pub fn builtin_set(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     super::cli::dispatch::<SetOperandsBuiltin>(shell, remaining)
 }
 
-fn print_all_vars(shell: &mut Shell) -> Result<ExitStatus> {
+fn print_all_vars(shell: &mut Shell) -> ExitStatus {
     let pairs: Vec<(String, String)> = shell
         .env
         .all_vars()
@@ -129,7 +129,7 @@ fn print_all_vars(shell: &mut Shell) -> Result<ExitStatus> {
     if printed_any {
         shell.note_stdout("\n");
     }
-    Ok(ExitStatus::SUCCESS)
+    ExitStatus::SUCCESS
 }
 
 /// Scans `args` for leading `-`/`+`-prefixed option flags, applying each to
@@ -245,15 +245,17 @@ pub struct ShiftBuiltin {
 
 impl Builtin for ShiftBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
-        let n = self.count.unwrap_or(1);
         let mut pos = shell.env.positional_args().to_vec();
         // Silently fails here (no message) for an out-of-range count,
         // negative included, unlike this builtin's other errors (a
         // non-numeric count is still a real, clap-reported usage error).
-        if n < 0 || n as usize > pos.len() {
+        let Ok(n) = usize::try_from(self.count.unwrap_or(1)) else {
+            return Ok(ExitStatus::FAILURE);
+        };
+        if n > pos.len() {
             return Ok(ExitStatus::FAILURE);
         }
-        pos.drain(..n as usize);
+        pos.drain(..n);
         shell.env.set_positional_args(pos);
         Ok(ExitStatus::SUCCESS)
     }

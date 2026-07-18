@@ -40,13 +40,13 @@ pub struct GetoptsBuiltin {
 /// unsets `OPTARG`: the state left behind once `getopts` runs out of
 /// options to report (a real end, `--`, or a bounds/state inconsistency
 /// that shouldn't be able to happen but shouldn't panic if it somehow does).
-fn end_of_options(shell: &mut Shell, name: &str, next_optind: i64) -> Result<ExitStatus> {
+fn end_of_options(shell: &mut Shell, name: &str, next_optind: i64) -> ExitStatus {
     shell.env.set("OPTIND", next_optind.to_string());
     shell.getopts_state.optind = next_optind;
     shell.getopts_state.offset = 0;
     shell.env.set(name, "?");
     shell.env.unset_var("OPTARG");
-    Ok(ExitStatus::FAILURE)
+    ExitStatus::FAILURE
 }
 
 impl Builtin for GetoptsBuiltin {
@@ -71,25 +71,25 @@ impl Builtin for GetoptsBuiltin {
         if shell.getopts_state.optind != optind {
             shell.getopts_state.offset = 0;
         }
-        let idx = (optind - 1) as usize;
+        let idx = usize::try_from(optind - 1).unwrap_or(0);
         let pos = shell.getopts_state.offset;
 
         let Some(word) = arglist.get(idx) else {
-            return end_of_options(shell, name, optind);
+            return Ok(end_of_options(shell, name, optind));
         };
 
         if pos == 0 {
             if word == "--" {
-                return end_of_options(shell, name, optind + 1);
+                return Ok(end_of_options(shell, name, optind + 1));
             }
             if !word.starts_with('-') || word == "-" {
-                return end_of_options(shell, name, optind);
+                return Ok(end_of_options(shell, name, optind));
             }
         }
 
         let chars: Vec<char> = word.chars().skip(1).collect();
         let Some(&opt) = chars.get(pos) else {
-            return end_of_options(shell, name, optind);
+            return Ok(end_of_options(shell, name, optind));
         };
         let is_last_char = pos + 1 >= chars.len();
         let next_optind_same_word = if is_last_char { optind + 1 } else { optind };

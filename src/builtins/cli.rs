@@ -7,7 +7,7 @@
 //! reformatted to a single line on the builtin's own name instead of
 //! clap's multi-paragraph "Usage: ..." block. Color is untouched (`clap`
 //! already defaults to `ColorChoice::Auto`, matching the rest of swagsh's
-//! output: real color on a terminal, plain text piped/NO_COLOR).
+//! output: real color on a terminal, plain text piped/`NO_COLOR`).
 use anyhow::Result;
 use clap::{Command, Parser, error::ErrorKind};
 
@@ -18,6 +18,7 @@ use crate::jobs::ExitStatus;
 
 /// Outcome of parsing a builtin's arguments: the parsed struct, `-h`
 /// already having printed help, or a bad-flag usage error already printed.
+///
 /// Kept distinct from a builtin's own runtime errors (a bad directory, a
 /// missing file, ...) so [`dispatch`] can give usage mistakes the
 /// conventional exit status 2 while runtime failures still get 1, the same
@@ -30,8 +31,14 @@ pub enum ParsedArgs<T> {
 
 /// Adapts any [`Builtin`] into the plain
 /// `fn(&mut Shell, &[&str]) -> Result<ExitStatus>` shape the `BUILTINS`
-/// lookup table stores. `dispatch::<CdBuiltin>` slots directly into that
+/// lookup table stores.
+///
+/// `dispatch::<CdBuiltin>` slots directly into that
 /// table in place of a hand-written wrapper function.
+///
+/// # Errors
+///
+/// Returns an error if the builtin itself fails.
 pub fn dispatch<B: Builtin>(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     match parse_args::<B>(args)? {
         ParsedArgs::Ok(b) => b.run(shell),
@@ -51,6 +58,10 @@ fn command_for<T: Parser>() -> Command {
 /// `exec` (no COMMAND) must keep its redirects applied permanently instead
 /// of scoping them to one call, something the generic dispatch flow has no
 /// way to ask for.
+///
+/// # Errors
+///
+/// Returns an error if `T::from_arg_matches` fails after a successful parse.
 pub fn parse_args<T: Parser>(args: &[&str]) -> Result<ParsedArgs<T>> {
     let cmd = command_for::<T>();
     let name = cmd.get_name().to_owned();

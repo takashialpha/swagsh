@@ -8,6 +8,7 @@ impl ExitStatus {
     pub const FAILURE: Self = Self(1);
 
     #[inline]
+    #[must_use]
     pub const fn is_success(self) -> bool {
         self.0 == 0
     }
@@ -15,6 +16,7 @@ impl ExitStatus {
     /// The status a `!`-negated pipeline reports: POSIX only distinguishes
     /// success (0) from failure, so any nonzero status negates to `SUCCESS`.
     #[inline]
+    #[must_use]
     pub const fn negated(self) -> Self {
         if self.is_success() {
             Self::FAILURE
@@ -25,10 +27,13 @@ impl ExitStatus {
 }
 
 /// Decodes a `waitpid`/`waitpgid` status for the two cases that end a wait
-/// loop: normal exit, or death by signal (reported as `128 + signum`, the
-/// POSIX convention `$?` follows). Returns `None` for a stopped process,
-/// since `wait_for_pid` and `fg` each handle that case differently
-/// (job-table bookkeeping vs. terminal ownership).
+/// loop: normal exit, or death by signal.
+///
+/// Death by signal is reported as `128 + signum`, the POSIX convention `$?`
+/// follows. Returns `None` for a stopped process, since `wait_for_pid` and
+/// `fg` each handle that case differently (job-table bookkeeping vs.
+/// terminal ownership).
+#[must_use]
 pub fn decode_wait_status(status: WaitStatus) -> Option<ExitStatus> {
     status
         .exit_status()

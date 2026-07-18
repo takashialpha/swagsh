@@ -57,6 +57,9 @@ impl Shell {
         Ok(status)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if running any statement in `list` fails.
     pub fn run_list(&mut self, list: &[AndOrList]) -> Result<ExitStatus> {
         let mut status = ExitStatus::SUCCESS;
         for aol in list {
@@ -132,10 +135,7 @@ impl Shell {
             }
         }
         self.loop_depth -= 1;
-        match propagate {
-            Some(sig) => Err(anyhow::Error::new(sig)),
-            None => Ok(status),
-        }
+        propagate.map_or(Ok(status), |sig| Err(anyhow::Error::new(sig)))
     }
 
     pub(super) fn run_while(&mut self, wc: &WhileClause) -> Result<ExitStatus> {
@@ -177,10 +177,7 @@ impl Shell {
             }
         }
         self.loop_depth -= 1;
-        match propagate {
-            Some(sig) => Err(anyhow::Error::new(sig)),
-            None => Ok(status),
-        }
+        propagate.map_or(Ok(status), |sig| Err(anyhow::Error::new(sig)))
     }
 
     pub(super) fn run_case(&mut self, cc: &CaseClause) -> Result<ExitStatus> {

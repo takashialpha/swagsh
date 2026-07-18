@@ -19,7 +19,7 @@ struct Spec {
 
 /// Parses one `%...` conversion starting right after the `%`. Returns
 /// `None` at end of input (a lone trailing `%`, printed literally).
-fn parse_spec(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Spec> {
+fn parse_spec(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<Spec> {
     let mut left_align = false;
     let mut zero_pad = false;
     let mut plus_sign = false;
@@ -33,19 +33,19 @@ fn parse_spec(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Spec> 
         chars.next();
     }
     let mut width_digits = String::new();
-    while chars.peek().is_some_and(char::is_ascii_digit) {
-        width_digits.push(chars.next().unwrap());
+    while let Some(c) = chars.next_if(char::is_ascii_digit) {
+        width_digits.push(c);
     }
     let width = width_digits.parse().ok();
-    let mut precision = None;
-    if chars.peek() == Some(&'.') {
-        chars.next();
+    let precision = if chars.next_if_eq(&'.').is_some() {
         let mut prec_digits = String::new();
-        while chars.peek().is_some_and(char::is_ascii_digit) {
-            prec_digits.push(chars.next().unwrap());
+        while let Some(c) = chars.next_if(char::is_ascii_digit) {
+            prec_digits.push(c);
         }
-        precision = Some(prec_digits.parse().unwrap_or(0));
-    }
+        Some(prec_digits.parse().unwrap_or(0))
+    } else {
+        None
+    };
     let conv = chars.next()?;
     Some(Spec {
         left_align,
@@ -71,11 +71,10 @@ fn apply_width(s: String, spec: &Spec) -> String {
     if spec.left_align {
         format!("{s}{}", " ".repeat(pad))
     } else if spec.zero_pad {
-        if let Some(rest) = s.strip_prefix(['-', '+']) {
-            format!("{}{}{rest}", &s[..1], "0".repeat(pad))
-        } else {
-            format!("{}{s}", "0".repeat(pad))
-        }
+        s.strip_prefix(['-', '+']).map_or_else(
+            || format!("{}{s}", "0".repeat(pad)),
+            |rest| format!("{}{}{rest}", &s[..1], "0".repeat(pad)),
+        )
     } else {
         format!("{}{s}", " ".repeat(pad))
     }
@@ -92,7 +91,7 @@ fn signed(n: i64, plus_sign: bool) -> String {
 /// Renders one conversion, consuming its argument (if any) from `args`.
 /// Missing arguments default conventionally: `""` for `%s`/`%c`, `0` for
 /// every numeric conversion.
-fn format_conv(spec: &Spec, args: &mut std::iter::Peekable<std::slice::Iter<&str>>) -> String {
+fn format_conv(spec: &Spec, args: &mut std::iter::Peekable<std::slice::Iter<'_, &str>>) -> String {
     match spec.conv {
         '%' => "%".to_owned(),
         's' => {
@@ -131,7 +130,7 @@ fn format_conv(spec: &Spec, args: &mut std::iter::Peekable<std::slice::Iter<&str
                 .trim()
                 .parse()
                 .unwrap_or(0);
-            apply_width((n as u64).to_string(), spec)
+            apply_width(n.cast_unsigned().to_string(), spec)
         }
         'x' => {
             let n: i64 = args
@@ -141,7 +140,7 @@ fn format_conv(spec: &Spec, args: &mut std::iter::Peekable<std::slice::Iter<&str
                 .trim()
                 .parse()
                 .unwrap_or(0);
-            apply_width(format!("{:x}", n as u64), spec)
+            apply_width(format!("{:x}", n.cast_unsigned()), spec)
         }
         'X' => {
             let n: i64 = args
@@ -151,7 +150,7 @@ fn format_conv(spec: &Spec, args: &mut std::iter::Peekable<std::slice::Iter<&str
                 .trim()
                 .parse()
                 .unwrap_or(0);
-            apply_width(format!("{:X}", n as u64), spec)
+            apply_width(format!("{:X}", n.cast_unsigned()), spec)
         }
         'o' => {
             let n: i64 = args
@@ -161,7 +160,7 @@ fn format_conv(spec: &Spec, args: &mut std::iter::Peekable<std::slice::Iter<&str
                 .trim()
                 .parse()
                 .unwrap_or(0);
-            apply_width(format!("{:o}", n as u64), spec)
+            apply_width(format!("{:o}", n.cast_unsigned()), spec)
         }
         'f' => {
             let f: f64 = args
@@ -201,7 +200,7 @@ fn has_arg_conversions(fmt: &str) -> bool {
     false
 }
 
-fn format_once(fmt: &str, args: &mut std::iter::Peekable<std::slice::Iter<&str>>) -> String {
+fn format_once(fmt: &str, args: &mut std::iter::Peekable<std::slice::Iter<'_, &str>>) -> String {
     let mut out = String::new();
     let mut chars = fmt.chars().peekable();
     while let Some(c) = chars.next() {
@@ -273,12 +272,11 @@ impl Builtin for PrintfBuiltin {
                 break;
             }
         }
-        match self.var {
-            Some(name) => shell.env.set(&name, output),
-            None => {
-                print!("{output}");
-                shell.note_stdout(&output);
-            }
+        if let Some(name) = self.var {
+            shell.env.set(&name, output);
+        } else {
+            print!("{output}");
+            shell.note_stdout(&output);
         }
         Ok(ExitStatus::SUCCESS)
     }

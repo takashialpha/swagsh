@@ -16,6 +16,11 @@ use crate::signal::restore_child_signals;
 use super::{Shell, is_break, is_continue, is_return};
 
 impl Shell {
+    /// # Errors
+    ///
+    /// Returns an error if expanding `word` fails (e.g. a command
+    /// substitution's command fails to run, or an unset variable is
+    /// referenced under `set -u`).
     pub fn expand_word(&mut self, word: &Word) -> Result<Vec<String>> {
         if let Word::Quoted(inner) = word {
             return Ok(vec![self.expand_word_to_string_inner(inner, true)?]);
@@ -36,6 +41,9 @@ impl Shell {
         Ok(vec![raw])
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if expanding any word fails.
     pub fn expand_words(&mut self, words: &[Word]) -> Result<Vec<String>> {
         let ifs = self.env.get("IFS").unwrap_or_else(|| " \t\n".to_owned());
         let mut result = Vec::with_capacity(words.len());
@@ -56,6 +64,9 @@ impl Shell {
         Ok(result)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if expanding `word` fails.
     pub fn expand_word_to_string(&mut self, word: &Word) -> Result<String> {
         self.expand_word_to_string_inner(word, false)
     }
@@ -153,6 +164,10 @@ impl Shell {
         Ok(result)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if `name` is unset under `set -u`, or if a nested
+    /// command substitution fails.
     pub fn expand_var(&mut self, name: &str) -> Result<String> {
         match name {
             "?" | "$" | "0" | "@" | "*" | "#" => self.resolve_param_checked(name),
@@ -351,6 +366,9 @@ impl Shell {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if expanding `body`'s embedded references fails.
     pub fn expand_heredoc_body(&mut self, body: &str) -> Result<String> {
         let mut result = self.expand_raw_text(body)?;
         if !result.ends_with('\n') {
@@ -431,8 +449,8 @@ impl Shell {
 /// strings at execution time, after lexing is long done.
 fn take_identifier(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
     let mut ident = String::new();
-    while matches!(chars.peek(), Some(c) if c.is_ascii_alphanumeric() || *c == '_') {
-        ident.push(chars.next().unwrap());
+    while let Some(c) = chars.next_if(|c| c.is_ascii_alphanumeric() || *c == '_') {
+        ident.push(c);
     }
     ident
 }

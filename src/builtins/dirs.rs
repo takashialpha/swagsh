@@ -35,6 +35,9 @@ fn normalize_logical(base: &str, target: &str) -> String {
 
 #[derive(Parser)]
 #[command(name = "cd", about = "Change the shell working directory")]
+// Each bool is an independent clap-derived CLI flag, always constructed by
+// clap from named flags rather than positionally.
+#[allow(clippy::struct_excessive_bools)]
 pub struct CdBuiltin {
     /// Resolve symlinks after processing `..` in DIR (default)
     #[arg(short = 'L', overrides_with = "physical")]

@@ -32,12 +32,13 @@ pub fn builtin_echo(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
         if !is_echo_option(arg) {
             break;
         }
+        // `is_echo_option` above only admits `n`/`e`/`E` characters here, so
+        // anything that isn't `n`/`e` is `E`.
         for c in arg[1..].chars() {
-            match c {
-                'n' => no_newline = true,
-                'e' => interpret_escapes = true,
-                'E' => interpret_escapes = false,
-                _ => unreachable!("is_echo_option only admits n/e/E"),
+            if c == 'n' {
+                no_newline = true;
+            } else {
+                interpret_escapes = c == 'e';
             }
         }
         start += 1;
