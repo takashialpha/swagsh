@@ -34,3 +34,90 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  fuzz-build:
+    name: Fuzz targets build
+    runs-on: ubuntu-latest
+    # `fuzz/` is a standalone crate (see fuzz/README.md), not a workspace
+    # member, so the jobs above never touch it. This just confirms every
+    # fuzz target still compiles against the current main-crate API; it
+    # doesn't need the nightly toolchain cargo-fuzz's sanitizer builds do,
+    # a plain stable `cargo build` is enough to catch bit-rot.
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+
+      - name: Build fuzz targets
+        run: cargo build --manifest-path fuzz/Cargo.toml
+
+  fuzz-discover:
+    name: Discover fuzz targets
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Reads fuzz/fuzz_targets/ via cargo-fuzz itself, not a hardcoded
+      # list here, so a new fuzz target is picked up automatically.
+      - name: List fuzz targets
+        id: list
+        run: |
+          targets=$(cargo fuzz list --fuzz-dir fuzz | awk '
+            BEGIN { printf "[" }
+            { printf "%s\"%s\"", (NR > 1 ? "," : ""), $0 }
+            END { printf "]" }
+          ')
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
+  fuzz-run:
+    name: Fuzz (timed)
+    runs-on: ubuntu-latest
+    needs: fuzz-discover
+    # Only on the weekly schedule (or manually): each target's sanitizer
+    # build plus a real run is much more expensive than fuzz-build's plain
+    # compile check above, and this is meant to catch real bugs over time,
+    # not gate every push/PR.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.fuzz-discover.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz ${{ matrix.target }}
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
