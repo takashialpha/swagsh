@@ -80,3 +80,18 @@ that separately; it can get large (sanitizer builds are not small).
 That still only clears `target/`, though: `corpus/`, `artifacts/`, and
 `coverage/` are cargo-fuzz's own accumulation, not cargo's, and outlive
 any `cargo clean`. `./clean.sh` clears all four in one go.
+
+## Lints
+
+Not being a workspace member also means `[lints]` isn't inherited from the
+main crate's `Cargo.toml`, so `fuzz/Cargo.toml` carries its own copy of the
+same strict `clippy::all`/`pedantic`/`nursery`/`cargo` (plus curated
+`restriction`) posture, kept in sync by hand. Three deliberate differences,
+each commented at its own `Cargo.toml` line:
+
+- `unsafe_code = "forbid"` and `print_stdout`/`print_stderr = "deny"` are
+  *only* set here: the main shell genuinely needs `unsafe` (fork/exec/env)
+  and stdout (that's its entire job), a fuzz harness needs neither.
+- `exit = "deny"` here vs. `"allow"` in the main crate, for the same
+  reason in reverse: the main crate's forked children and `exit` builtin
+  must call `process::exit` directly; nothing in a fuzz target should.
