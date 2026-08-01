@@ -68,7 +68,7 @@ pub fn glob_expand(pattern: &str) -> Vec<String> {
         return vec![];
     };
     let mut results: Vec<String> = entries
-        .filter_map(std::result::Result::ok)
+        .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().to_string())
         .filter(|name| {
             (file_pat.starts_with('.') || !name.starts_with('.')) && glob_match(file_pat, name)

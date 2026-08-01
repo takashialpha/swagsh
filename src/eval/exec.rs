@@ -555,11 +555,7 @@ fn describe_word(word: &Word) -> String {
 /// locate it on disk; those are independent by design in every Unix exec
 /// family. `empty_env` is `exec -c`: run with no inherited environment at
 /// all rather than the shell's own.
-fn execvp_path(
-    argv: &[CString],
-    display_argv0: Option<&CString>,
-    empty_env: bool,
-) -> rustix::io::Errno {
+fn execvp_path(argv: &[CString], display_argv0: Option<&CString>, empty_env: bool) -> Errno {
     let mut argv_ptrs: Vec<*const u8> = argv.iter().map(|s| s.as_ptr().cast::<u8>()).collect();
     argv_ptrs.push(std::ptr::null());
     if let Some(d) = display_argv0 {
@@ -594,7 +590,7 @@ fn execvp_path(
 
     let path_var =
         std::env::var_os("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
-    let mut last_err = rustix::io::Errno::NOENT;
+    let mut last_err = Errno::NOENT;
     for dir in std::env::split_paths(&path_var) {
         let mut full = dir;
         full.push(std::str::from_utf8(name_bytes).unwrap_or(""));
@@ -604,7 +600,7 @@ fn execvp_path(
             }
             // SAFETY: null-terminated arrays of valid CString data.
             let err = unsafe { execve(&candidate, argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
-            if err != rustix::io::Errno::NOENT && err != rustix::io::Errno::NOTDIR {
+            if err != Errno::NOENT && err != Errno::NOTDIR {
                 return err;
             }
             last_err = err;
