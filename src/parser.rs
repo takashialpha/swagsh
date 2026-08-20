@@ -676,7 +676,7 @@ fn decompose_word(raw: &str, parser: &Parser, in_dquotes: bool) -> ParseResult<V
                 }
                 let mut sub_parts = decompose_word(&inner, parser, true)?;
                 let inner_word = if sub_parts.len() == 1 {
-                    sub_parts.pop().map_or(Word::Compound(sub_parts), |w| w)
+                    sub_parts.pop().unwrap_or(Word::Compound(sub_parts))
                 } else {
                     Word::Compound(sub_parts)
                 };
