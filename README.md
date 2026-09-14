@@ -137,6 +137,8 @@ cd swagsh
 cargo build --release   # binary at target/release/swagsh
 ```
 
+Build with the latest stable Rust: swagsh tracks the stable channel rather than supporting a minimum version, and uses new language features as they land. If cargo reports your toolchain is too old, run `rustup update stable`.
+
 ---
 
 ## Known limitations

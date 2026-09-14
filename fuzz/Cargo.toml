@@ -3,6 +3,11 @@ name = "swagsh-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
+# Kept in sync with the main crate's Cargo.toml by hand, for the same reason
+# [lints] below is: fuzz/ is not a workspace member, so it inherits nothing.
+# The channel itself is not duplicated here: rustup reads the repo root's
+# rust-toolchain.toml for this directory too.
+rust-version = "1.98.1"
 
 [package.metadata]
 cargo-fuzz = true

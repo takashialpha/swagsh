@@ -2,6 +2,11 @@
 name = "swagsh"
 version = "0.8.0"
 edition = "2024"
+# The current stable at the time of release, not a support floor: swagsh tracks
+# the stable channel (see rust-toolchain.toml). Raise this to the new stable
+# whenever the channel moves. It is here so an old toolchain fails with a clear
+# message instead of a syntax error on a feature it does not have.
+rust-version = "1.98.1"
 description = "A fast, minimal, modern Linux shell. Named after swag, slang for stylish flair."
 authors = ["takashialpha <takashialpha@protonmail.com>"]
 license = "GPL-3.0-or-later"
