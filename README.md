@@ -1,14 +1,14 @@
 <div align="center">
 
 <pre>
-                         ▗▖
-                         ▐▌
+                         ▗▖   
+                         ▐▌   
 ▗▟██▖█   █ ▟██▖ ▟█▟▌▗▟██▖▐▙██▖
 ▐▙▄▖▘▜ █ ▛ ▘▄▟▌▐▛ ▜▌▐▙▄▖▘▐▛ ▐▌
  ▀▀█▖▐▙█▟▌▗█▀▜▌▐▌ ▐▌ ▀▀█▖▐▌ ▐▌
 ▐▄▄▟▌▝█ █▘▐▙▄█▌▝█▄█▌▐▄▄▟▌▐▌ ▐▌
  ▀▀▀  ▀ ▀  ▀▀▝▘ ▞▀▐▌ ▀▀▀ ▝▘ ▝▘
-                ▜█▛▘
+                ▜█▛▘          
 </pre>
 
 **A fast, minimal, modern Linux shell. Named after swag, slang for stylish flair.**
