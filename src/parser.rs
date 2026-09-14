@@ -88,6 +88,21 @@ impl Parser {
     /// Returns an error if `src` contains a lex error (e.g. an unterminated
     /// quote or substitution).
     pub fn new(src: &str) -> ParseResult<Self> {
+        Self::new_at_depth(src, 0)
+    }
+
+    /// `Parser::new`, but starting the nesting counter at `depth` instead of
+    /// zero.
+    ///
+    /// A `$(...)` or backtick substitution is parsed by handing its interior
+    /// to a *new* `Parser`, and a fresh parser used to reset `depth` to 0.
+    /// That left `MAX_PARSE_DEPTH` bounding recursion only within a single
+    /// parser instance while the nesting that actually matters crossed
+    /// instances, so a few thousand nested `$(` overflowed the stack even
+    /// though the identical depth of `{ }` was rejected cleanly. Carrying
+    /// the depth across the boundary makes the limit apply to the real
+    /// recursion.
+    fn new_at_depth(src: &str, depth: usize) -> ParseResult<Self> {
         use crate::lexer::Lexer;
 
         let mut lexer = Lexer::new(src);
@@ -115,7 +130,7 @@ impl Parser {
         Ok(Self {
             tokens,
             pos: 0,
-            depth: 0,
+            depth,
         })
     }
 
@@ -435,7 +450,7 @@ impl Parser {
             return Ok(Word::Literal(raw));
         }
 
-        let mut parts = decompose_word(&raw, self, false)?;
+        let mut parts = decompose_word(&raw, self.depth, false)?;
         if parts.len() == 1
             && let Some(part) = parts.pop()
         {
@@ -476,7 +491,7 @@ impl Parser {
 
                 Ok(Redirect {
                     kind: rk,
-                    fd: fd.map_or(default_fd, u32::cast_signed),
+                    fd: fd.unwrap_or(default_fd),
                     target,
                 })
             }
@@ -511,7 +526,7 @@ impl Parser {
 
 fn parse_dollar(
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
-    _parser: &Parser,
+    depth: usize,
 ) -> ParseResult<Option<Word>> {
     match chars.peek().map(|(_, c)| *c) {
         Some('(') => {
@@ -526,7 +541,7 @@ fn parse_dollar(
             }
             let fragment = collect_balanced(chars, '(', ')')?;
             let inner = &fragment[2..fragment.len() - 1];
-            let prog = Parser::new(inner)
+            let prog = Parser::new_at_depth(inner, depth + 1)
                 .and_then(Parser::parse)
                 .map_err(|e| ParseError {
                     msg: format!("in command substitution: {}", e.msg),
@@ -599,6 +614,11 @@ const fn keyword_text(tok: &Token) -> Option<&'static str> {
         Token::Case => "case",
         Token::Esac => "esac",
         Token::Function => "function",
+        // Not reserved words in the `if`/`while` sense, but subject to the
+        // same positional rule: a standalone `{`/`}` anywhere but the start
+        // of a command is just that character as text (`echo }` prints `}`).
+        Token::LBrace => "{",
+        Token::RBrace => "}",
         _ => return None,
     })
 }
@@ -611,7 +631,19 @@ const fn keyword_text(tok: &Token) -> Option<&'static str> {
 /// entirely); a backslash before anything else stays a literal backslash
 /// followed by that character, e.g. `"\t"` is the two characters `\` and
 /// `t`, not a tab.
-fn decompose_word(raw: &str, parser: &Parser, in_dquotes: bool) -> ParseResult<Vec<Word>> {
+fn decompose_word(raw: &str, depth: usize, in_dquotes: bool) -> ParseResult<Vec<Word>> {
+    // Backstop for the nesting this function reaches on its own (a quoted
+    // region re-enters it, a `$(...)` re-enters the whole parser). The
+    // sub-parsers below carry `depth` onward so the limit spans every hop,
+    // not just the ones inside one `Parser`.
+    if depth > MAX_PARSE_DEPTH {
+        return Err(ParseError {
+            line: 0,
+            col: 0,
+            msg: "too deeply nested".to_owned(),
+            incomplete: false,
+        });
+    }
     let mut parts: Vec<Word> = Vec::new();
     let mut chars = raw.char_indices().peekable();
     let mut lit = String::new();
@@ -626,7 +658,7 @@ fn decompose_word(raw: &str, parser: &Parser, in_dquotes: bool) -> ParseResult<V
 
     while let Some((_, ch)) = chars.next() {
         match ch {
-            '$' => match parse_dollar(&mut chars, parser)? {
+            '$' => match parse_dollar(&mut chars, depth)? {
                 Some(word) => {
                     flush_lit!();
                     parts.push(word);
@@ -648,59 +680,12 @@ fn decompose_word(raw: &str, parser: &Parser, in_dquotes: bool) -> ParseResult<V
 
             '"' => {
                 flush_lit!();
-                let mut inner = String::new();
-                while let Some((_, c)) = chars.next() {
-                    match c {
-                        '"' => break,
-                        // An escaped quote can't be the closing delimiter;
-                        // consume the pair atomically so the `"` isn't
-                        // seen as anything but data here (`decompose_word`
-                        // resolves the escape itself on the second pass).
-                        '\\' => {
-                            inner.push('\\');
-                            if let Some((_, next)) = chars.next() {
-                                inner.push(next);
-                            }
-                        }
-                        // A nested `$(...)` can itself contain quotes (e.g.
-                        // `"result: $(echo "nested")"`); skip the whole
-                        // balanced span as one unit so an inner `"` isn't
-                        // mistaken for this string's closing quote. The
-                        // recursive `decompose_word` call below re-parses
-                        // it properly once `inner` is correctly bounded.
-                        '$' if chars.peek().map(|&(_, c)| c) == Some('(') => {
-                            inner.push_str(&collect_balanced(&mut chars, '(', ')')?);
-                        }
-                        _ => inner.push(c),
-                    }
-                }
-                let mut sub_parts = decompose_word(&inner, parser, true)?;
-                let inner_word = if sub_parts.len() == 1 {
-                    sub_parts.pop().unwrap_or(Word::Compound(sub_parts))
-                } else {
-                    Word::Compound(sub_parts)
-                };
-                parts.push(Word::Quoted(Box::new(inner_word)));
+                parts.push(read_double_quoted(&mut chars, depth)?);
             }
 
             '`' => {
                 flush_lit!();
-                let mut inner = String::new();
-                while let Some((_, c)) = chars.next() {
-                    match c {
-                        '`' => break,
-                        '\\' => {
-                            inner.push('\\');
-                            if let Some((_, next)) = chars.next() {
-                                inner.push(next);
-                            }
-                        }
-                        _ => inner.push(c),
-                    }
-                }
-                let sub_parser = Parser::new(&inner)?;
-                let program = sub_parser.parse()?;
-                parts.push(Word::CmdSub(Box::new(program.into_command())));
+                parts.push(read_backtick(&mut chars, depth)?);
             }
 
             '\\' if in_dquotes => match chars.peek().map(|&(_, c)| c) {
@@ -734,6 +719,68 @@ fn decompose_word(raw: &str, parser: &Parser, in_dquotes: bool) -> ParseResult<V
     Ok(parts)
 }
 
+/// Reads a `"..."` region, starting just past the opening quote, and returns
+/// it as a single [`Word::Quoted`].
+fn read_double_quoted(
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+    depth: usize,
+) -> ParseResult<Word> {
+    let mut inner = String::new();
+    while let Some((_, c)) = chars.next() {
+        match c {
+            '"' => break,
+            // An escaped quote can't be the closing delimiter; consume the
+            // pair atomically so the `"` isn't seen as anything but data
+            // here (`decompose_word` resolves the escape on its own pass).
+            '\\' => {
+                inner.push('\\');
+                if let Some((_, next)) = chars.next() {
+                    inner.push(next);
+                }
+            }
+            // A nested `$(...)` can itself contain quotes (e.g.
+            // `"result: $(echo "nested")"`); skip the whole balanced span as
+            // one unit so an inner `"` isn't mistaken for this string's
+            // closing quote. The `decompose_word` call below re-parses it
+            // properly once `inner` is correctly bounded.
+            '$' if chars.peek().map(|&(_, c)| c) == Some('(') => {
+                inner.push_str(&collect_balanced(chars, '(', ')')?);
+            }
+            _ => inner.push(c),
+        }
+    }
+    let mut sub_parts = decompose_word(&inner, depth + 1, true)?;
+    let inner_word = if sub_parts.len() == 1 {
+        sub_parts.remove(0)
+    } else {
+        Word::Compound(sub_parts)
+    };
+    Ok(Word::Quoted(Box::new(inner_word)))
+}
+
+/// Reads a `` `...` `` substitution, starting just past the opening backtick,
+/// and returns it as a [`Word::CmdSub`].
+fn read_backtick(
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+    depth: usize,
+) -> ParseResult<Word> {
+    let mut inner = String::new();
+    while let Some((_, c)) = chars.next() {
+        match c {
+            '`' => break,
+            '\\' => {
+                inner.push('\\');
+                if let Some((_, next)) = chars.next() {
+                    inner.push(next);
+                }
+            }
+            _ => inner.push(c),
+        }
+    }
+    let program = Parser::new_at_depth(&inner, depth + 1)?.parse()?;
+    Ok(Word::CmdSub(Box::new(program.into_command())))
+}
+
 fn collect_balanced(
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
     open: char,
@@ -747,7 +794,12 @@ fn collect_balanced(
         if c == open {
             depth += 1;
         } else if c == close {
-            depth -= 1;
+            // Saturating, not `-= 1`: every current call site peeks the
+            // opening delimiter before calling, so `depth` is at least 1
+            // here, but that is a convention among callers rather than
+            // anything this function enforces. An underflow would panic in
+            // debug and wrap to `usize::MAX` in release.
+            depth = depth.saturating_sub(1);
             if depth == 0 {
                 break;
             }

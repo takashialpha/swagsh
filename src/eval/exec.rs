@@ -10,7 +10,7 @@ use rustix::termios::tcsetpgrp;
 
 use crate::ast::{Command, Pipeline, Redirect, RedirectKind, SimpleCmd, Word};
 use crate::errfmt::{emit, strerror};
-use crate::fd::{close_raw, dup2_raw, open_read, open_write, raw_pipe, write_raw};
+use crate::fd::{close_if_open, close_raw, dup2_raw, open_read, open_write, raw_pipe, write_raw};
 use crate::jobs::{ExitStatus, JobState, decode_wait_status};
 use crate::signal::restore_child_signals;
 
@@ -403,22 +403,32 @@ impl Shell {
             match &r.kind {
                 RedirectKind::Out => {
                     let fd = open_write(&self.word_to_path(&r.target)?, false)?;
-                    dup2_raw(fd, r.fd)?;
-                    close_raw(fd);
+                    move_fd(fd, r.fd)?;
                 }
                 RedirectKind::Append => {
                     let fd = open_write(&self.word_to_path(&r.target)?, true)?;
-                    dup2_raw(fd, r.fd)?;
-                    close_raw(fd);
+                    move_fd(fd, r.fd)?;
                 }
                 RedirectKind::In => {
                     let fd = open_read(&self.word_to_path(&r.target)?)?;
-                    dup2_raw(fd, r.fd)?;
-                    close_raw(fd);
+                    move_fd(fd, r.fd)?;
                 }
                 RedirectKind::FdOut => {
-                    if let Word::Literal(s) = &r.target {
-                        let target_fd: RawFd = s.parse().map_err(|_| anyhow!("invalid fd: {s}"))?;
+                    // Expanded as a word rather than matched against
+                    // `Word::Literal`: `>&$fd` is an ordinary word, and the
+                    // literal-only match silently dropped the redirect for
+                    // anything else, leaving output on the original
+                    // descriptor with no error at all.
+                    let target = self.expand_word_to_string(&r.target)?;
+                    if target == "-" {
+                        // POSIX `>&-`: close the descriptor outright, and
+                        // quietly do nothing when it was not open to begin
+                        // with (see `close_if_open`).
+                        close_if_open(r.fd);
+                    } else {
+                        let target_fd: RawFd = target
+                            .parse()
+                            .map_err(|_| anyhow!("invalid fd: {target}"))?;
                         dup2_raw(target_fd, r.fd)?;
                     }
                 }
@@ -426,7 +436,9 @@ impl Shell {
                     let fd = open_write(&self.word_to_path(&r.target)?, false)?;
                     dup2_raw(fd, 1)?;
                     dup2_raw(fd, 2)?;
-                    close_raw(fd);
+                    if fd != 1 && fd != 2 {
+                        close_raw(fd);
+                    }
                 }
                 RedirectKind::HereDoc { raw_body, quoted } => {
                     let content = if *quoted {
@@ -607,4 +619,21 @@ fn execvp_path(argv: &[CString], display_argv0: Option<&CString>, empty_env: boo
         }
     }
     last_err
+}
+
+/// Moves a freshly opened descriptor onto the slot the redirection names,
+/// dropping the original.
+///
+/// The `fd == target` guard is the whole point: the kernel hands out the
+/// lowest free descriptor, so `exec 3>file` in a shell holding only 0-2 gets
+/// exactly fd 3 back. `dup2(3, 3)` is a documented no-op, and the `close(3)`
+/// that used to follow it then shut the redirection down again, so
+/// `exec 3>file; echo x >&3` reported EBADF while fd 4 and up worked.
+fn move_fd(fd: RawFd, target: RawFd) -> Result<()> {
+    if fd == target {
+        return Ok(());
+    }
+    dup2_raw(fd, target)?;
+    close_raw(fd);
+    Ok(())
 }

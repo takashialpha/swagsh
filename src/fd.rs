@@ -29,6 +29,22 @@ pub fn close_raw(fd: RawFd) {
     let _ = unsafe { OwnedFd::from_raw_fd(fd) };
 }
 
+/// Closes `fd` only if it is currently open.
+///
+/// [`close_raw`] hands the descriptor to an `OwnedFd`, and that drop asserts
+/// the underlying `close` succeeded: closing a descriptor that was never
+/// open (`exec 3>&-` in a shell with no fd 3) aborts the whole process with
+/// "IO Safety violation: owned file descriptor already closed". A shell
+/// wants that to be a quiet no-op, so probe first.
+pub fn close_if_open(fd: RawFd) {
+    // SAFETY: borrowed only for the fcntl probe; ownership is not taken
+    // here, and `close_raw` below re-derives its own owned handle.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    if rustix::io::fcntl_getfd(borrowed).is_ok() {
+        close_raw(fd);
+    }
+}
+
 /// Creates a new pipe, returning the raw `(read, write)` file descriptors.
 ///
 /// # Errors

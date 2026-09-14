@@ -62,7 +62,7 @@ pub enum Token {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedirToken {
     pub kind: RedirKind,
-    pub fd: Option<u32>,
+    pub fd: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,6 +418,11 @@ impl<'src> Lexer<'src> {
                     self.lex_single_quoted(&mut delim)?;
                     quoted = true;
                 }
+                // POSIX: if *any* character of the delimiter word is
+                // quoted, the body is not expanded. Single quotes already
+                // set this; double quotes and a backslash escape are the
+                // other two spellings and were both being missed, so
+                // `<<"EOF"` wrongly expanded `$VAR` in the body.
                 Some(b'"') => {
                     self.advance();
                     let start = delim.len();
@@ -426,10 +431,29 @@ impl<'src> Lexer<'src> {
                     if delim.ends_with('"') {
                         delim.pop();
                     }
+                    quoted = true;
                 }
-                Some(b) => {
+                Some(b'\\') => {
+                    self.advance();
+                    match self.advance() {
+                        None => break,
+                        Some(b) if b < UTF8_CONT_START => delim.push(b as char),
+                        Some(_) => self.push_utf8(&mut delim, self.pos - 1),
+                    }
+                    quoted = true;
+                }
+                // `b as char` on a lead byte would mangle a non-ASCII
+                // delimiter into mojibake (`é` became `Ã©`), which then
+                // never matched the properly decoded body line and ran the
+                // here-document to end of input.
+                Some(b) if b < UTF8_CONT_START => {
                     self.advance();
                     delim.push(b as char);
+                }
+                Some(_) => {
+                    let start = self.pos;
+                    self.advance();
+                    self.push_utf8(&mut delim, start);
                 }
             }
         }
@@ -450,9 +474,13 @@ impl<'src> Lexer<'src> {
         let mut body = String::new();
         loop {
             let mut line = String::new();
+            let mut at_eof = false;
             loop {
                 match self.peek() {
-                    None => return Ok(Token::HereDoc { body, quoted }),
+                    None => {
+                        at_eof = true;
+                        break;
+                    }
                     Some(b'\n') => {
                         self.advance();
                         break;
@@ -476,6 +504,23 @@ impl<'src> Lexer<'src> {
             if check == delim {
                 break;
             }
+            // Input ran out before the delimiter line ever appeared. Every
+            // other shell warns and uses the body it managed to collect, so
+            // do the same rather than failing the parse outright. The
+            // non-empty check matters: a heredoc whose last line carries no
+            // trailing newline still has content here and used to be dropped
+            // on the floor, while a body that ended cleanly on a newline
+            // leaves `check` empty and must not gain a stray blank line.
+            if at_eof {
+                if !check.is_empty() {
+                    body.push_str(check);
+                    body.push('\n');
+                }
+                crate::errfmt::emit(format!(
+                    "warning: here-document delimited by end-of-file (wanted `{delim}`)"
+                ));
+                break;
+            }
             body.push_str(check);
             body.push('\n');
         }
@@ -491,7 +536,7 @@ impl<'src> Lexer<'src> {
     /// that is confirmed (via `peek`/`peek2`) to be followed by `>`; the
     /// error path below exists only to keep this total rather than panic if
     /// that invariant is ever violated.
-    fn lex_redir(&mut self, fd: Option<u32>) -> Result<Token, LexError> {
+    fn lex_redir(&mut self, fd: Option<i32>) -> Result<Token, LexError> {
         let kind = match self.advance() {
             Some(b'>') => {
                 if self.peek() == Some(b'>') {
@@ -543,8 +588,7 @@ impl<'src> Lexer<'src> {
             match self.peek() {
                 None
                 | Some(
-                    b' ' | b'\t' | b'\r' | b'\n' | b';' | b'|' | b'&' | b'(' | b')' | b'{' | b'}'
-                    | b'<' | b'>',
+                    b' ' | b'\t' | b'\r' | b'\n' | b';' | b'|' | b'&' | b'(' | b')' | b'<' | b'>',
                 ) => break,
                 Some(b'#') => {
                     if buf.is_empty() {
@@ -646,6 +690,17 @@ impl<'src> Lexer<'src> {
     // Public interface
     // ------------------------------------------------------------------
 
+    /// True when the brace under the cursor is a complete word by itself,
+    /// i.e. what follows it delimits a word rather than continuing one.
+    fn brace_is_own_word(&self) -> bool {
+        matches!(
+            self.peek2(),
+            None | Some(
+                b' ' | b'\t' | b'\r' | b'\n' | b';' | b'|' | b'&' | b'(' | b')' | b'<' | b'>'
+            )
+        )
+    }
+
     /// # Errors
     ///
     /// Returns an error if the next token is malformed (e.g. an unclosed
@@ -701,11 +756,17 @@ impl<'src> Lexer<'src> {
                 self.advance();
                 return Ok(Token::RParen);
             }
-            Some(b'{') => {
+            // `{`/`}` are reserved words only where a command can start
+            // and only as a word of their own (`{ list; }`). Glued to other
+            // text they are ordinary characters, so `echo a{b}c` is a single
+            // literal word: emitting `LBrace`/`RBrace` unconditionally split
+            // it into three commands and ran `b` and `c`. Falling through
+            // hands them to `lex_word_into`, which no longer breaks on them.
+            Some(b'{') if self.brace_is_own_word() => {
                 self.advance();
                 return Ok(Token::LBrace);
             }
-            Some(b'}') => {
+            Some(b'}') if self.brace_is_own_word() => {
                 self.advance();
                 return Ok(Token::RBrace);
             }
@@ -729,11 +790,18 @@ impl<'src> Lexer<'src> {
         let mut buf = String::new();
         self.lex_word_into(&mut buf)?;
 
+        // A leading digit run only introduces a redirection if it actually
+        // fits a file descriptor. `9999999999>file` is not fd 9999999999:
+        // bash treats an out-of-range run as an ordinary command word (and
+        // then reports "command not found"), which is exactly what falling
+        // through to `keyword_or_word` below does. Saturating to `u32::MAX`
+        // instead, as this used to, reached the parser as fd -1 once signed,
+        // and `OwnedFd::from_raw_fd(-1)` panicked, aborting the shell.
         if !buf.is_empty()
             && buf.chars().all(|c| c.is_ascii_digit())
             && matches!(self.peek(), Some(b'<' | b'>'))
+            && let Ok(fd) = buf.parse::<i32>()
         {
-            let fd: u32 = buf.parse().unwrap_or(u32::MAX);
             return self.lex_redir(Some(fd));
         }
 

@@ -12,12 +12,19 @@ use super::{LoopSignal, Shell, is_break, is_continue, is_return, loop_signal_lev
 impl Shell {
     pub(super) fn run_and_or(&mut self, aol: &AndOrList) -> Result<ExitStatus> {
         let items = &aol.items;
+        // The parser never emits an empty `items`, but `AndOrList` is an
+        // ordinary struct with public fields, so an empty one would reach
+        // the `items.len() - 1` below and underflow instead of harmlessly
+        // doing nothing.
+        let Some(last_index) = items.len().checked_sub(1) else {
+            return Ok(ExitStatus::SUCCESS);
+        };
         let mut status = ExitStatus::SUCCESS;
         let mut last_negated = false;
         let mut last_executed = 0;
         let mut i = 0;
         while i < items.len() {
-            let is_last = i == items.len() - 1;
+            let is_last = i == last_index;
             status = if aol.is_async && is_last {
                 self.run_pipeline_async(&items[i].command)?
             } else {
@@ -51,7 +58,7 @@ impl Shell {
         // list's last one. Every earlier item's failure is likewise
         // "explicitly tested" by the `&&`/`||` that follows it, whether or
         // not the rest of the chain ran.
-        if last_executed == items.len() - 1 {
+        if last_executed == last_index {
             self.check_errexit(status, last_negated);
         }
         Ok(status)
@@ -97,14 +104,12 @@ impl Shell {
     }
 
     pub(super) fn run_for(&mut self, fc: &ForClause) -> Result<ExitStatus> {
-        let items: Vec<String> = fc
-            .items
-            .iter()
-            .map(|w| self.expand_word(w))
-            .collect::<Result<Vec<Vec<String>>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+        // `expand_words`, not a flatten of per-word `expand_word`: a `for`
+        // list is a word list exactly like a command's arguments, so an
+        // unquoted `$v` or `$(...)` in it undergoes IFS field splitting.
+        // Only `expand_words` does that step, so `for w in $v` used to
+        // iterate once over the whole value instead of once per field.
+        let items = self.expand_words(&fc.items)?;
 
         self.loop_depth += 1;
         let mut status = ExitStatus::SUCCESS;

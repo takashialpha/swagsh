@@ -188,6 +188,78 @@ Build with the latest stable Rust: swagsh tracks the stable channel rather than 
 
 ---
 
+## TODO
+
+Gaps found by a full review pass over the interpreter, checked against
+`bash` and `dash`. Nothing here is implemented yet; the ordering is by how
+badly each one misleads, not by effort.
+
+### Silently wrong
+
+Like the trailing-redirect bug above, these return a plausible answer
+instead of an error, so a script hits them without any signal that
+something went wrong.
+
+- **Arithmetic is missing most of its operators and yields a wrong number
+  rather than complaining.** `$(( ))` covers `+ - * / %`, the comparisons,
+  `&& || !` and parentheses. POSIX also requires the bitwise and shift
+  operators (`& | ^ << >> ~`), the ternary `?:`, and the assignment forms
+  (`x = 5`, `+=`, `<<=`, ...). None are implemented, and `arith_tokenize`
+  discards any character it does not recognise instead of erroring, so
+  `$((1|2))` evaluates to `1` and `$((6&3))` to `6`.
+- **Only decimal constants are understood.** `$((0x10))` is `0` and
+  `$((010))` is `10`, where POSIX requires `16` and `8`.
+- **Division by zero evaluates to `0`** instead of being an error.
+- **The unset-only parameter expansions are missing.** The colon forms
+  (`${v:-w}`, `${v:+w}`, `${v:=w}`, `${v:?w}`) work. The POSIX forms without
+  the colon, which test for *unset* rather than unset-or-empty (`${v-w}`,
+  `${v+w}`, `${v=w}`, `${v?w}`), are not recognised by `parse_param_op` at
+  all and expand to the empty string.
+
+### Unsupported, but visibly so
+
+- **`<&` (input descriptor duplication) is a parse error.** `>&` works, but
+  the lexer has no `InFd` counterpart to its `OutFd`, so `exec 3<file;
+  cat <&3` does not parse.
+- **Globs have no bracket expressions.** `[abc]`, `[a-z]` and `[!abc]` match
+  literally; `glob_match` implements `*` and `?` only.
+- **Only the final path component is globbed.** `a/*/b` is left untouched,
+  since `glob_expand` splits on the last `/` and treats everything before it
+  as a literal directory.
+- **`~user` is not expanded**, only `~` and `~/...`.
+- **`set` implements `-e`, `-x` and `-u` only.** POSIX also specifies `-a`,
+  `-b`, `-C`, `-f`, `-m`, `-n` and `-v`, and `$-` (the active option letters)
+  is always empty.
+- **Aliases are resolved when a command runs, not while it is parsed.**
+  POSIX expands them during tokenization, so an alias can stand in for
+  partial syntax: `alias fori='for i in'` then `fori 1 2; do ...; done`
+  works in `dash` and is a parse error here, since by evaluation time the
+  grammar has already been fixed. The same difference runs the other way
+  for `alias l=cmd; l` on a single line, which this shell accepts and a
+  POSIX one does not.
+
+### Smaller
+
+- `echo`/`printf` do not check their writes, so `echo x >&-` succeeds
+  quietly where other shells report `write error: Bad file descriptor`.
+- `$0` under `-c` is the binary's path rather than the shell's name.
+
+### Planned interactive work
+
+All of this has to stay strictly on the interactive side: none of it may
+change script execution or its performance. That separation holds today by
+construction, since `repl.rs` and `prompt.rs` are reachable only from
+`main`'s interactive branch and the only ANSI escapes outside `prompt.rs`
+are `echo -e`'s own, but nothing enforces it at the type level.
+
+- A startup banner when launched interactively.
+- Completion and syntax highlighting, through rustyline's `Completer` and
+  `Highlighter`.
+- A configuration file, beyond the `~/.swagshrc` and `~/.swagsh_profile`
+  script sourcing that already exists.
+
+---
+
 ## Contributing
 
 Issues and pull requests are welcome. Open an issue before starting work on a large change.
