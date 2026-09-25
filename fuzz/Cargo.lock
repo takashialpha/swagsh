@@ -378,6 +378,7 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "rustc-hash",
  "rustix",
  "rustyline",

@@ -23,17 +23,47 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
+      # What each of these actually runs lives in the justfile, so CI and a
+      # local run cannot disagree about what "passing" means.
       - name: Test
-        run: cargo test --verbose
+        run: just test
 
       - name: Format check
-        run: cargo fmt --all -- --check
+        run: just fmt
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: just lint
+
+      - name: Module boundaries
+        run: just boundaries
+
+  deps:
+    name: Unused dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-shear, just
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Unused dependencies
+        run: just deps
 
   fuzz-build:
     name: Fuzz targets build
@@ -49,13 +79,18 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
 
       - name: Build fuzz targets
-        run: cargo build --manifest-path fuzz/Cargo.toml
+        run: just fuzz-build
 
   fuzz-discover:
     name: Discover fuzz targets
@@ -69,15 +104,17 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+      - name: Install tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz, just
 
       # Reads fuzz/fuzz_targets/ via cargo-fuzz itself, not a hardcoded
       # list here, so a new fuzz target is picked up automatically.
       - name: List fuzz targets
         id: list
         run: |
-          targets=$(cargo fuzz list --fuzz-dir fuzz | awk '
+          targets=$(just fuzz-list | awk '
             BEGIN { printf "[" }
             { printf "%s\"%s\"", (NR > 1 ? "," : ""), $0 }
             END { printf "]" }
@@ -108,11 +145,13 @@ jobs:
         with:
           workspaces: fuzz
 
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+      - name: Install tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz, just
 
       - name: Fuzz ${{ matrix.target }}
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60
+        run: just fuzz ${{ matrix.target }} 60
 
       - name: Upload crash artifacts
         if: failure()

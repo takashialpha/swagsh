@@ -26,15 +26,26 @@ This directory is its own standalone crate (not a workspace member of the
 main one; see below), so all commands run from *inside* `fuzz/`, or via
 `cargo fuzz <cmd>` from the repo root, which shells out to it automatically.
 
-```sh
-# One target, until stopped (Ctrl-C) or it finds a crash:
-cargo +nightly fuzz run parse
+The `just` recipes at the repo root wrap all of it, and are what CI calls, so
+there is one definition of each command rather than two that can drift:
 
-# Bound the run instead of leaving it open-ended:
+```sh
+just fuzz-list            # what targets cargo-fuzz can see
+just fuzz parse           # one target, 60s
+just fuzz parse 120       # one target, 120s
+just fuzz-all             # every target, 60s each
+just fuzz-all 120         # every target, 120s each
+just fuzz-build           # just compile them, no fuzzing (what CI gates on)
+```
+
+Underneath, those are:
+
+```sh
+# One target, bounded (leave off `-max_total_time` to run until Ctrl-C or a crash):
 cargo +nightly fuzz run parse -- -max_total_time=120
 
-# Every target, current set:
-for t in parse eval_arith unescape param_expand; do
+# Every target, read from cargo-fuzz rather than a hardcoded list:
+for t in $(cargo fuzz list --fuzz-dir fuzz); do
     cargo +nightly fuzz run "$t" -- -max_total_time=60
 done
 ```
@@ -79,7 +90,7 @@ that separately; it can get large (sanitizer builds are not small).
 
 That still only clears `target/`, though: `corpus/`, `artifacts/`, and
 `coverage/` are cargo-fuzz's own accumulation, not cargo's, and outlive
-any `cargo clean`. `./clean.sh` clears all four in one go.
+any `cargo clean`. `just clean`, at the repo root, clears all four in one go.
 
 ## Lints
 

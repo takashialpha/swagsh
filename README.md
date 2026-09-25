@@ -264,5 +264,33 @@ are `echo -e`'s own, but nothing enforces it at the type level.
 
 Issues and pull requests are welcome. Open an issue before starting work on a large change.
 
+Every command CI runs is a [`just`](https://github.com/casey/just) recipe, and
+the workflows call those recipes rather than repeating the flags, so a green
+local run and a green pipeline cannot mean two different things. `just` on its
+own lists what there is; `just check` is the whole gate:
+
+```sh
+just check        # fmt + lint + test + boundaries + fuzz-build
+just fuzz parse   # fuzz one target (needs nightly and cargo-fuzz)
+just clean        # target/, and the corpus/artifacts cargo does not own
+```
+
+### Two modules own the unsafe
+
+The syscall surface is deliberately confined, and `just boundaries` enforces it
+because Rust has no way to express it as a lint:
+
+- **`src/sys.rs` is the only place allowed to name `libc::`.** It holds the
+  four libc-like primitives rustix does not expose publicly (`fork`, `execve`,
+  `sigaction`, `sigprocmask`). rustix hid its `runtime` module behind a name it
+  says "will rotate periodically", so depending on that meant breaking on every
+  rustix release; keeping the FFI in one file is what made moving off it a
+  one-file change.
+- **`src/fd.rs` owns every raw-descriptor conversion.** No `borrow_raw` or
+  `from_raw_fd` outside it. Callers take its safe wrappers instead.
+
+Everything else goes through rustix's stable public API, which is worth using
+directly: it is the experimental `runtime` corner that moved, not the rest.
+
 The parser and other pure interpreter internals are fuzz-tested; see
 [`fuzz/README.md`](fuzz/README.md) for targets and how to run them.

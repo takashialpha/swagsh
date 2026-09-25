@@ -19,13 +19,11 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 rustyline = "18"
 rustc-hash = "2"
-rustix = { version = "1", features = [
-  "fs",
-  "pipe",
-  "termios",
-  "process",
-  "runtime",
-] }
+rustix = { version = "1", features = ["fs", "pipe", "termios", "process"] }
+# Only for the four libc-like primitives rustix refuses to expose publicly
+# (fork/execve/sigaction/sigprocmask); see src/sys.rs. Already in the graph
+# via rustyline, so it costs nothing to compile.
+libc = "0.2"
 
 [profile.release]
 strip = true

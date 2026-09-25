@@ -2,7 +2,6 @@ use std::fmt;
 
 use anyhow::{Error, Result};
 use rustix::process::{Pid, Signal, getpid, setpgid};
-use rustix::runtime::kernel_sigaction;
 use rustix::termios::{OptionalActions, Termios, tcgetattr, tcsetattr, tcsetpgrp};
 
 use crate::ast::{Command, Program, SimpleCmd};
@@ -11,7 +10,8 @@ use crate::env::Env;
 use crate::errfmt::emit;
 use crate::fd::{restore_fds, save_fds};
 use crate::jobs::{ExitStatus, JobTable};
-use crate::signal::{sig_ign_action, sig_interrupt_action, take_interrupted};
+use crate::signal::{sig_interrupt_action, take_interrupted};
+use crate::sys::{SigHandler, sigaction};
 
 mod compound;
 mod exec;
@@ -202,11 +202,10 @@ impl Shell {
             sane_termios = tcgetattr(std::io::stdin()).ok();
             // SAFETY: main shell process, single-threaded at startup.
             unsafe {
-                let ign = sig_ign_action();
-                let _ = kernel_sigaction(Signal::TTOU, Some(ign.clone()));
-                let _ = kernel_sigaction(Signal::TTIN, Some(ign.clone()));
-                let _ = kernel_sigaction(Signal::TSTP, Some(ign));
-                let _ = kernel_sigaction(Signal::INT, Some(sig_interrupt_action()));
+                let _ = sigaction(Signal::TTOU, SigHandler::Ignore);
+                let _ = sigaction(Signal::TTIN, SigHandler::Ignore);
+                let _ = sigaction(Signal::TSTP, SigHandler::Ignore);
+                let _ = sigaction(Signal::INT, sig_interrupt_action());
             }
         }
         Self {

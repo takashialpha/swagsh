@@ -25,3 +25,4 @@ pub mod parser;
 pub(crate) mod prompt;
 pub mod repl;
 pub mod signal;
+pub(crate) mod sys;

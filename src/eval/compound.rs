@@ -1,5 +1,5 @@
+use crate::sys::{Fork, fork};
 use anyhow::Result;
-use rustix::runtime::{Fork, kernel_fork};
 
 use crate::ast::{AndOrList, AndOrOp, CaseClause, ForClause, GroupCmd, IfClause, WhileClause};
 use crate::errfmt::emit;
@@ -205,8 +205,8 @@ impl Shell {
     pub(super) fn run_group(&mut self, gc: &GroupCmd) -> Result<ExitStatus> {
         if gc.subshell {
             // SAFETY: fork.
-            match unsafe { kernel_fork()? } {
-                Fork::Child(_) => {
+            match unsafe { fork()? } {
+                Fork::Child => {
                     // SAFETY: in child, before any allocations.
                     unsafe { restore_child_signals(self.interactive) };
                     let status = match self.run_list(&gc.body) {

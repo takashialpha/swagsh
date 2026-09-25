@@ -1,10 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustix::process::Signal;
-use rustix::runtime::{
-    How, KERNEL_SIG_DFL, KernelSigSet, KernelSigaction, KernelSigactionFlags, kernel_sig_ign,
-    kernel_sigaction, kernel_sigprocmask,
-};
+
+use crate::sys::{SigHandler, sigaction, unblock_all_signals};
 
 /// Set by [`handle_sigint`] when the interactive shell's own `SIGINT`
 /// handler fires; drained by [`take_interrupted`]. An atomic store is the
@@ -25,38 +23,13 @@ extern "C" fn handle_sigint(_signum: core::ffi::c_int) {
 /// was active beforehand when they return; since this is installed before
 /// the first such call, that restore always lands back on this handler.
 #[must_use]
-pub fn sig_interrupt_action() -> KernelSigaction {
-    KernelSigaction {
-        sa_handler_kernel: Some(handle_sigint),
-        sa_flags: KernelSigactionFlags::empty(),
-        sa_mask: KernelSigSet::empty(),
-        ..Default::default()
-    }
+pub const fn sig_interrupt_action() -> SigHandler {
+    SigHandler::Handler(handle_sigint)
 }
 
 /// Reports and clears whether `SIGINT` has arrived since the last call.
 pub fn take_interrupted() -> bool {
     INTERRUPTED.swap(false, Ordering::SeqCst)
-}
-
-#[must_use]
-pub fn sig_ign_action() -> KernelSigaction {
-    KernelSigaction {
-        sa_handler_kernel: kernel_sig_ign(),
-        sa_flags: KernelSigactionFlags::empty(),
-        sa_mask: KernelSigSet::empty(),
-        ..Default::default()
-    }
-}
-
-#[must_use]
-pub fn sig_dfl_action() -> KernelSigaction {
-    KernelSigaction {
-        sa_handler_kernel: KERNEL_SIG_DFL,
-        sa_flags: KernelSigactionFlags::empty(),
-        sa_mask: KernelSigSet::empty(),
-        ..Default::default()
-    }
 }
 
 /// Restore default signal dispositions and unblock all signals in a forked child.
@@ -77,24 +50,22 @@ pub fn sig_dfl_action() -> KernelSigaction {
 /// any allocator or async-signal-unsafe code runs.
 #[inline]
 pub unsafe fn restore_child_signals(interactive: bool) {
-    let dfl = sig_dfl_action();
-    if interactive {
+    let conditional: &[Signal] = if interactive {
+        &[Signal::TTOU, Signal::TTIN, Signal::TSTP, Signal::INT]
+    } else {
+        &[]
+    };
+    for sig in conditional
+        .iter()
+        .copied()
+        .chain([Signal::QUIT, Signal::PIPE])
+    {
         // SAFETY: see this function's own `# Safety` doc: called only just
         // after `fork`, in the child, before any async-signal-unsafe code.
-        let _ = unsafe { kernel_sigaction(Signal::TTOU, Some(dfl.clone())) };
-        // SAFETY: see this function's own `# Safety` doc.
-        let _ = unsafe { kernel_sigaction(Signal::TTIN, Some(dfl.clone())) };
-        // SAFETY: see this function's own `# Safety` doc.
-        let _ = unsafe { kernel_sigaction(Signal::TSTP, Some(dfl.clone())) };
-        // SAFETY: see this function's own `# Safety` doc.
-        let _ = unsafe { kernel_sigaction(Signal::INT, Some(dfl.clone())) };
+        let _ = unsafe { sigaction(sig, SigHandler::Default) };
     }
     // SAFETY: see this function's own `# Safety` doc.
-    let _ = unsafe { kernel_sigaction(Signal::QUIT, Some(dfl.clone())) };
-    // SAFETY: see this function's own `# Safety` doc.
-    let _ = unsafe { kernel_sigaction(Signal::PIPE, Some(dfl)) };
-    // SAFETY: see this function's own `# Safety` doc.
-    let _ = unsafe { kernel_sigprocmask(How::SETMASK, Some(&KernelSigSet::empty())) };
+    let _ = unsafe { unblock_all_signals() };
 }
 
 /// Resets `SIGPIPE` to its default (terminate) disposition for the shell's
@@ -114,7 +85,5 @@ pub unsafe fn restore_child_signals(interactive: bool) {
 pub fn reset_sigpipe() {
     // SAFETY: installs the default disposition (not a custom handler),
     // before any other threads exist.
-    unsafe {
-        let _ = kernel_sigaction(Signal::PIPE, Some(sig_dfl_action()));
-    }
+    let _ = unsafe { sigaction(Signal::PIPE, SigHandler::Default) };
 }

@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow, bail};
 use rustix::fd::RawFd;
 use rustix::io::Errno;
 use rustix::process::{Pid, WaitOptions, getpid, setpgid, waitpid};
-use rustix::runtime::{Fork, execve, kernel_fork};
+
 use rustix::termios::tcsetpgrp;
 
 use crate::ast::{Command, Pipeline, Redirect, RedirectKind, SimpleCmd, Word};
@@ -13,6 +13,7 @@ use crate::errfmt::{emit, strerror};
 use crate::fd::{close_if_open, close_raw, dup2_raw, open_read, open_write, raw_pipe, write_raw};
 use crate::jobs::{ExitStatus, JobState, decode_wait_status};
 use crate::signal::restore_child_signals;
+use crate::sys::{Fork, execve, fork};
 
 use super::{Resolved, Shell, catch_return, is_break, is_continue, is_return};
 
@@ -104,7 +105,7 @@ impl Shell {
                 (Some(r), Some(w))
             };
 
-            let child = self.fork_command(cmd, prev_read, pipe_write, pgid)?;
+            let child = self.fork_command(cmd, prev_read, pipe_write, pipe_read, pgid)?;
 
             if let Some(existing) = pgid {
                 let _ = setpgid(Some(child), Some(existing));
@@ -129,21 +130,36 @@ impl Shell {
         Ok((pgid, pids))
     }
 
+    /// Forks one pipeline stage.
+    ///
+    /// `unused_pipe_end` is the read end of the pipe this stage *writes* into.
+    /// That pipe has to exist before the fork, so the child inherits both of
+    /// its ends, and the child must drop the read end: nothing here reads from
+    /// it, and while it stays open the pipe still has a reader. The kernel
+    /// then never raises `SIGPIPE` when the next stage exits, so a writer that
+    /// outlives its reader (`yes | head -1`, `seq 1 100000 | head -1`) fills
+    /// the pipe and blocks on the write forever instead of dying.
     fn fork_command(
         &mut self,
         cmd: &Command,
         stdin_override: Option<RawFd>,
         stdout_override: Option<RawFd>,
+        unused_pipe_end: Option<RawFd>,
         pgid: Option<Pid>,
     ) -> Result<Pid> {
         // SAFETY: fork rules: async-signal-safe code only in child until exec.
-        match unsafe { kernel_fork()? } {
-            Fork::Child(_) => {
+        match unsafe { fork()? } {
+            Fork::Child => {
                 // SAFETY: in child, before any allocations.
                 unsafe { restore_child_signals(self.interactive) };
                 let my_pid = getpid();
                 let group = pgid.unwrap_or(my_pid);
                 let _ = setpgid(Some(my_pid), Some(group));
+                // Before the `dup2`s below, so a descriptor number being
+                // reused as 0/1 cannot close the wrong thing.
+                if let Some(fd) = unused_pipe_end {
+                    close_raw(fd);
+                }
                 if let Some(fd) = stdin_override {
                     let _ = dup2_raw(fd, 0);
                     close_raw(fd);
@@ -251,8 +267,8 @@ impl Shell {
         assignments: &[String],
     ) -> Result<ExitStatus> {
         // SAFETY: fork; async-signal-safe code only in child.
-        match unsafe { kernel_fork()? } {
-            Fork::Child(_) => {
+        match unsafe { fork()? } {
+            Fork::Child => {
                 // SAFETY: in child, before any allocations.
                 unsafe { restore_child_signals(self.interactive) };
                 if self.interactive {
@@ -493,7 +509,7 @@ fn write_herestring(content: &str) -> Result<()> {
         }
     } else {
         // SAFETY: grandchild only writes to pipe and exits immediately.
-        if let Ok(Fork::Child(_)) = unsafe { kernel_fork() } {
+        if matches!(unsafe { fork() }, Ok(Fork::Child)) {
             close_raw(read_fd);
             let mut written = 0;
             while written < bytes.len() {

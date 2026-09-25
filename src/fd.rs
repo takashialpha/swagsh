@@ -29,6 +29,18 @@ pub fn close_raw(fd: RawFd) {
     let _ = unsafe { OwnedFd::from_raw_fd(fd) };
 }
 
+/// Reports whether `fd` refers to a terminal.
+///
+/// Wrapped here rather than at the call site so the unsafe borrow of a raw
+/// descriptor stays in this module with every other one (`test -t N` is the
+/// only caller).
+#[must_use]
+pub fn fd_is_tty(fd: RawFd) -> bool {
+    // SAFETY: the descriptor is only borrowed for the `isatty` query; nothing
+    // here takes ownership of it or closes it.
+    rustix::termios::isatty(unsafe { BorrowedFd::borrow_raw(fd) })
+}
+
 /// Closes `fd` only if it is currently open.
 ///
 /// [`close_raw`] hands the descriptor to an `OwnedFd`, and that drop asserts

@@ -16,9 +16,9 @@ use std::os::unix::fs::FileTypeExt;
 use anyhow::{Result, bail};
 use rustix::fd::RawFd;
 use rustix::fs::Access;
-use rustix::termios::isatty;
 
 use crate::eval::Shell;
+use crate::fd::fd_is_tty;
 use crate::jobs::ExitStatus;
 
 pub fn builtin_bracket(_shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
@@ -128,10 +128,7 @@ fn parse_primary<'a>(args: &'a [&'a str]) -> (bool, &'a [&'a str]) {
         ["-n", s, rest @ ..] => (!s.is_empty(), rest),
 
         ["-t", fd_str, rest @ ..] => {
-            let val = fd_str.parse::<RawFd>().is_ok_and(|fd| {
-                // SAFETY: we only borrow the fd for the isatty call; not closed.
-                isatty(unsafe { rustix::fd::BorrowedFd::borrow_raw(fd) })
-            });
+            let val = fd_str.parse::<RawFd>().is_ok_and(fd_is_tty);
             (val, rest)
         }
 

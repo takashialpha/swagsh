@@ -1,7 +1,7 @@
+use crate::sys::{Fork, fork};
 use anyhow::Result;
 use rustix::io::Errno;
 use rustix::process::{WaitOptions, waitpid};
-use rustix::runtime::{Fork, kernel_fork};
 
 use crate::ast::{Command, Word};
 use crate::errfmt::emit;
@@ -326,8 +326,8 @@ impl Shell {
     fn expand_cmd_sub(&self, cmd: &Command) -> Result<String> {
         let (read_fd, write_fd) = raw_pipe()?;
         // SAFETY: fork.
-        match unsafe { kernel_fork()? } {
-            Fork::Child(_) => {
+        match unsafe { fork()? } {
+            Fork::Child => {
                 // SAFETY: in child, before any allocations.
                 unsafe { restore_child_signals(self.interactive) };
                 close_raw(read_fd);
