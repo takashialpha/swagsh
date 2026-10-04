@@ -134,8 +134,10 @@ paru -S swagsh   # or: yay -S swagsh
 ```sh
 git clone https://github.com/takashialpha/swagsh.git
 cd swagsh
-cargo build --release   # binary at target/release/swagsh
+just build   # binary at target/release/swagsh
 ```
+
+`just build` is a thin wrapper over `cargo build --release`, the same recipe the release workflow uses; plain cargo works too if you do not have [just](https://github.com/casey/just). Run `just` to list the other recipes.
 
 Build with the latest stable Rust: swagsh tracks the stable channel rather than supporting a minimum version, and uses new language features as they land. If cargo reports your toolchain is too old, run `rustup update stable`.
 
@@ -270,7 +272,7 @@ local run and a green pipeline cannot mean two different things. `just` on its
 own lists what there is; `just check` is the whole gate:
 
 ```sh
-just check        # fmt + lint + test + boundaries + fuzz-build
+just check        # fmt + lint + test + boundaries + deps + fuzz-build
 just fuzz parse   # fuzz one target (needs nightly and cargo-fuzz)
 just clean        # target/, and the corpus/artifacts cargo does not own
 ```
