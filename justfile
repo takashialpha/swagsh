@@ -80,7 +80,13 @@ fuzz-list:
 
 # fuzz one target for SECONDS (cargo-fuzz needs nightly)
 fuzz target seconds="60":
-    cargo +nightly fuzz run {{ target }} -- -max_total_time={{ seconds }}
+    #!/bin/sh
+    set -eu
+    # cargo-fuzz defaults `--target` to the triple it was itself built for,
+    # and prebuilt binaries (e.g. CI's install-action) are musl builds, which
+    # ASan rejects. Pin the real host triple instead.
+    host=$(rustc +nightly -vV | sed -n 's/^host: //p')
+    cargo +nightly fuzz run --target "$host" {{ target }} -- -max_total_time={{ seconds }}
 
 # fuzz every target for SECONDS each
 fuzz-all seconds="60":
@@ -88,9 +94,11 @@ fuzz-all seconds="60":
     set -eu
     # Read from cargo-fuzz rather than a list here, so a new target is picked
     # up without editing this file.
+    # Pin the host triple for the same reason as the `fuzz` recipe.
+    host=$(rustc +nightly -vV | sed -n 's/^host: //p')
     for t in $(cargo fuzz list --fuzz-dir fuzz); do
         echo "== $t =="
-        cargo +nightly fuzz run "$t" -- -max_total_time={{ seconds }}
+        cargo +nightly fuzz run --target "$host" "$t" -- -max_total_time={{ seconds }}
     done
 
 # throw away everything built, including what cargo does not own
