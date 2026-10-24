@@ -257,8 +257,8 @@ are `echo -e`'s own, but nothing enforces it at the type level.
 - A startup banner when launched interactively.
 - Completion and syntax highlighting, through rustyline's `Completer` and
   `Highlighter`.
-- A configuration file, beyond the `~/.swagshrc` and `~/.swagsh_profile`
-  script sourcing that already exists.
+- A configuration file, beyond the `~/.swagshrc`, `~/.swagsh_profile` and
+  `$ENV` script sourcing that already exists.
 
 ---
 

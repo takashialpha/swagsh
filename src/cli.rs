@@ -23,7 +23,7 @@ pub struct Cli {
     #[arg(long = "private")]
     pub private: bool,
 
-    /// Start as a login shell, sourcing `~/.swagsh_profile`.
+    /// Start as a login shell, sourcing `~/.swagsh_profile` instead of `~/.swagshrc`.
     #[arg(short = 'l', long = "login")]
     pub login: bool,
 

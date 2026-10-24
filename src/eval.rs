@@ -4,7 +4,7 @@ use anyhow::{Error, Result};
 use rustix::process::{Pid, Signal, getpid, setpgid};
 use rustix::termios::{OptionalActions, Termios, tcgetattr, tcsetattr, tcsetpgrp};
 
-use crate::ast::{Command, Program, SimpleCmd};
+use crate::ast::{Command, Program, Redirect, SimpleCmd, Word};
 use crate::builtins::{self, BuiltinFn};
 use crate::env::Env;
 use crate::errfmt::emit;
@@ -297,6 +297,9 @@ impl Shell {
                 self.env.define_function(fd.name.clone(), *fd.body.clone());
                 Ok(ExitStatus::SUCCESS)
             }
+            Command::Redirected(inner, redirects) => {
+                self.with_redirects(redirects, |shell| shell.run_command(inner))
+            }
         }
     }
 
@@ -307,13 +310,10 @@ impl Shell {
         }
         match resolved {
             Resolved::AssignOnly => {
-                // Nothing to run: apply redirects (for their side effects,
-                // e.g. `> file` still truncates it), then set the vars.
-                self.with_redirects(sc, |_| Ok(()))?;
-                for assign in &assignments {
-                    let (name, value) = split_assignment(assign);
-                    self.env.set(name, value);
-                }
+                // Nothing to run (`resolve_simple` already set the vars):
+                // apply redirects for their side effects, e.g. `> file`
+                // still truncates it.
+                self.with_redirects(&sc.redirects, |_| Ok(()))?;
                 Ok(ExitStatus::SUCCESS)
             }
             Resolved::Builtin(f, name, args) => {
@@ -356,14 +356,29 @@ impl Shell {
     /// this resolution logic in one place means both paths agree on what
     /// counts as a builtin, a function, or an external command.
     fn resolve_simple(&mut self, sc: &SimpleCmd) -> Result<(Vec<String>, Resolved)> {
-        let words = self.expand_words(&sc.words)?;
-        let assign_count = words.iter().take_while(|w| is_assignment(w)).count();
-        let (assignments, cmd_words) = words.split_at(assign_count);
-        let assignments = assignments.to_vec();
+        let assign_count = sc
+            .words
+            .iter()
+            .take_while(|w| is_assignment_word(w))
+            .count();
+        let (assign_words, cmd_words) = sc.words.split_at(assign_count);
+        let cmd_words = self.expand_command_words(cmd_words)?;
 
         if cmd_words.is_empty() {
+            // Performed in order, so `a=1 b=$a` sees the new `a`.
+            let mut assignments = Vec::with_capacity(assign_words.len());
+            for word in assign_words {
+                let assign = self.expand_assignment(word)?;
+                let (name, value) = split_assignment(&assign);
+                self.env.set(name, value);
+                assignments.push(assign);
+            }
             return Ok((assignments, Resolved::AssignOnly));
         }
+        let assignments = assign_words
+            .iter()
+            .map(|w| self.expand_assignment(w))
+            .collect::<Result<Vec<_>>>()?;
 
         let (name, args) = resolve_alias(&self.env, &cmd_words[0], &cmd_words[1..]);
 
@@ -390,9 +405,11 @@ impl Shell {
     ) -> Result<ExitStatus> {
         // alias/unalias receive verbatim (non-IFS-split) expanded args.
         let verbatim: Option<Vec<String>> = if matches!(name, "alias" | "unalias") {
-            let assign_count = sc.words.iter().take_while(|w| {
-                matches!(self.expand_word(w), Ok(v) if v.first().is_some_and(|s| is_assignment(s)))
-            }).count();
+            let assign_count = sc
+                .words
+                .iter()
+                .take_while(|w| is_assignment_word(w))
+                .count();
             Some(
                 sc.words[assign_count + 1..]
                     .iter()
@@ -441,7 +458,7 @@ impl Shell {
         // restores the original fds as soon as the closure returns, so
         // catching the error out here would `emit` it to the shell's real
         // stderr regardless of what the command's own redirects said.
-        let result = self.with_redirects(sc, |shell| match f(shell, &arg_refs) {
+        let result = self.with_redirects(&sc.redirects, |shell| match f(shell, &arg_refs) {
             Err(e)
                 if !is_break(&e) && !is_continue(&e) && !is_return(&e) && !is_interrupted(&e) =>
             {
@@ -470,7 +487,7 @@ impl Shell {
         // own independent loop nesting, so hide the caller's depth for the
         // duration of this call.
         let outer_loop_depth = std::mem::take(&mut self.loop_depth);
-        let result = self.with_redirects(sc, |shell| shell.run_command(body));
+        let result = self.with_redirects(&sc.redirects, |shell| shell.run_command(body));
         self.loop_depth = outer_loop_depth;
         self.env.set_positional_args(old_args);
         self.env.restore_vars(saved_vars);
@@ -494,7 +511,7 @@ impl Shell {
             .collect()
     }
 
-    /// Saves fds 0/1/2, applies `sc.redirects`, runs `f`, then restores the
+    /// Saves fds 0/1/2, applies `redirects`, runs `f`, then restores the
     /// original fds regardless of outcome. If applying the redirects fails,
     /// `f` doesn't run and that error is returned.
     ///
@@ -508,14 +525,14 @@ impl Shell {
     /// to restore.
     fn with_redirects<T>(
         &mut self,
-        sc: &SimpleCmd,
+        redirects: &[Redirect],
         f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
-        if sc.redirects.is_empty() {
+        if redirects.is_empty() {
             return f(self);
         }
         let saved_fds = save_fds(&[0, 1, 2])?;
-        let result = self.apply_redirects(&sc.redirects).and_then(|()| f(self));
+        let result = self.apply_redirects(redirects).and_then(|()| f(self));
         let _ = restore_fds(saved_fds);
         result
     }
@@ -552,6 +569,18 @@ fn resolve_alias(env: &Env, raw: &str, rest: &[String]) -> (String, Vec<String>)
             (name, parts)
         },
     )
+}
+
+/// Whether `word`, as written, is a `NAME=value` assignment. Decided before
+/// expansion, so `$v` holding `a=b` is an ordinary word.
+pub(crate) fn is_assignment_word(word: &Word) -> bool {
+    match word {
+        Word::Literal(s) => is_assignment(s),
+        Word::Compound(parts) => {
+            matches!(parts.first(), Some(Word::Literal(s)) if is_assignment(s))
+        }
+        _ => false,
+    }
 }
 
 #[must_use]

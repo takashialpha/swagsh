@@ -1,6 +1,7 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 use anyhow::Result;
+use rustix::process::{getegid, geteuid, getgid, getuid};
 use rustyline::error::ReadlineError;
 use rustyline::{Config, DefaultEditor};
 
@@ -119,15 +120,38 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+/// Sources the profile (login), then `$ENV` and the rc file (interactive).
+///
+/// The shell counts as interactive when stdin and stderr are both terminals,
+/// as POSIX defines it. `$ENV` comes after the profile so the profile can set
+/// it, and before the rc file so swagsh-specific settings win.
 pub fn source_startup_files(shell: &mut Shell, is_login: bool) {
-    let Some(home_str) = shell.env.get("HOME") else {
+    let home = shell.env.get("HOME").map(std::path::PathBuf::from);
+    if is_login && let Some(home) = &home {
+        source_if_exists(shell, &home.join(".swagsh_profile"));
+    }
+    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        return;
+    }
+    source_env_file(shell);
+    if !is_login && let Some(home) = &home {
+        source_if_exists(shell, &home.join(".swagshrc"));
+    }
+}
+
+/// POSIX: an interactive shell parameter-expands `$ENV` and sources the
+/// file it names, unless the real and effective user or group IDs differ.
+fn source_env_file(shell: &mut Shell) {
+    if getuid() != geteuid() || getgid() != getegid() {
+        return;
+    }
+    let Some(raw) = shell.env.get("ENV").filter(|s| !s.is_empty()) else {
         return;
     };
-    let home = std::path::PathBuf::from(home_str);
-    if is_login {
-        source_if_exists(shell, &home.join(".swagsh_profile"));
-    } else {
-        source_if_exists(shell, &home.join(".swagshrc"));
+    match shell.expand_raw_text(&raw) {
+        Ok(path) if !path.is_empty() => source_if_exists(shell, std::path::Path::new(&path)),
+        Ok(_) => {}
+        Err(e) => emit(format!("ENV: {e}")),
     }
 }
 
@@ -214,12 +238,17 @@ fn collect_heredoc_input(line: &str, rl: &mut DefaultEditor) -> String {
     let mut buf = line.to_owned();
     buf.push('\n');
 
-    for delim in delimiters {
-        let delim = delim.trim_matches(|c| c == '\'' || c == '"');
+    for (delim, strip_tabs) in delimiters {
         while let Ok(body_line) = rl.readline("> ") {
             buf.push_str(&body_line);
             buf.push('\n');
-            if body_line.trim_end_matches('\r') == delim {
+            let check = body_line.trim_end_matches('\r');
+            let check = if strip_tabs {
+                check.trim_start_matches('\t')
+            } else {
+                check
+            };
+            if check == delim {
                 break;
             }
         }
@@ -227,7 +256,9 @@ fn collect_heredoc_input(line: &str, rl: &mut DefaultEditor) -> String {
     buf
 }
 
-fn extract_heredoc_delimiters(line: &str) -> Vec<String> {
+/// Returns each here-doc's delimiter, with quoting removed, and whether it
+/// came from `<<-`.
+fn extract_heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
     let mut delims = Vec::new();
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
@@ -236,9 +267,7 @@ fn extract_heredoc_delimiters(line: &str) -> Vec<String> {
         }
         if c == '<' && chars.peek() == Some(&'<') {
             chars.next();
-            if chars.peek() == Some(&'-') {
-                chars.next();
-            }
+            let strip_tabs = chars.next_if_eq(&'-').is_some();
             // skip <<< (herestring, not heredoc)
             if chars.peek() == Some(&'<') {
                 chars.next();
@@ -248,14 +277,23 @@ fn extract_heredoc_delimiters(line: &str) -> Vec<String> {
                 chars.next();
             }
             let mut delim = String::new();
-            for ch in chars.by_ref() {
-                if ch.is_whitespace() || matches!(ch, ';' | '|' | '&') {
-                    break;
+            let mut quote = None;
+            while let Some(ch) = chars.next() {
+                match (quote, ch) {
+                    (None, '\'' | '"') => quote = Some(ch),
+                    (Some(q), _) if ch == q => quote = None,
+                    (None, '\\') => delim.extend(chars.next()),
+                    (None, _)
+                        if ch.is_whitespace()
+                            || matches!(ch, ';' | '|' | '&' | '<' | '>' | '(' | ')') =>
+                    {
+                        break;
+                    }
+                    _ => delim.push(ch),
                 }
-                delim.push(ch);
             }
             if !delim.is_empty() {
-                delims.push(delim);
+                delims.push((delim, strip_tabs));
             }
         }
     }

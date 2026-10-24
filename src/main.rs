@@ -28,6 +28,12 @@ fn main() -> Result<()> {
         }
     }
 
+    if env.get("SHELL").is_none_or(|s| s.is_empty())
+        && let Ok(exe) = std::env::current_exe()
+    {
+        env.export("SHELL", exe.to_string_lossy());
+    }
+
     if let Some(cmd) = &cli.command {
         let mut shell = Shell::new(env, false);
         return run_and_exit(&mut shell, cmd, &cli);

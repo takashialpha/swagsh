@@ -131,6 +131,8 @@ pub enum Command {
     Case(CaseClause),
     FunctionDef(FunctionDef),
     Group(GroupCmd),
+    /// A compound command followed by redirections: `while ...; done <file`.
+    Redirected(Box<Self>, Vec<Redirect>),
 }
 
 // ---------------------------------------------------------------------------

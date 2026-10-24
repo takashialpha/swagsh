@@ -112,16 +112,26 @@ impl Parser {
         // otherwise do for any script of real size. Wrong by some factor
         // just means one more/fewer reallocation, not a correctness issue.
         let mut tokens = Vec::with_capacity(src.len() / 4);
+        let mut unfilled_heredocs = Vec::new();
 
         loop {
             let (line, col) = lexer.position();
             let tok = lexer.next_token()?;
             let done = tok == Token::Eof;
+            if matches!(tok, Token::HereDoc { .. }) {
+                unfilled_heredocs.push(tokens.len());
+            }
             tokens.push(Spanned {
                 token: tok,
                 line,
                 col,
             });
+            let bodies = lexer.take_heredoc_bodies();
+            for (idx, body) in unfilled_heredocs.drain(..bodies.len()).zip(bodies) {
+                if let Token::HereDoc { body: slot, .. } = &mut tokens[idx].token {
+                    *slot = body;
+                }
+            }
             if done {
                 break;
             }
@@ -351,7 +361,7 @@ impl Parser {
     }
 
     fn parse_command_inner(&mut self) -> ParseResult<Command> {
-        match self.peek() {
+        let compound = match self.peek() {
             Token::If => self.parse_if(),
             Token::For => self.parse_for(),
             Token::While => self.parse_while(false),
@@ -359,10 +369,22 @@ impl Parser {
             Token::Case => self.parse_case(),
             Token::LBrace => self.parse_brace_group(),
             Token::LParen => self.parse_subshell(),
-            Token::Function => self.parse_function_def(),
-            Token::Word(_) if self.is_function_def_ahead() => self.parse_function_def(),
-            _ => self.parse_simple_cmd().map(Command::Simple),
+            Token::Function => return self.parse_function_def(),
+            Token::Word(_) if self.is_function_def_ahead() => return self.parse_function_def(),
+            _ => return self.parse_simple_cmd().map(Command::Simple),
+        }?;
+        let mut redirects = Vec::new();
+        while matches!(
+            self.peek(),
+            Token::Redir(_) | Token::HereString(_) | Token::HereDoc { .. }
+        ) {
+            redirects.push(self.parse_redirect()?);
         }
+        Ok(if redirects.is_empty() {
+            compound
+        } else {
+            Command::Redirected(Box::new(compound), redirects)
+        })
     }
 
     fn is_function_def_ahead(&self) -> bool {

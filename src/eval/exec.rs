@@ -564,6 +564,7 @@ fn describe_command(cmd: &Command) -> String {
         Command::Group(gc) if gc.subshell => "(...)".to_owned(),
         Command::Group(_) => "{ ... }".to_owned(),
         Command::FunctionDef(fd) => format!("{}()", fd.name),
+        Command::Redirected(inner, _) => describe_command(inner),
     }
 }
 

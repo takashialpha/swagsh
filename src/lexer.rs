@@ -130,6 +130,11 @@ pub struct Lexer<'src> {
     pos: usize,
     line: usize,
     col: usize,
+    /// Delimiter and `<<-` flag of each here-doc lexed on the current line,
+    /// in source order. POSIX starts their bodies after the next newline
+    /// token, so they are read only once the lexer reaches it.
+    pending_heredocs: Vec<(String, bool)>,
+    heredoc_bodies: Vec<String>,
 }
 
 impl<'src> Lexer<'src> {
@@ -140,6 +145,22 @@ impl<'src> Lexer<'src> {
             pos: 0,
             line: 1,
             col: 1,
+            pending_heredocs: Vec::new(),
+            heredoc_bodies: Vec::new(),
+        }
+    }
+
+    /// Bodies read since the last call, one per [`Token::HereDoc`] emitted
+    /// before the newline that ended them, in the same order. Those tokens
+    /// carry an empty `body` until the caller fills it in from here.
+    pub fn take_heredoc_bodies(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.heredoc_bodies)
+    }
+
+    fn read_pending_heredocs(&mut self) {
+        for (delim, strip_tabs) in std::mem::take(&mut self.pending_heredocs) {
+            let body = self.read_heredoc_body(&delim, strip_tabs);
+            self.heredoc_bodies.push(body);
         }
     }
 
@@ -412,7 +433,10 @@ impl<'src> Lexer<'src> {
         let mut quoted = false;
         loop {
             match self.peek() {
-                None | Some(b'\n' | b' ' | b'\t') => break,
+                None
+                | Some(b'\n' | b' ' | b'\t' | b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b')') => {
+                    break;
+                }
                 Some(b'\'') => {
                     self.advance();
                     self.lex_single_quoted(&mut delim)?;
@@ -460,17 +484,15 @@ impl<'src> Lexer<'src> {
         if delim.is_empty() {
             return Err(self.err("empty here-doc delimiter"));
         }
+        self.pending_heredocs.push((delim, strip_tabs));
+        Ok(Token::HereDoc {
+            body: String::new(),
+            quoted,
+        })
+    }
 
-        // Consume the remainder of the current line up to and including the newline.
-        while let Some(b) = self.peek() {
-            if b == b'\n' {
-                self.advance();
-                break;
-            }
-            self.advance();
-        }
-
-        // Collect body lines until a line equal to the delimiter is found.
+    /// Collects body lines until a line equal to `delim` is found.
+    fn read_heredoc_body(&mut self, delim: &str, strip_tabs: bool) -> String {
         let mut body = String::new();
         loop {
             let mut line = String::new();
@@ -524,8 +546,7 @@ impl<'src> Lexer<'src> {
             body.push_str(check);
             body.push('\n');
         }
-
-        Ok(Token::HereDoc { body, quoted })
+        body
     }
 
     // ------------------------------------------------------------------
@@ -709,9 +730,13 @@ impl<'src> Lexer<'src> {
         self.skip_whitespace();
 
         match self.peek() {
-            None => return Ok(Token::Eof),
+            None => {
+                self.read_pending_heredocs();
+                return Ok(Token::Eof);
+            }
             Some(b'\n') => {
                 self.advance();
+                self.read_pending_heredocs();
                 return Ok(Token::Newline);
             }
             Some(b'#') => {
