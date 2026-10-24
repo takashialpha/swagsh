@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rustix::process::Signal;
 
@@ -27,6 +27,37 @@ pub const fn sig_interrupt_action() -> SigHandler {
     SigHandler::Handler(handle_sigint)
 }
 
+/// One bit per signal number that has arrived since [`take_pending_traps`]
+/// last drained it, set by [`handle_trapped`] for every signal with a `trap`
+/// action.
+static PENDING_TRAPS: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn handle_trapped(signum: core::ffi::c_int) {
+    if let Ok(bit) = u32::try_from(signum)
+        && bit < 64
+    {
+        PENDING_TRAPS.fetch_or(1 << bit, Ordering::SeqCst);
+    }
+}
+
+/// The disposition for a signal that has a `trap` action: note its arrival
+/// for the shell to act on between commands.
+#[must_use]
+pub const fn trap_action() -> SigHandler {
+    SigHandler::Handler(handle_trapped)
+}
+
+/// Drains the set of trapped signals that arrived since the last call, as a
+/// bitmask by signal number.
+pub fn take_pending_traps() -> u64 {
+    // Checked first so the common case, nothing pending, is a plain load:
+    // this runs before every command.
+    if PENDING_TRAPS.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    PENDING_TRAPS.swap(0, Ordering::SeqCst)
+}
+
 /// Reports and clears whether `SIGINT` has arrived since the last call.
 pub fn take_interrupted() -> bool {
     INTERRUPTED.swap(false, Ordering::SeqCst)
@@ -34,9 +65,10 @@ pub fn take_interrupted() -> bool {
 
 /// Restore default signal dispositions and unblock all signals in a forked child.
 ///
-/// `interactive` gates `TTOU`/`TTIN`/`TSTP`/`INT`: `Shell::new` only ever
+/// `interactive` gates `TTOU`/`TTIN`/`TSTP`/`INT`: the shell only ever
 /// moves those away from their default disposition in the first place when
-/// `interactive` is true (see its own `if interactive { ... }` block), so
+/// it is interactive or has job control on (`Shell::new`,
+/// `Shell::set_monitor`), and callers pass exactly that, so
 /// resetting them in a non-interactive shell's children is resetting
 /// something that was never touched. That's not wrong, just 4 wasted
 /// `rt_sigaction` calls per fork; found via `strace -c` on a command-

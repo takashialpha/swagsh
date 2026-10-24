@@ -18,14 +18,14 @@ pub struct AliasBuiltin {
 impl Builtin for AliasBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
         if self.names.is_empty() {
-            let mut pairs: Vec<(&str, &str)> = shell.env.all_aliases().collect();
-            pairs.sort_by_key(|(k, _)| *k);
-            let printed_any = !pairs.is_empty();
+            let mut pairs: Vec<(String, String)> = shell
+                .env
+                .all_aliases()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect();
+            pairs.sort();
             for (k, v) in pairs {
-                println!("alias {k}={}", shell_quote_always(v));
-            }
-            if printed_any {
-                shell.note_stdout("\n");
+                shell.outln(&format!("alias {k}={}", shell_quote_always(&v)))?;
             }
             return Ok(ExitStatus::SUCCESS);
         }
@@ -38,8 +38,7 @@ impl Builtin for AliasBuiltin {
             if let Some((k, v)) = arg.split_once('=') {
                 shell.env.set_alias(k.to_owned(), v.to_owned());
             } else if let Some(v) = shell.env.get_alias(arg) {
-                println!("alias {arg}={}", shell_quote_always(&v));
-                shell.note_stdout("\n");
+                shell.outln(&format!("alias {arg}={}", shell_quote_always(&v)))?;
             } else {
                 emit(format!("alias: {arg}: not found"));
                 status = ExitStatus::FAILURE;

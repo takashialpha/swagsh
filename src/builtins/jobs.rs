@@ -18,9 +18,16 @@ use super::Builtin;
 
 /// Parses the `%job` argument `fg`/`bg` take, defaulting to job 1 (`%%`,
 /// the "current job", which this shell doesn't distinguish from job 1).
-pub(super) fn parse_job_id(job: Option<&str>) -> usize {
-    job.and_then(|s| s.trim_start_matches('%').parse().ok())
-        .unwrap_or(1)
+/// A job id from `%N`, `N`, or the current job (`%%`, `%+`, or none given:
+/// the most recently started), or the previous one (`%-`).
+pub(super) fn parse_job_id(shell: &Shell, job: Option<&str>) -> usize {
+    let mut ids: Vec<usize> = shell.jobs.iter().map(|j| j.id).collect();
+    ids.sort_unstable();
+    match job.map(|s| s.strip_prefix('%').unwrap_or(s)) {
+        None | Some("%" | "+" | "") => ids.last().copied().unwrap_or(0),
+        Some("-") => ids.iter().rev().nth(1).copied().unwrap_or(0),
+        Some(n) => n.parse().unwrap_or(0),
+    }
 }
 
 pub(super) fn find_job(shell: &Shell, id: usize) -> Option<&Job> {
@@ -68,16 +75,13 @@ impl Builtin for JobsBuiltin {
                 (j.id, j.pgid, state, j.command.clone())
             })
             .collect();
-        if !entries.is_empty() {
-            shell.note_stdout("\n");
-        }
         for (id, pgid, state, cmd) in entries {
             if self.pids_only {
-                println!("{pgid}");
+                shell.outln(&pgid.to_string())?;
             } else if self.long {
-                println!("[{id}]  {pgid}  {state}\t{cmd}");
+                shell.outln(&format!("[{id}]  {pgid}  {state}\t{cmd}"))?;
             } else {
-                println!("[{id}]  {state}\t{cmd}");
+                shell.outln(&format!("[{id}]  {state}\t{cmd}"))?;
             }
         }
         Ok(ExitStatus::SUCCESS)
@@ -99,10 +103,10 @@ pub struct FgBuiltin {
 
 impl Builtin for FgBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
-        if !shell.interactive {
+        if !shell.monitor {
             return Err(anyhow!("fg: no job control"));
         }
-        let id = parse_job_id(self.job.as_deref());
+        let id = parse_job_id(shell, self.job.as_deref());
         let (pgid, cmd) = find_job(shell, id)
             .map(|j| (j.pgid, j.command.clone()))
             .ok_or_else(|| anyhow!("fg: no such job: {id}"))?;
@@ -140,10 +144,10 @@ pub struct BgBuiltin {
 
 impl Builtin for BgBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
-        if !shell.interactive {
+        if !shell.monitor {
             return Err(anyhow!("bg: no job control"));
         }
-        let id = parse_job_id(self.job.as_deref());
+        let id = parse_job_id(shell, self.job.as_deref());
         let pgid = find_job(shell, id)
             .map(|j| j.pgid)
             .ok_or_else(|| anyhow!("bg: no such job: {id}"))?;
@@ -152,6 +156,37 @@ impl Builtin for BgBuiltin {
             job.state = JobState::Running;
         }
         eprintln!("[{id}]+ {pgid} &");
+        Ok(ExitStatus::SUCCESS)
+    }
+}
+
+#[derive(Parser)]
+#[command(name = "disown", about = "Remove jobs from the job table")]
+pub struct DisownBuiltin {
+    /// Remove every job
+    #[arg(short = 'a')]
+    all: bool,
+    jobs: Vec<String>,
+}
+
+impl Builtin for DisownBuiltin {
+    fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
+        let ids: Vec<usize> = if self.all {
+            shell.jobs.iter().map(|j| j.id).collect()
+        } else if self.jobs.is_empty() {
+            vec![parse_job_id(shell, None)]
+        } else {
+            self.jobs
+                .iter()
+                .map(|j| parse_job_id(shell, Some(j)))
+                .collect()
+        };
+        for id in ids {
+            if find_job(shell, id).is_none() {
+                return Err(anyhow!("disown: no such job: {id}"));
+            }
+            shell.jobs.remove(id);
+        }
         Ok(ExitStatus::SUCCESS)
     }
 }

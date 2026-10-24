@@ -28,16 +28,23 @@ fn find_job_by_pid_or_spec(shell: &Shell, spec: &str) -> Option<usize> {
 /// Blocks until job `id` terminates (or returns immediately if it already
 /// has, per `reap_nonblocking`), removing it from the job table either way.
 fn wait_one(shell: &mut Shell, id: usize) -> Option<ExitStatus> {
-    let (pgid, done_status) = {
+    let pending: Vec<Pid> = {
         let job = shell.jobs.iter().find(|j| j.id == id)?;
-        match job.state {
-            JobState::Done(s) => (job.pgid, Some(s)),
-            JobState::Running | JobState::Stopped => (job.pgid, None),
-        }
+        job.pids
+            .iter()
+            .zip(&job.statuses)
+            .filter(|(_, s)| s.is_none())
+            .map(|(&p, _)| p)
+            .collect()
     };
-    let status = match done_status {
-        Some(s) => s,
-        None => shell.wait_for_pid(pgid).ok()?,
+    for pid in pending {
+        if let Ok(status) = shell.wait_for_pid(pid) {
+            shell.jobs.mark_pid_done(pid, status);
+        }
+    }
+    let status = match shell.jobs.iter().find(|j| j.id == id)?.state {
+        JobState::Done(s) => s,
+        JobState::Running | JobState::Stopped => return None,
     };
     shell.jobs.remove(id);
     Some(status)

@@ -1,4 +1,5 @@
 use std::io::{IsTerminal, Write};
+use std::rc::Rc;
 
 use anyhow::Result;
 use rustix::process::{getegid, geteuid, getgid, getuid};
@@ -6,11 +7,12 @@ use rustyline::error::ReadlineError;
 use rustyline::{Config, DefaultEditor};
 
 use crate::ast::Program;
+use crate::builtins::flow::ExitRequest;
 use crate::cli::Cli;
 use crate::errfmt::emit;
 use crate::eval::{Shell, is_interrupted};
 use crate::jobs::ExitStatus;
-use crate::parser::ParseError;
+use crate::parser::{Aliases, ParseError};
 use crate::prompt::{build_prompt, history_file};
 use crate::signal::take_interrupted;
 
@@ -38,8 +40,10 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
         && let Some(ref p) = history_path
     {
         let _ = rl.load_history(p);
+        shell.history = rl.history().iter().cloned().collect();
     }
 
+    let mut exit_code = None;
     loop {
         let prompt = build_prompt(&shell);
 
@@ -51,7 +55,10 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
                 }
 
                 take_interrupted();
-                let (full_text, program_result) = read_program(line, &mut rl);
+                let (full_text, program_result) = read_program(line, &mut rl, &shell.env.aliases());
+                if shell.verbose {
+                    eprintln!("{full_text}");
+                }
                 // Recorded once the whole (possibly multi-line) command has
                 // been read, as one entry holding every line, rather than
                 // just `line` alone: adding only the first line here (before
@@ -59,8 +66,8 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
                 // over several `> `-continued lines used to do, silently
                 // losing every line after the first from history instead of
                 // recalling the whole command on one Up-arrow press.
-                if !cli.private {
-                    let _ = rl.add_history_entry(full_text.trim());
+                if !cli.private && rl.add_history_entry(full_text.trim()).unwrap_or(false) {
+                    shell.history.push(full_text.trim().to_owned());
                 }
 
                 match program_result {
@@ -69,13 +76,23 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
                         if !cli.no_execute
                             && let Err(e) = shell.run_program(&program)
                         {
-                            if is_interrupted(&e) {
+                            if let Some(ExitRequest(code)) = e.downcast_ref() {
+                                exit_code = Some(*code);
+                                break;
+                            } else if is_interrupted(&e) {
                                 println!();
                                 shell.last_status = ExitStatus(130);
                             } else {
                                 emit(e);
                             }
                         }
+                    }
+                }
+                shell.run_pending_traps();
+                if std::mem::take(&mut shell.history_changed) {
+                    let _ = rl.clear_history();
+                    for entry in &shell.history {
+                        let _ = rl.add_history_entry(entry.as_str());
                     }
                 }
                 shell.jobs.reap_nonblocking();
@@ -117,7 +134,8 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
     {
         emit(format!("history: could not save to {}: {e}", p.display()));
     }
-    Ok(())
+    let code = exit_code.unwrap_or(shell.last_status.0);
+    shell.exit(code)
 }
 
 /// Sources the profile (login), then `$ENV` and the rc file (interactive).
@@ -164,11 +182,11 @@ fn source_if_exists(shell: &mut Shell, path: &std::path::Path) {
             return;
         }
     };
-    match crate::parser::parse(&src) {
-        Ok(program) => {
-            let _ = shell.run_program(&program);
+    if let Err(e) = shell.run_source(&src, &format!("{}: ", path.display())) {
+        match e.downcast_ref() {
+            Some(ExitRequest(code)) => shell.exit(*code),
+            None => emit(e),
         }
-        Err(e) => emit(format!("{}: {e}", path.display())),
     }
 }
 
@@ -191,10 +209,14 @@ fn source_if_exists(shell: &mut Shell, path: &std::path::Path) {
 /// Returns the full raw text read (every physical line, joined by `\n`)
 /// alongside the parse result, so the caller can record the *whole* command
 /// as a single history entry regardless of how many lines it took.
-fn read_program(first_line: &str, rl: &mut DefaultEditor) -> (String, Result<Program, ParseError>) {
+fn read_program(
+    first_line: &str,
+    rl: &mut DefaultEditor,
+    aliases: &Rc<Aliases>,
+) -> (String, Result<Program, ParseError>) {
     let mut buf = collect_heredoc_input(&join_backslash_continuations(first_line, rl), rl);
     loop {
-        match crate::parser::parse(&buf) {
+        match crate::parser::parse_with_aliases(&buf, Rc::clone(aliases)) {
             Ok(program) => return (buf, Ok(program)),
             Err(e) if e.incomplete => {
                 let Ok(next_line) = rl.readline("> ") else {

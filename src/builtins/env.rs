@@ -28,12 +28,8 @@ impl Builtin for ExportBuiltin {
                 .exported()
                 .map(|(k, v)| (k.to_owned(), v.to_owned()))
                 .collect();
-            let printed_any = !pairs.is_empty();
             for (k, v) in pairs {
-                println!("export {k}={}", shell_quote(&v));
-            }
-            if printed_any {
-                shell.note_stdout("\n");
+                shell.outln(&format!("export {k}={}", shell_quote(&v)))?;
             }
             return Ok(ExitStatus::SUCCESS);
         }
@@ -41,6 +37,9 @@ impl Builtin for ExportBuiltin {
             if self.remove {
                 shell.env.unexport(name);
             } else if let Some((k, v)) = name.split_once('=') {
+                if shell.env.is_readonly(k) {
+                    anyhow::bail!("export: {}", crate::env::ReadonlyError(k.to_owned()));
+                }
                 shell.env.export(k, v.to_owned());
             } else {
                 shell.env.mark_exported(name);
@@ -64,16 +63,27 @@ pub struct UnsetBuiltin {
 
 impl Builtin for UnsetBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
+        let mut status = ExitStatus::SUCCESS;
         for name in &self.names {
             if self.function {
                 shell.env.unset_function(name);
+            } else if shell.env.is_readonly(name) {
+                emit(format!(
+                    "unset: {}",
+                    crate::env::ReadonlyError(name.clone())
+                ));
+                status = ExitStatus::FAILURE;
             } else if self.variable {
                 shell.env.unset_var(name);
             } else {
                 shell.env.unset(name);
             }
         }
-        Ok(ExitStatus::SUCCESS)
+        if status.is_success() {
+            Ok(status)
+        } else {
+            Err(super::BuiltinFailed(status).into())
+        }
     }
 }
 
@@ -100,13 +110,13 @@ impl Builtin for UnsetBuiltin {
 #[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
 pub fn builtin_set(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     if args.is_empty() {
-        return Ok(print_all_vars(shell));
+        return print_all_vars(shell);
     }
     let (remaining, saw_double_dash) = match apply_set_flags(shell, args) {
         Ok(r) => r,
         Err(e) => {
             emit(e);
-            return Ok(ExitStatus(2));
+            return Err(super::BuiltinFailed(ExitStatus(2)).into());
         }
     };
     if remaining.is_empty() && !saw_double_dash {
@@ -116,31 +126,26 @@ pub fn builtin_set(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     super::cli::dispatch::<SetOperandsBuiltin>(shell, remaining)
 }
 
-fn print_all_vars(shell: &mut Shell) -> ExitStatus {
+fn print_all_vars(shell: &mut Shell) -> Result<ExitStatus> {
     let pairs: Vec<(String, String)> = shell
         .env
         .all_vars()
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
         .collect();
-    let printed_any = !pairs.is_empty();
     for (k, v) in pairs {
-        println!("{k}={}", shell_quote(&v));
+        shell.outln(&format!("{k}={}", shell_quote(&v)))?;
     }
-    if printed_any {
-        shell.note_stdout("\n");
-    }
-    ExitStatus::SUCCESS
+    Ok(ExitStatus::SUCCESS)
 }
 
 /// Scans `args` for leading `-`/`+`-prefixed option flags, applying each to
 /// `shell` as it's recognized, and returns whatever's left (to be treated
 /// as operands) plus whether a `--` was the thing that ended the scan.
 ///
-/// Only `-e`/`-x`/`-u` (`errexit`/`xtrace`/`nounset`) and their `-o`/`+o`
-/// long-option spellings are real here. There are roughly fifteen more
-/// well-known shell options (`-a`, `-b`, `-f`, `-m`, `-o pipefail`, ...)
-/// this shell doesn't implement; accepting-and-ignoring them would be a
-/// fake flag pretending to work, so an unrecognized one is a usage error
+/// The POSIX options this shell implements are `-a`, `-C`, `-e`, `-f`,
+/// `-m`, `-n`, `-u`, `-v` and `-x`, plus their `-o`/`+o` long names (see
+/// [`OPTIONS`]). Accepting-and-ignoring the rest (`-b`, ...) would be
+/// a fake flag pretending to work, so an unrecognized one is a usage error
 /// (`invalid option`, exit 2) rather than a silent no-op.
 fn apply_set_flags<'a>(shell: &mut Shell, args: &'a [&'a str]) -> Result<(&'a [&'a str], bool)> {
     let mut i = 0;
@@ -173,46 +178,114 @@ fn apply_set_flags<'a>(shell: &mut Shell, args: &'a [&'a str]) -> Result<(&'a [&
         if rest == "o" {
             i += 1;
             let Some(&name) = args.get(i) else {
-                print_set_o_status(shell);
+                print_set_o_status(shell, enable)?;
                 return Ok((&[], false));
             };
-            apply_o_option(shell, name, enable)?;
+            let option = OPTIONS
+                .iter()
+                .find(|o| o.name == name)
+                .ok_or_else(|| anyhow::anyhow!("set: {name}: invalid option name"))?;
+            set_option(shell, option.letter, enable);
             i += 1;
             continue;
         }
         for c in rest.chars() {
-            match c {
-                'e' => shell.errexit = enable,
-                'x' => shell.xtrace = enable,
-                'u' => shell.nounset = enable,
-                _ => anyhow::bail!(
-                    "set: {arg}: invalid option\nset: usage: set [-eux] [-o option] [--] [arg ...]"
-                ),
+            if !OPTIONS.iter().any(|o| o.letter == c) {
+                anyhow::bail!(
+                    "set: {arg}: invalid option\nset: usage: set [-aCefmnuvx] [-o option] [--] [arg ...]"
+                );
             }
+            set_option(shell, c, enable);
         }
         i += 1;
     }
     Ok((&args[i..], saw_double_dash))
 }
 
-fn apply_o_option(shell: &mut Shell, name: &str, enable: bool) -> Result<()> {
-    match name {
-        "errexit" => shell.errexit = enable,
-        "xtrace" => shell.xtrace = enable,
-        "nounset" => shell.nounset = enable,
-        _ => anyhow::bail!("set: {name}: invalid option name"),
-    }
-    Ok(())
+struct ShellOption {
+    letter: char,
+    name: &'static str,
 }
 
-fn print_set_o_status(shell: &Shell) {
-    for (name, val) in [
-        ("errexit", shell.errexit),
-        ("nounset", shell.nounset),
-        ("xtrace", shell.xtrace),
-    ] {
-        println!("{name:<15}{}", if val { "on" } else { "off" });
+/// Every `set` option this shell implements, in `set -o` listing order.
+const OPTIONS: &[ShellOption] = &[
+    ShellOption {
+        letter: 'a',
+        name: "allexport",
+    },
+    ShellOption {
+        letter: 'e',
+        name: "errexit",
+    },
+    ShellOption {
+        letter: 'm',
+        name: "monitor",
+    },
+    ShellOption {
+        letter: 'C',
+        name: "noclobber",
+    },
+    ShellOption {
+        letter: 'n',
+        name: "noexec",
+    },
+    ShellOption {
+        letter: 'f',
+        name: "noglob",
+    },
+    ShellOption {
+        letter: 'u',
+        name: "nounset",
+    },
+    ShellOption {
+        letter: 'v',
+        name: "verbose",
+    },
+    ShellOption {
+        letter: 'x',
+        name: "xtrace",
+    },
+];
+
+fn set_option(shell: &mut Shell, letter: char, enable: bool) {
+    match letter {
+        'a' => shell.env.allexport = enable,
+        'C' => shell.noclobber = enable,
+        'e' => shell.errexit = enable,
+        'f' => shell.noglob = enable,
+        'm' => shell.set_monitor(enable),
+        'n' => shell.noexec = enable,
+        'u' => shell.nounset = enable,
+        'v' => shell.verbose = enable,
+        'x' => shell.xtrace = enable,
+        _ => {}
     }
+}
+
+fn option_enabled(shell: &Shell, letter: char) -> bool {
+    shell.option_flags().contains(letter)
+}
+
+/// `set -o` lists every option and whether it is on; `set +o` prints the
+/// `set` commands that would restore the current settings.
+fn print_set_o_status(shell: &mut Shell, human: bool) -> Result<()> {
+    for option in OPTIONS {
+        let on = option_enabled(shell, option.letter);
+        if human {
+            shell.outln(&format!(
+                "{:<15}{}",
+                option.name,
+                if on { "on" } else { "off" }
+            ))?;
+        } else {
+            shell.outln(&format!(
+                "set {}o {}",
+                if on { '-' } else { '+' },
+                option.name
+            ))?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Parser)]
@@ -257,6 +330,77 @@ impl Builtin for ShiftBuiltin {
         }
         pos.drain(..n);
         shell.env.set_positional_args(pos);
+        Ok(ExitStatus::SUCCESS)
+    }
+}
+
+#[derive(Parser)]
+#[command(name = "readonly", about = "Mark variables as unchangeable")]
+pub struct ReadonlyBuiltin {
+    /// List readonly variables as `readonly` commands (the default with no
+    /// NAMEs)
+    #[arg(short = 'p')]
+    print: bool,
+    #[arg(value_name = "NAME[=VALUE]")]
+    names: Vec<String>,
+}
+
+impl Builtin for ReadonlyBuiltin {
+    fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
+        if self.names.is_empty() || self.print {
+            for (name, value) in shell.env.readonly_vars() {
+                match value {
+                    Some(v) => shell.outln(&format!("readonly {name}={}", shell_quote(&v)))?,
+                    None => shell.outln(&format!("readonly {name}"))?,
+                }
+            }
+            return Ok(ExitStatus::SUCCESS);
+        }
+        for name in &self.names {
+            let name = match name.split_once('=') {
+                Some((k, v)) => {
+                    shell
+                        .env
+                        .assign(k, v)
+                        .map_err(|e| anyhow::anyhow!("readonly: {e}"))?;
+                    k
+                }
+                None => name,
+            };
+            shell.env.mark_readonly(name);
+        }
+        Ok(ExitStatus::SUCCESS)
+    }
+}
+
+#[derive(Parser)]
+#[command(
+    name = "local",
+    about = "Make variables local to the current function",
+    long_about = "Make variables local to the current function. A NAME given \
+                  without a value keeps the value it had outside until assigned."
+)]
+pub struct LocalBuiltin {
+    #[arg(value_name = "NAME[=VALUE]")]
+    names: Vec<String>,
+}
+
+impl Builtin for LocalBuiltin {
+    fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
+        for arg in &self.names {
+            let (name, value) = arg
+                .split_once('=')
+                .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
+            if shell.env.is_readonly(name) {
+                anyhow::bail!("local: {}", crate::env::ReadonlyError(name.to_owned()));
+            }
+            if !shell.env.make_local(name) {
+                anyhow::bail!("local: can only be used in a function");
+            }
+            if let Some(value) = value {
+                shell.env.set(name, value);
+            }
+        }
         Ok(ExitStatus::SUCCESS)
     }
 }

@@ -50,11 +50,9 @@ pub fn builtin_echo(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
         (output, false)
     };
     if no_newline || stopped_early {
-        print!("{output}");
-        shell.note_stdout(&output);
+        shell.out(&output)?;
     } else {
-        println!("{output}");
-        shell.note_stdout("\n");
+        shell.outln(&output)?;
     }
     Ok(ExitStatus::SUCCESS)
 }

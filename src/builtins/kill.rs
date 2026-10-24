@@ -116,7 +116,7 @@ fn parse_rt_name(bare: &str) -> Option<i32> {
 /// fixed table (1-31) and the dynamically-named real-time range. Pure
 /// display: never constructs a `Signal`, so the real-time restriction
 /// above doesn't apply to this direction.
-fn signal_name_by_raw(n: i32) -> Option<String> {
+pub(super) fn signal_name_by_raw(n: i32) -> Option<String> {
     if let Some((name, _)) = SIGNAL_TABLE.iter().find(|(_, s)| s.as_raw() == n) {
         return Some((*name).to_owned());
     }
@@ -135,7 +135,7 @@ fn signal_number_by_name(spec: &str) -> Option<i32> {
     parse_rt_name(bare)
 }
 
-fn parse_signal_name(s: &str) -> Option<Signal> {
+pub(super) fn parse_signal_name(s: &str) -> Option<Signal> {
     let upper = s.to_uppercase();
     let bare = upper.strip_prefix("SIG").unwrap_or(upper.as_str());
     SIGNAL_TABLE
@@ -164,14 +164,14 @@ fn parse_signal(spec: &str) -> Result<Signal> {
     Err(anyhow!("kill: invalid signal: {spec}"))
 }
 
-fn builtin_kill_list(args: &[&str]) -> Result<ExitStatus> {
+fn builtin_kill_list(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     if args.is_empty() {
         for (i, (name, _)) in SIGNAL_TABLE.iter().enumerate() {
-            println!("{:2}) SIG{name}", i + 1);
+            shell.outln(&format!("{:2}) SIG{name}", i + 1))?;
         }
         for n in SIGRTMIN..=SIGRTMAX {
             if let Some(name) = rt_signal_name(n) {
-                println!("{n:2}) SIG{name}");
+                shell.outln(&format!("{n:2}) SIG{name}"))?;
             }
         }
         return Ok(ExitStatus::SUCCESS);
@@ -180,11 +180,11 @@ fn builtin_kill_list(args: &[&str]) -> Result<ExitStatus> {
         if let Ok(n) = spec.parse::<i32>() {
             let name = signal_name_by_raw(n)
                 .ok_or_else(|| anyhow!("kill: {spec}: invalid signal number"))?;
-            println!("{name}");
+            shell.outln(&name)?;
         } else {
             let n = signal_number_by_name(spec)
                 .ok_or_else(|| anyhow!("kill: invalid signal: {spec}"))?;
-            println!("{n}");
+            shell.outln(&n.to_string())?;
         }
     }
     Ok(ExitStatus::SUCCESS)
@@ -225,7 +225,7 @@ impl Builtin for KillBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
         if self.list || self.list_alt {
             let specs: Vec<&str> = self.targets.iter().map(String::as_str).collect();
-            return builtin_kill_list(&specs);
+            return builtin_kill_list(shell, &specs);
         }
 
         let (sig, targets) = if let Some(spec) = self.signal_spec.or(self.signal_num) {
@@ -252,11 +252,15 @@ impl Builtin for KillBuiltin {
                 let id: usize = id_str
                     .parse()
                     .map_err(|_| anyhow!("kill: invalid job: {target}"))?;
-                let pgid = find_job(shell, id)
-                    .map(|j| j.pgid)
-                    .ok_or_else(|| anyhow!("kill: no such job: {id}"))?;
-                kill_process_group(pgid, sig)
-                    .map_err(|e| anyhow!("kill: ({target}) - {}", crate::errfmt::strerror(e)))?;
+                let job = find_job(shell, id).ok_or_else(|| anyhow!("kill: no such job: {id}"))?;
+                // Without job control the job has no process group of its
+                // own, so signal each of its processes instead.
+                let result = if shell.monitor {
+                    kill_process_group(job.pgid, sig)
+                } else {
+                    job.pids.iter().try_for_each(|&pid| kill_process(pid, sig))
+                };
+                result.map_err(|e| anyhow!("kill: ({target}) - {}", crate::errfmt::strerror(e)))?;
             } else {
                 let raw: i32 = target
                     .parse()

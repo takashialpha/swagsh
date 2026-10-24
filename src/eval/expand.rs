@@ -1,16 +1,18 @@
 use crate::sys::{Fork, fork};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use rustix::io::Errno;
 use rustix::process::{WaitOptions, waitpid};
 
 use crate::ast::{Command, Word};
 use crate::errfmt::emit;
 use crate::expand::{
-    ParamOp, eval_arith, expand_tilde, glob_expand, parse_param_op, strip_prefix, strip_suffix,
+    ParamOp, escape_glob, eval_arith_with, expand_tilde, glob_expand, has_glob_syntax,
+    parse_param_op, strip_prefix, strip_suffix,
 };
 use crate::fd::{close_raw, dup2_raw, raw_pipe, read_raw};
 use crate::jobs::ExitStatus;
-use crate::parser::parse;
+use crate::lexer::{QUOTE_END, QUOTE_START};
+use crate::parser::{parse, parse_word};
 use crate::signal::restore_child_signals;
 
 use super::{Shell, is_assignment_word, is_break, is_continue, is_return};
@@ -26,13 +28,7 @@ impl Shell {
             return Ok(vec![self.expand_word_to_string_inner(inner, true)?]);
         }
         let raw = self.expand_word_to_string(word)?;
-        // Only '*'/'?' trigger a directory scan: `glob_match` (src/expand.rs)
-        // has no bracket-expression support, so a `[` here never changes
-        // what actually matches. Treating a bare `[` as a possible glob was
-        // pure overhead: the ubiquitous `[` test command is itself exactly
-        // one such word, so every `[ ... ]` invocation paid for a full
-        // `read_dir` (open+getdents64+close) with no matching payoff.
-        if raw.contains('*') || raw.contains('?') {
+        if !self.noglob && has_glob_syntax(&raw) {
             let matches = glob_expand(&raw);
             if !matches.is_empty() {
                 return Ok(matches);
@@ -52,6 +48,7 @@ impl Shell {
     pub fn expand_words(&mut self, words: &[Word]) -> Result<Vec<String>> {
         let ifs = self.env.get("IFS").unwrap_or_else(|| " \t\n".to_owned());
         let mut fields = Fields::new(&ifs, words.len());
+        fields.noglob = self.noglob;
         for word in words {
             self.expand_into_fields(word, false, &mut fields)?;
             fields.finish(false);
@@ -96,17 +93,134 @@ impl Shell {
         let Some((name, value)) = head.split_once('=') else {
             return self.expand_word_to_string(word);
         };
-        let mut out = format!("{name}=");
-        for (i, segment) in value.split(':').enumerate() {
-            if i > 0 {
-                out.push(':');
+        let mut out = String::with_capacity(head.len());
+        if value.contains('~') {
+            out.push_str(name);
+            out.push('=');
+            for (i, segment) in value.split(':').enumerate() {
+                if i > 0 {
+                    out.push(':');
+                }
+                out.push_str(&expand_tilde(segment, &self.env));
             }
-            out.push_str(&expand_tilde(segment, &self.env));
+        } else {
+            out.push_str(head);
         }
         for part in rest {
             out.push_str(&self.expand_word_to_string(part)?);
         }
         Ok(out)
+    }
+
+    /// Expands `word` into a pattern for [`glob_match`](crate::expand::glob_match): quoted parts are
+    /// escaped so they match literally, unquoted ones keep their meaning.
+    pub(super) fn expand_pattern(&mut self, word: &Word) -> Result<String> {
+        match word {
+            Word::Literal(s) if s.starts_with('~') => Ok(escape_glob(&expand_tilde(s, &self.env))),
+            Word::Compound(parts) => {
+                let mut out = String::new();
+                for (i, part) in parts.iter().enumerate() {
+                    match part {
+                        Word::Literal(s) if i == 0 && s.starts_with('~') => {
+                            let expanded = self.tilde_prefix(s, false);
+                            out.push_str(&if expanded == *s {
+                                expanded
+                            } else {
+                                escape_glob(&expanded)
+                            });
+                        }
+                        _ => out.push_str(&self.expand_pattern_inner(part, false)?),
+                    }
+                }
+                Ok(out)
+            }
+            _ => self.expand_pattern_inner(word, false),
+        }
+    }
+
+    /// Tilde-expands the literal `s` that begins a word. The tilde prefix
+    /// runs to the first `/`, so when `s` has none and more of the word
+    /// follows (`~"x"`, `~$u`), part of the prefix is quoted or expanded and
+    /// POSIX leaves it alone.
+    fn tilde_prefix(&self, s: &str, whole_word: bool) -> String {
+        if whole_word || s.contains('/') {
+            expand_tilde(s, &self.env).into_owned()
+        } else {
+            s.to_owned()
+        }
+    }
+
+    fn expand_pattern_inner(&mut self, word: &Word, in_quotes: bool) -> Result<String> {
+        match word {
+            Word::Compound(parts) => {
+                let mut out = String::new();
+                for part in parts {
+                    out.push_str(&self.expand_pattern_inner(part, in_quotes)?);
+                }
+                Ok(out)
+            }
+            Word::Quoted(inner) => self.expand_pattern_inner(inner, true),
+            _ => {
+                let s = self.expand_word_to_string_inner(word, in_quotes)?;
+                Ok(if in_quotes { escape_glob(&s) } else { s })
+            }
+        }
+    }
+
+    fn push_positional(&self, star: bool, in_quotes: bool, fields: &mut Fields<'_>) {
+        let params = self.env.positional_args();
+        if in_quotes && star {
+            let sep = fields
+                .ifs
+                .chars()
+                .next()
+                .map(String::from)
+                .unwrap_or_default();
+            fields.push_quoted(&params.join(&sep));
+            return;
+        }
+        for (i, param) in params.iter().enumerate() {
+            if i > 0 {
+                fields.finish(in_quotes);
+            }
+            if in_quotes {
+                fields.push_quoted(param);
+            } else {
+                fields.push_split(param);
+            }
+        }
+    }
+
+    /// Like [`Self::expand_into_fields`] for the operand of `${var:-word}`,
+    /// whose unquoted literal text is field-split like an expansion result.
+    fn expand_operand_into_fields(
+        &mut self,
+        word: &Word,
+        in_quotes: bool,
+        fields: &mut Fields<'_>,
+    ) -> Result<()> {
+        match word {
+            Word::Literal(s) if !in_quotes && fields.at_word_start() => {
+                fields.push_split(&expand_tilde(s, &self.env));
+                Ok(())
+            }
+            Word::Literal(s) if !in_quotes => {
+                fields.push_split(s);
+                Ok(())
+            }
+            Word::Compound(parts) => {
+                for (i, part) in parts.iter().enumerate() {
+                    match part {
+                        Word::Literal(s) if i == 0 && !in_quotes && fields.at_word_start() => {
+                            fields.push_split(&self.tilde_prefix(s, parts.len() == 1));
+                        }
+                        _ => self.expand_operand_into_fields(part, in_quotes, fields)?,
+                    }
+                }
+                Ok(())
+            }
+            _ => self.expand_into_fields(word, in_quotes, fields),
+        }
     }
 
     fn expand_into_fields(
@@ -117,34 +231,45 @@ impl Shell {
     ) -> Result<()> {
         match word {
             Word::Literal(s) if in_quotes => fields.push_quoted(s),
-            Word::Literal(s) if s.starts_with('~') => {
+            Word::Literal(s) if fields.at_word_start() => {
                 fields.push_unquoted(&expand_tilde(s, &self.env));
             }
             Word::Literal(s) => fields.push_unquoted(s),
             Word::Var(name) if name == "@" || name == "*" => {
-                let params = self.env.positional_args().to_vec();
-                if in_quotes && name == "*" {
-                    let sep = fields
-                        .ifs
-                        .chars()
-                        .next()
-                        .map(String::from)
-                        .unwrap_or_default();
-                    fields.push_quoted(&params.join(&sep));
+                self.push_positional(name == "*", in_quotes, fields);
+            }
+            Word::Var(name) => {
+                if let Some(ParamOp::Conditional { var, op, word }) =
+                    has_param_op(name).then(|| parse_param_op(name)).flatten()
+                {
+                    match self.resolve_conditional(var, op, word, in_quotes)? {
+                        Conditional::Value(_) if var == "@" || var == "*" => {
+                            self.push_positional(var == "*", in_quotes, fields);
+                        }
+                        Conditional::Value(val) if in_quotes => fields.push_quoted(&val),
+                        Conditional::Value(val) => fields.push_split(&val),
+                        Conditional::Word(raw) if is_plain_operand(raw) => {
+                            if in_quotes {
+                                fields.push_quoted(raw);
+                            } else {
+                                fields.push_split(raw);
+                            }
+                        }
+                        Conditional::Word(raw) => {
+                            let word = parse_word(raw, in_quotes, Some(&self.env.aliases()))?;
+                            self.expand_operand_into_fields(&word, in_quotes, fields)?;
+                        }
+                    }
                 } else {
-                    for (i, param) in params.iter().enumerate() {
-                        if i > 0 {
-                            fields.finish(in_quotes);
-                        }
-                        if in_quotes {
-                            fields.push_quoted(param);
-                        } else {
-                            fields.push_split(param);
-                        }
+                    let value = self.expand_var_in(name, in_quotes)?;
+                    if in_quotes {
+                        fields.push_quoted(&value);
+                    } else {
+                        fields.push_split(&value);
                     }
                 }
             }
-            Word::Var(_) | Word::CmdSub(_) | Word::Arith(_) => {
+            Word::CmdSub(_) | Word::Arith(_) => {
                 let value = self.expand_word_to_string_inner(word, in_quotes)?;
                 if in_quotes {
                     fields.push_quoted(&value);
@@ -153,8 +278,17 @@ impl Shell {
                 }
             }
             Word::Compound(parts) => {
-                for part in parts {
-                    self.expand_into_fields(part, in_quotes, fields)?;
+                for (i, part) in parts.iter().enumerate() {
+                    match part {
+                        Word::Literal(s) if i == 0 && !in_quotes && fields.at_word_start() => {
+                            if s.starts_with('~') {
+                                fields.push_unquoted(&self.tilde_prefix(s, parts.len() == 1));
+                            } else {
+                                fields.push_unquoted(s);
+                            }
+                        }
+                        _ => self.expand_into_fields(part, in_quotes, fields)?,
+                    }
                 }
             }
             Word::Quoted(inner) => {
@@ -173,23 +307,29 @@ impl Shell {
     ///
     /// Returns an error if expanding `word` fails.
     pub fn expand_word_to_string(&mut self, word: &Word) -> Result<String> {
-        self.expand_word_to_string_inner(word, false)
+        match word {
+            Word::Literal(s) => Ok(expand_tilde(s, &self.env).into_owned()),
+            Word::Compound(parts) => {
+                let mut result = String::new();
+                for (i, part) in parts.iter().enumerate() {
+                    match part {
+                        Word::Literal(s) if i == 0 => {
+                            result.push_str(&self.tilde_prefix(s, parts.len() == 1));
+                        }
+                        _ => result.push_str(&self.expand_word_to_string_inner(part, false)?),
+                    }
+                }
+                Ok(result)
+            }
+            _ => self.expand_word_to_string_inner(word, false),
+        }
     }
 
     fn expand_word_to_string_inner(&mut self, word: &Word, in_quotes: bool) -> Result<String> {
         match word {
-            Word::Literal(s) => {
-                if !in_quotes && s.starts_with('~') {
-                    Ok(expand_tilde(s, &self.env))
-                } else {
-                    Ok(s.clone())
-                }
-            }
-            Word::Var(name) => self.expand_var(name),
-            Word::Arith(expr) => {
-                let expanded = self.expand_arith_vars(expr)?;
-                Ok(eval_arith(&expanded).to_string())
-            }
+            Word::Literal(s) => Ok(s.clone()),
+            Word::Var(name) => self.expand_var_in(name, in_quotes),
+            Word::Arith(expr) => self.eval_arith_expr(expr),
             Word::CmdSub(cmd) => self.expand_cmd_sub(cmd),
             Word::Compound(parts) => {
                 let mut result = String::new();
@@ -202,71 +342,16 @@ impl Shell {
         }
     }
 
-    /// Substitutes `$var`/`${var}` *and* bare `var` references inside a
-    /// `$(( ))` expression with their values, before handing the result to
-    /// `eval_arith`. POSIX arithmetic treats a bare identifier the same as
-    /// `$identifier`: `$(( x + 1 ))` means the same thing as
-    /// `$(( $x + 1 ))`, so both forms are recognized here; `eval_arith`'s
-    /// tokenizer has no variable lookup of its own; it treats any
-    /// identifier that reaches it as `0`, which is only correct once every
-    /// reference has already been substituted.
-    ///
-    /// Delegates each reference to `expand_var` (the same variable expander
-    /// `Word::Var` uses for ordinary word expansion) rather than reading
-    /// `self.env` directly, so parameter-expansion operators work inside
-    /// arithmetic too: `$(( ${n:-0} + 1 ))` needs the `:-` default applied,
-    /// not just a raw lookup of a variable literally named `n:-0`. Follows
-    /// dash's rule for what a substitution is allowed to be: unset (empty)
-    /// becomes `0` silently, but a variable holding non-numeric text is a
-    /// hard error (`Illegal number: <value>`) rather than a silent `0` or
-    /// being recursively re-interpreted as yet another variable name.
-    fn expand_arith_vars(&mut self, expr: &str) -> Result<String> {
-        let mut result = String::new();
-        let mut chars = expr.chars().peekable();
-        while let Some(c) = chars.next() {
-            let var = match c {
-                '$' => Some(match chars.peek() {
-                    Some(&'{') => {
-                        chars.next();
-                        let mut var = String::new();
-                        for ch in chars.by_ref() {
-                            if ch == '}' {
-                                break;
-                            }
-                            var.push(ch);
-                        }
-                        var
-                    }
-                    Some(&c2) if "@*#?-$!".contains(c2) => {
-                        chars.next();
-                        c2.to_string()
-                    }
-                    _ => take_identifier(&mut chars),
-                }),
-                c if c.is_ascii_alphabetic() || c == '_' => {
-                    let mut var = String::from(c);
-                    var.push_str(&take_identifier(&mut chars));
-                    Some(var)
-                }
-                _ => None,
-            };
-
-            match var {
-                Some(var) => {
-                    let value = self.expand_var(&var)?;
-                    let trimmed = value.trim();
-                    if trimmed.is_empty() {
-                        result.push('0');
-                    } else if trimmed.parse::<i64>().is_ok() {
-                        result.push_str(trimmed);
-                    } else {
-                        anyhow::bail!("Illegal number: {trimmed}");
-                    }
-                }
-                None => result.push(c),
-            }
-        }
-        Ok(result)
+    /// Evaluates the body of a `$(( ))`: `$` references are expanded first,
+    /// then bare variable names are read and assigned by the evaluator.
+    fn eval_arith_expr(&mut self, expr: &str) -> Result<String> {
+        let value = if expr.contains(['$', '`', '\\']) {
+            let expanded = self.expand_raw_text(expr)?;
+            eval_arith_with(&expanded, &mut self.env)?
+        } else {
+            eval_arith_with(expr, &mut self.env)?
+        };
+        Ok(value.to_string())
     }
 
     /// # Errors
@@ -274,77 +359,101 @@ impl Shell {
     /// Returns an error if `name` is unset under `set -u`, or if a nested
     /// command substitution fails.
     pub fn expand_var(&mut self, name: &str) -> Result<String> {
-        match name {
-            "?" | "$" | "0" | "@" | "*" | "#" => self.resolve_param_checked(name),
-            n if n.chars().all(|c| c.is_ascii_digit()) => self.resolve_param_checked(n),
-            name => match parse_param_op(name) {
-                Some(ParamOp::Length(var)) => {
-                    Ok(self.resolve_param_checked(var)?.len().to_string())
-                }
-                Some(ParamOp::PrefixStrip { var, pat, greedy }) => {
-                    let val = self.resolve_param_checked(var)?;
-                    Ok(strip_prefix(&val, pat, greedy))
-                }
-                Some(ParamOp::SuffixStrip { var, pat, greedy }) => {
-                    let val = self.resolve_param_checked(var)?;
-                    Ok(strip_suffix(&val, pat, greedy))
-                }
-                Some(ParamOp::Conditional { var, op, word }) => {
-                    // Unchecked (`resolve_param`, not `_checked`): `:-`,
-                    // `:=`, `:+`, and `:?` all explicitly handle `var`
-                    // being unset themselves, so they're exempt from
-                    // `nounset` on `var` specifically, even though every
-                    // other reference to it is not.
-                    let val = self.resolve_param(var);
-                    // `word` is raw, unexpanded source text (`parse_param_op`
-                    // only slices it out, it never parses it); a `$ref`
-                    // inside it needs the same substitution any other word
-                    // gets, e.g. `${X:-$Y}` must expand `$Y`, not use it
-                    // literally.
-                    match op {
-                        ":-" => {
-                            if val.is_empty() {
-                                self.expand_raw_text(word)
-                            } else {
-                                Ok(val)
-                            }
-                        }
-                        ":+" => {
-                            if val.is_empty() {
-                                Ok(String::new())
-                            } else {
-                                self.expand_raw_text(word)
-                            }
-                        }
-                        ":?" => {
-                            if val.is_empty() {
-                                let msg = if word.is_empty() {
-                                    "parameter not set".to_owned()
-                                } else {
-                                    self.expand_raw_text(word)?
-                                };
-                                emit(format!("{var}: {msg}"));
-                                if !self.interactive {
-                                    std::process::exit(1);
-                                }
-                            }
-                            Ok(val)
-                        }
-                        ":=" => {
-                            if val.is_empty() {
-                                let expanded = self.expand_raw_text(word)?;
-                                self.env.set(var, &expanded);
-                                Ok(expanded)
-                            } else {
-                                Ok(val)
-                            }
-                        }
-                        _ => Ok(val),
-                    }
-                }
-                None => self.resolve_param_checked(name),
-            },
+        self.expand_var_in(name, false)
+    }
+
+    /// Expands the body of a `$name`/`${...}` reference. `in_quotes` says
+    /// whether it sits inside double quotes, which changes how the operand
+    /// word of `${var:-word}` and friends is parsed.
+    fn expand_var_in(&mut self, name: &str, in_quotes: bool) -> Result<String> {
+        if !has_param_op(name) {
+            return self.resolve_param_checked(name);
         }
+        match parse_param_op(name) {
+            Some(ParamOp::Length(var)) => {
+                Ok(self.resolve_param_checked(var)?.chars().count().to_string())
+            }
+            Some(ParamOp::PrefixStrip { var, pat, greedy }) => {
+                let val = self.resolve_param_checked(var)?;
+                let pat = self.expand_param_pattern(pat, in_quotes)?;
+                Ok(strip_prefix(&val, &pat, greedy))
+            }
+            Some(ParamOp::SuffixStrip { var, pat, greedy }) => {
+                let val = self.resolve_param_checked(var)?;
+                let pat = self.expand_param_pattern(pat, in_quotes)?;
+                Ok(strip_suffix(&val, &pat, greedy))
+            }
+            Some(ParamOp::Conditional { var, op, word }) => {
+                match self.resolve_conditional(var, op, word, in_quotes)? {
+                    Conditional::Value(val) => Ok(val),
+                    Conditional::Word(word) => self.expand_param_word(word, in_quotes),
+                }
+            }
+            None => self.resolve_param_checked(name),
+        }
+    }
+
+    /// Decides what `${var<op>word}` expands to. The colon forms (`:-`, `:+`,
+    /// `:?`, `:=`) treat an empty `var` like an unset one; the others only
+    /// react to unset. Exempt from `nounset`, since every form handles the
+    /// unset case itself.
+    fn resolve_conditional<'w>(
+        &mut self,
+        var: &str,
+        op: &str,
+        word: &'w str,
+        in_quotes: bool,
+    ) -> Result<Conditional<'w>> {
+        let val = self.resolve_param(var);
+        let (missing, base) = op.strip_prefix(':').map_or_else(
+            || (!self.is_param_set(var), op),
+            |base| (val.is_empty(), base),
+        );
+        Ok(match (base, missing) {
+            ("-", true) | ("+", false) => Conditional::Word(word),
+            ("+", true) => Conditional::Value(String::new()),
+            ("?", true) => {
+                let msg = if word.is_empty() {
+                    "parameter not set".to_owned()
+                } else {
+                    self.expand_param_word(word, in_quotes)?
+                };
+                if self.interactive {
+                    return Err(anyhow!("{var}: {msg}"));
+                }
+                emit(format!("{var}: {msg}"));
+                self.exit(1);
+            }
+            ("=", true) => {
+                let expanded = self.expand_param_word(word, in_quotes)?;
+                self.env.assign(var, &expanded)?;
+                Conditional::Value(expanded)
+            }
+            _ => Conditional::Value(val),
+        })
+    }
+
+    /// Expands the operand of `${var:-word}` and friends as one string.
+    fn expand_param_word(&mut self, raw: &str, in_quotes: bool) -> Result<String> {
+        if is_plain_operand(raw) {
+            return Ok(raw.to_owned());
+        }
+        let word = parse_word(raw, in_quotes, Some(&self.env.aliases()))?;
+        if in_quotes {
+            self.expand_word_to_string_inner(&word, true)
+        } else {
+            self.expand_word_to_string(&word)
+        }
+    }
+
+    /// Expands the pattern of `${var#pattern}` and friends. The pattern stays
+    /// active even inside double quotes; only its own quoted parts are literal.
+    fn expand_param_pattern(&mut self, raw: &str, in_quotes: bool) -> Result<String> {
+        if is_plain_operand(raw) {
+            return Ok(raw.to_owned());
+        }
+        let word = parse_word(raw, in_quotes, Some(&self.env.aliases()))?;
+        self.expand_pattern(&word)
     }
 
     /// Resolves a bare parameter name to its value: the special parameters
@@ -371,7 +480,8 @@ impl Shell {
                 .map(|p| p.as_raw_nonzero().to_string())
                 .unwrap_or_default(),
             "$" => std::process::id().to_string(),
-            "0" => std::env::args().next().unwrap_or_default(),
+            "-" => self.option_flags(),
+            "0" => self.arg0.clone(),
             n if n.chars().all(|c| c.is_ascii_digit()) => {
                 let idx: usize = n.parse().unwrap_or(0);
                 self.env
@@ -393,7 +503,7 @@ impl Shell {
     /// `nounset`), and anything else is set iff `Env` actually has it.
     fn is_param_set(&self, name: &str) -> bool {
         match name {
-            "?" | "!" | "$" | "0" | "@" | "*" | "#" => true,
+            "?" | "!" | "$" | "0" | "@" | "*" | "#" | "-" => true,
             n if n.chars().all(|c| c.is_ascii_digit()) => {
                 let idx: usize = n.parse().unwrap_or(0);
                 idx >= 1 && idx <= self.env.positional_args().len()
@@ -417,29 +527,31 @@ impl Shell {
     /// code itself is 127 normally, but 1 if `errexit` is *also* set:
     /// `set -u` alone exits 127 on an unbound variable, `set -eu` exits 1
     /// for the identical failure.
-    fn resolve_param_checked(&self, name: &str) -> Result<String> {
+    fn resolve_param_checked(&mut self, name: &str) -> Result<String> {
         if self.nounset && !self.is_param_set(name) {
             if self.interactive {
                 anyhow::bail!("{name}: unbound variable");
             }
             emit(format!("{name}: unbound variable"));
-            std::process::exit(if self.errexit { 1 } else { 127 });
+            self.exit(if self.errexit { 1 } else { 127 });
         }
         Ok(self.resolve_param(name))
     }
 
-    fn expand_cmd_sub(&self, cmd: &Command) -> Result<String> {
+    fn expand_cmd_sub(&mut self, cmd: &Command) -> Result<String> {
         let (read_fd, write_fd) = raw_pipe()?;
         // SAFETY: fork.
         match unsafe { fork()? } {
             Fork::Child => {
                 // SAFETY: in child, before any allocations.
-                unsafe { restore_child_signals(self.interactive) };
+                unsafe { restore_child_signals(self.interactive || self.monitor) };
                 close_raw(read_fd);
                 let _ = dup2_raw(write_fd, 1);
                 close_raw(write_fd);
-                let mut child = Self::new(self.env.clone(), false);
-                let status = match child.run_command(cmd) {
+                // The forked copy of this shell is the subshell, options and
+                // all, minus its traps and job control.
+                self.reset_traps_for_subshell();
+                let status = match self.run_command(cmd) {
                     Ok(s) => s,
                     Err(e) => {
                         if !is_break(&e) && !is_continue(&e) && !is_return(&e) {
@@ -448,7 +560,7 @@ impl Shell {
                         ExitStatus::FAILURE
                     }
                 };
-                std::process::exit(status.0);
+                self.exit(status.0);
             }
             Fork::ParentOf(child) => {
                 close_raw(write_fd);
@@ -486,12 +598,9 @@ impl Shell {
     /// text, as opposed to the `Word` AST nodes the parser produces:
     /// wherever raw text picked up after parsing needs the same
     /// substitutions applied by hand. Used for here-doc bodies and for the
-    /// default/alternate word in `${var:-word}`-style parameter-expansion
-    /// operators (`parse_param_op` hands that word back as an unexpanded
-    /// slice of the original source, since it's only extracted, never
-    /// parsed into `Word`s), and for the value of `$ENV` at startup.
-    /// As inside double quotes, a backslash escapes only `$`, `` ` ``, `\`
-    /// and newline; before anything else it stays literal.
+    /// value of `$ENV` at startup. As inside double quotes, a backslash
+    /// escapes only `$`, `` ` ``, `\` and newline; before anything else it
+    /// stays literal.
     ///
     /// # Errors
     ///
@@ -522,7 +631,7 @@ impl Shell {
                         }
                         var.push(ch);
                     }
-                    result.push_str(&self.expand_var(&var)?);
+                    result.push_str(&self.expand_var_in(&var, true)?);
                 }
                 Some('(') => {
                     chars.next();
@@ -544,8 +653,7 @@ impl Shell {
                         if cmd_src.ends_with(')') {
                             cmd_src.pop();
                         }
-                        let expanded = self.expand_arith_vars(&cmd_src)?;
-                        result.push_str(&eval_arith(&expanded).to_string());
+                        result.push_str(&self.eval_arith_expr(&cmd_src)?);
                     } else if let Ok(program) = parse(&cmd_src)
                         && let Ok(s) = self.expand_cmd_sub(&program.into_command())
                     {
@@ -555,10 +663,10 @@ impl Shell {
                 Some(c2) if c2.is_ascii_alphanumeric() || c2 == '_' || "@*#?-$!".contains(c2) => {
                     if "@*#?-$!".contains(c2) {
                         chars.next();
-                        result.push_str(&self.expand_var(&c2.to_string())?);
+                        result.push_str(&self.expand_var_in(&c2.to_string(), true)?);
                     } else {
                         var.push_str(&take_identifier(&mut chars));
-                        result.push_str(&self.expand_var(&var)?);
+                        result.push_str(&self.expand_var_in(&var, true)?);
                     }
                 }
                 _ => result.push('$'),
@@ -568,6 +676,13 @@ impl Shell {
     }
 }
 
+/// What a `${var<op>word}` reference resolved to.
+enum Conditional<'w> {
+    Value(String),
+    /// The operand word, still to be expanded.
+    Word(&'w str),
+}
+
 /// Fields built up while expanding a list of words (POSIX 2.6.5, 2.6.6).
 struct Fields<'a> {
     ifs: &'a str,
@@ -575,8 +690,13 @@ struct Fields<'a> {
     cur: String,
     /// The current field contains a quoted part, so it is kept even if empty.
     quoted: bool,
-    /// The current field contains an unquoted `*` or `?`.
+    /// The current field contains an unquoted `*`, `?` or `[`.
     glob: bool,
+    /// `set -f`: never pathname-expand.
+    noglob: bool,
+    /// The current field as a glob pattern, with its quoted `*?[\` escaped.
+    /// Only built once one of those is quoted; until then it equals `cur`.
+    pattern: Option<String>,
 }
 
 impl<'a> Fields<'a> {
@@ -587,17 +707,42 @@ impl<'a> Fields<'a> {
             cur: String::new(),
             quoted: false,
             glob: false,
+            noglob: false,
+            pattern: None,
         }
     }
 
+    /// Nothing has been added to the current field yet, so a `~` here
+    /// begins a tilde prefix.
+    const fn at_word_start(&self) -> bool {
+        self.cur.is_empty() && !self.quoted
+    }
+
     fn push_quoted(&mut self, s: &str) {
+        if self.pattern.is_none() && s.contains(['*', '?', '[', '\\']) {
+            self.pattern = Some(escape_glob(&self.cur));
+        }
+        if let Some(pattern) = &mut self.pattern {
+            pattern.push_str(&escape_glob(s));
+        }
         self.cur.push_str(s);
         self.quoted = true;
     }
 
     fn push_unquoted(&mut self, s: &str) {
-        self.glob |= s.contains(['*', '?']);
+        self.glob |= s.contains(['*', '?', '[']);
+        if let Some(pattern) = &mut self.pattern {
+            pattern.push_str(s);
+        }
         self.cur.push_str(s);
+    }
+
+    fn push_unquoted_char(&mut self, c: char) {
+        self.glob |= matches!(c, '*' | '?' | '[');
+        if let Some(pattern) = &mut self.pattern {
+            pattern.push(c);
+        }
+        self.cur.push(c);
     }
 
     /// Appends an unquoted expansion result, ending a field at each `$IFS`
@@ -619,8 +764,7 @@ impl<'a> Fields<'a> {
         }
         while let Some(c) = chars.next() {
             if !is_ws(c) && !is_delim(c) {
-                self.glob |= matches!(c, '*' | '?');
-                self.cur.push(c);
+                self.push_unquoted_char(c);
                 continue;
             }
             let mut hard = is_delim(c);
@@ -633,10 +777,12 @@ impl<'a> Fields<'a> {
 
     /// Ends the current field, keeping it if `force`d, quoted, or non-empty.
     fn finish(&mut self, force: bool) {
+        let pattern = self.pattern.take();
         if force || self.quoted || !self.cur.is_empty() {
             let field = std::mem::take(&mut self.cur);
-            let matches = if self.glob {
-                glob_expand(&field)
+            let pattern = pattern.as_deref().unwrap_or(&field);
+            let matches = if self.glob && !self.noglob && has_glob_syntax(pattern) {
+                glob_expand(pattern)
             } else {
                 Vec::new()
             };
@@ -649,6 +795,18 @@ impl<'a> Fields<'a> {
         self.quoted = false;
         self.glob = false;
     }
+}
+
+/// Whether a `${var...}` operand is text that parsing would leave as it is:
+/// nothing quoted, expanded, escaped or tilde-prefixed.
+fn is_plain_operand(raw: &str) -> bool {
+    !raw.contains(['$', '`', '\\', '\'', '"', '~', QUOTE_START, QUOTE_END])
+}
+
+/// Whether `name`, the text of a `$name` or `${...}`, could hold an
+/// operator (`${#v}`, `${v:-w}`, ...) rather than just naming a parameter.
+fn has_param_op(name: &str) -> bool {
+    name.len() > 1 && !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 fn contains_at(word: &Word) -> bool {

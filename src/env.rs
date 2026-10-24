@@ -20,6 +20,9 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::ast::Command;
 
+/// Alias names and their values.
+pub type AliasMap = HashMap<String, String>;
+
 /// Sets a process environment variable. Single-threaded shell: no concurrent
 /// env mutation, so this is always safe to call.
 fn set_process_var(name: &str, value: &str) {
@@ -39,9 +42,40 @@ pub struct Env {
     vars: HashMap<String, String>,
     exported: HashSet<String>,
     functions: HashMap<String, Rc<Command>>,
-    aliases: HashMap<String, String>,
+    /// Shared with the parser, which takes a snapshot for each command it
+    /// reads; definitions copy on write.
+    aliases: Rc<AliasMap>,
     positional: Vec<String>,
+    /// `set -a`: every variable assigned is exported too.
+    pub allexport: bool,
+    readonly: HashSet<String>,
+    /// One frame per running function, holding what each `local` variable
+    /// was before it, to put back when the function returns.
+    local_frames: Vec<Vec<SavedVar>>,
+    /// `hash`: where each external command was found on `$PATH`. Cleared
+    /// whenever `PATH` changes.
+    command_hash: HashMap<String, String>,
 }
+
+/// A variable's state before `local` shadowed it.
+#[derive(Debug, Clone)]
+struct SavedVar {
+    name: String,
+    value: Option<String>,
+    exported: bool,
+}
+
+/// An assignment to, or `unset` of, a readonly variable.
+#[derive(Debug)]
+pub struct ReadonlyError(pub String);
+
+impl std::fmt::Display for ReadonlyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: readonly variable", self.0)
+    }
+}
+
+impl std::error::Error for ReadonlyError {}
 
 impl Env {
     #[must_use]
@@ -72,8 +106,12 @@ impl Env {
             vars,
             exported,
             functions: HashMap::default(),
-            aliases: HashMap::default(),
+            aliases: Rc::default(),
             positional: Vec::new(),
+            allexport: false,
+            readonly: HashSet::default(),
+            local_frames: Vec::new(),
+            command_hash: HashMap::default(),
         }
     }
 
@@ -86,6 +124,12 @@ impl Env {
     pub fn get(&self, name: &str) -> Option<String> {
         self.vars.get(name).cloned()
     }
+    /// [`Env::get`] without the copy.
+    #[inline]
+    #[must_use]
+    pub fn get_ref(&self, name: &str) -> Option<&str> {
+        self.vars.get(name).map(String::as_str)
+    }
     #[inline]
     #[must_use]
     pub fn get_or_empty(&self, name: &str) -> String {
@@ -94,15 +138,138 @@ impl Env {
 
     pub fn set(&mut self, name: &str, value: impl Into<String>) {
         let value = value.into();
+        if self.allexport && !self.exported.contains(name) {
+            self.exported.insert(name.to_owned());
+        }
         if self.exported.contains(name) {
             set_process_var(name, &value);
         }
+        if name == "PATH" {
+            self.command_hash.clear();
+        }
         self.vars.insert(name.to_owned(), value);
+    }
+
+    /// [`Env::set`] for an assignment the user wrote, which a readonly
+    /// variable refuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ReadonlyError`] if `name` is readonly.
+    pub fn assign(&mut self, name: &str, value: impl Into<String>) -> Result<(), ReadonlyError> {
+        if self.readonly.contains(name) {
+            return Err(ReadonlyError(name.to_owned()));
+        }
+        self.set(name, value);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn is_readonly(&self, name: &str) -> bool {
+        self.readonly.contains(name)
+    }
+
+    pub fn mark_readonly(&mut self, name: &str) {
+        self.readonly.insert(name.to_owned());
+    }
+
+    /// Readonly variables and their values, sorted by name.
+    #[must_use]
+    pub fn readonly_vars(&self) -> Vec<(String, Option<String>)> {
+        let mut vars: Vec<_> = self
+            .readonly
+            .iter()
+            .map(|name| (name.clone(), self.vars.get(name).cloned()))
+            .collect();
+        vars.sort();
+        vars
+    }
+
+    // ------------------------------------------------------------------
+    // Function scopes (`local`)
+    // ------------------------------------------------------------------
+
+    pub fn push_scope(&mut self) {
+        self.local_frames.push(Vec::new());
+    }
+
+    /// Ends the innermost function scope, putting back every variable a
+    /// `local` in it shadowed.
+    pub fn pop_scope(&mut self) {
+        let Some(frame) = self.local_frames.pop() else {
+            return;
+        };
+        for saved in frame.into_iter().rev() {
+            match saved.value {
+                Some(value) => {
+                    if saved.exported {
+                        self.exported.insert(saved.name.clone());
+                        set_process_var(&saved.name, &value);
+                    } else {
+                        self.exported.remove(&saved.name);
+                        remove_process_var(&saved.name);
+                    }
+                    if saved.name == "PATH" {
+                        self.command_hash.clear();
+                    }
+                    self.vars.insert(saved.name, value);
+                }
+                None => self.unset_var(&saved.name),
+            }
+        }
+    }
+
+    /// Makes `name` local to the innermost function scope, keeping its
+    /// current value until assigned. Returns false outside a function.
+    pub fn make_local(&mut self, name: &str) -> bool {
+        let Some(frame) = self.local_frames.last_mut() else {
+            return false;
+        };
+        if !frame.iter().any(|s| s.name == name) {
+            frame.push(SavedVar {
+                name: name.to_owned(),
+                value: self.vars.get(name).cloned(),
+                exported: self.exported.contains(name),
+            });
+        }
+        true
+    }
+
+    // ------------------------------------------------------------------
+    // Command hash (`hash`)
+    // ------------------------------------------------------------------
+
+    #[must_use]
+    pub fn hashed_command(&self, name: &str) -> Option<&str> {
+        self.command_hash.get(name).map(String::as_str)
+    }
+
+    pub fn hash_command(&mut self, name: &str, path: String) {
+        self.command_hash.insert(name.to_owned(), path);
+    }
+
+    pub fn clear_command_hash(&mut self) {
+        self.command_hash.clear();
+    }
+
+    /// Hashed commands and their paths, sorted by name.
+    #[must_use]
+    pub fn hashed_commands(&self) -> Vec<(String, String)> {
+        let mut all: Vec<_> = self
+            .command_hash
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        all.sort();
+        all
     }
 
     pub fn export(&mut self, name: impl Into<String>, value: impl Into<String>) {
         let name = name.into();
         let value = value.into();
+        if name == "PATH" {
+            self.command_hash.clear();
+        }
         set_process_var(&name, &value);
         self.exported.insert(name.clone());
         self.vars.insert(name, value);
@@ -124,6 +291,9 @@ impl Env {
     /// Removes a variable (and its export/environment-variable state) only,
     /// leaving a same-named function untouched.
     pub fn unset_var(&mut self, name: &str) {
+        if name == "PATH" {
+            self.command_hash.clear();
+        }
         self.vars.remove(name);
         self.exported.remove(name);
         remove_process_var(name);
@@ -175,8 +345,14 @@ impl Env {
     // Aliases
     // ------------------------------------------------------------------
 
+    /// The current alias definitions, for the parser.
+    #[must_use]
+    pub fn aliases(&self) -> Rc<AliasMap> {
+        Rc::clone(&self.aliases)
+    }
+
     pub fn set_alias(&mut self, name: String, value: String) {
-        self.aliases.insert(name, value);
+        Rc::make_mut(&mut self.aliases).insert(name, value);
     }
     #[must_use]
     pub fn get_alias(&self, name: &str) -> Option<String> {
@@ -185,10 +361,10 @@ impl Env {
     /// Removes an alias, reporting whether one by that name actually
     /// existed (`unalias` treats a nonexistent name as an error).
     pub fn remove_alias(&mut self, name: &str) -> bool {
-        self.aliases.remove(name).is_some()
+        Rc::make_mut(&mut self.aliases).remove(name).is_some()
     }
     pub fn clear_aliases(&mut self) {
-        self.aliases.clear();
+        Rc::make_mut(&mut self.aliases).clear();
     }
     pub fn all_aliases(&self) -> impl Iterator<Item = (&str, &str)> {
         self.aliases.iter().map(|(k, v)| (k.as_str(), v.as_str()))
@@ -205,6 +381,10 @@ impl Env {
     }
     pub fn set_positional_args(&mut self, args: Vec<String>) {
         self.positional = args;
+    }
+    /// Sets the positional parameters, returning the old ones.
+    pub const fn replace_positional_args(&mut self, args: Vec<String>) -> Vec<String> {
+        std::mem::replace(&mut self.positional, args)
     }
 
     pub fn restore_vars(&mut self, saved: Vec<(String, Option<String>)>) {

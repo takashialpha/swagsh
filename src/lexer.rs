@@ -68,9 +68,14 @@ pub struct RedirToken {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RedirKind {
     Out,
+    /// `>|`: like `>`, but overrides `set -C`.
+    Clobber,
     Append,
     In,
+    /// `<>`: open for reading and writing.
+    ReadWrite,
     OutFd,
+    InFd,
     BothOut,
 }
 
@@ -134,6 +139,11 @@ pub struct Lexer<'src> {
     /// in source order. POSIX starts their bodies after the next newline
     /// token, so they are read only once the lexer reaches it.
     pending_heredocs: Vec<(String, bool)>,
+    /// A newline has been lexed, so `pending_heredocs` read their bodies
+    /// before the next token. Deferred to then, rather than done at the
+    /// newline, so a here-doc queued in between (from an alias expanded
+    /// after the parser looked ahead past the newline) still gets its body.
+    bodies_due: bool,
     heredoc_bodies: Vec<String>,
 }
 
@@ -146,6 +156,7 @@ impl<'src> Lexer<'src> {
             line: 1,
             col: 1,
             pending_heredocs: Vec::new(),
+            bodies_due: false,
             heredoc_bodies: Vec::new(),
         }
     }
@@ -157,11 +168,50 @@ impl<'src> Lexer<'src> {
         std::mem::take(&mut self.heredoc_bodies)
     }
 
+    /// Whether only blanks and comments are left.
+    pub fn is_exhausted(&mut self) -> bool {
+        self.read_due_heredocs();
+        loop {
+            self.skip_whitespace();
+            if self.peek() == Some(b'#') {
+                self.skip_comment();
+            } else {
+                return self.peek().is_none();
+            }
+        }
+    }
+
+    /// Takes the here-docs lexed but not yet given a body, for a lexer that
+    /// will not reach another newline (an alias's value).
+    pub fn take_pending_heredocs(&mut self) -> Vec<(String, bool)> {
+        std::mem::take(&mut self.pending_heredocs)
+    }
+
+    /// Queues a here-doc lexed elsewhere (in an alias's value) to take its
+    /// body from this lexer's input, as the `at`-th of those still pending.
+    pub fn insert_pending_heredoc(&mut self, at: usize, delim: String, strip_tabs: bool) {
+        let at = at.min(self.pending_heredocs.len());
+        self.pending_heredocs.insert(at, (delim, strip_tabs));
+    }
+
+    fn read_due_heredocs(&mut self) {
+        if std::mem::take(&mut self.bodies_due) {
+            self.read_pending_heredocs();
+        }
+    }
+
     fn read_pending_heredocs(&mut self) {
         for (delim, strip_tabs) in std::mem::take(&mut self.pending_heredocs) {
             let body = self.read_heredoc_body(&delim, strip_tabs);
             self.heredoc_bodies.push(body);
         }
+    }
+
+    /// Byte offset of the next unread character.
+    #[inline]
+    #[must_use]
+    pub const fn offset(&self) -> usize {
+        self.pos
     }
 
     /// Current source position: called by the parser before each token advance
@@ -566,6 +616,9 @@ impl<'src> Lexer<'src> {
                 } else if self.peek() == Some(b'&') {
                     self.advance();
                     RedirKind::OutFd
+                } else if self.peek() == Some(b'|') {
+                    self.advance();
+                    RedirKind::Clobber
                 } else {
                     RedirKind::Out
                 }
@@ -584,6 +637,14 @@ impl<'src> Lexer<'src> {
                         return self.lex_heredoc(true);
                     }
                     return self.lex_heredoc(false);
+                }
+                Some(b'&') => {
+                    self.advance();
+                    RedirKind::InFd
+                }
+                Some(b'>') => {
+                    self.advance();
+                    RedirKind::ReadWrite
                 }
                 _ => RedirKind::In,
             },
@@ -727,6 +788,7 @@ impl<'src> Lexer<'src> {
     /// Returns an error if the next token is malformed (e.g. an unclosed
     /// quote, substitution, or here-doc).
     pub fn next_token(&mut self) -> Result<Token, LexError> {
+        self.read_due_heredocs();
         self.skip_whitespace();
 
         match self.peek() {
@@ -736,7 +798,7 @@ impl<'src> Lexer<'src> {
             }
             Some(b'\n') => {
                 self.advance();
-                self.read_pending_heredocs();
+                self.bodies_due = true;
                 return Ok(Token::Newline);
             }
             Some(b'#') => {
@@ -800,15 +862,6 @@ impl<'src> Lexer<'src> {
                 return Ok(Token::Bang);
             }
             Some(b'<' | b'>') => return self.lex_redir(None),
-            // [ and ] are standalone word tokens (used by the [ / test builtin).
-            Some(b'[') => {
-                self.advance();
-                return Ok(Token::Word("[".into()));
-            }
-            Some(b']') => {
-                self.advance();
-                return Ok(Token::Word("]".into()));
-            }
             _ => {}
         }
 

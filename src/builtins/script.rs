@@ -43,8 +43,7 @@ impl Builtin for EvalBuiltin {
             return Ok(ExitStatus::SUCCESS);
         }
         let src = self.words.join(" ");
-        let program = crate::parser::parse(&src).map_err(|e| anyhow::anyhow!("eval: {e}"))?;
-        shell.run_program(&program)
+        shell.run_source(&src, "eval: ")
     }
 }
 
@@ -135,18 +134,13 @@ impl Builtin for SourceBuiltin {
         let resolved = resolve_source_path(&self.filename, self.path.as_deref(), shell);
         let src = std::fs::read_to_string(&resolved)
             .map_err(|e| anyhow::anyhow!("source: {resolved}: {}", strerror(e)))?;
-        let program =
-            crate::parser::parse(&src).map_err(|e| anyhow::anyhow!("source: {resolved}: {e}"))?;
 
         // Extra arguments become $1, $2, ... only for this run, restored
         // afterward; with none given, the caller's own positional params
         // stay visible to the sourced script.
-        let old_args = (!self.arguments.is_empty()).then(|| {
-            let old = shell.env.positional_args().to_vec();
-            shell.env.set_positional_args(self.arguments.clone());
-            old
-        });
-        let result = shell.run_program(&program);
+        let old_args = (!self.arguments.is_empty())
+            .then(|| shell.env.replace_positional_args(self.arguments.clone()));
+        let result = shell.run_source(&src, &format!("source: {resolved}: "));
         if let Some(old) = old_args {
             shell.env.set_positional_args(old);
         }

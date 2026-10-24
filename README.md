@@ -145,106 +145,32 @@ Build with the latest stable Rust: swagsh tracks the stable channel rather than 
 
 ## Known limitations
 
-- A redirect trailing a compound command (`while ... done < file`,
-  `{ ...; } > file`, same for `if`/`for`/`case`/`( )`) is silently wrong,
-  not just unsupported: it parses without error but has no effect on the
-  command, since the AST has nowhere to attach it (only a plain simple
-  command carries redirects today). `while read line; do ...; done < file`
-  runs with whatever stdin the shell already had, never touching `file`, a
-  real hazard given how common that exact idiom is. Fixing it properly
-  needs a redirect list on every compound-command AST node plus parser and
-  evaluator support to match, not a small patch.
 - No shell arrays (`arr=(a b c)`, `${arr[@]}`); a language-level gap, not a
-  missing builtin, but it's why `declare`/`mapfile`/`readarray` aren't in
-  the list below either: they'd need this first.
+  missing builtin, and the reason `declare`/`typeset`/`mapfile`/`readarray`
+  are absent too: they would need this first.
+- `set -b` (report background jobs the moment they finish) is not
+  implemented, and is rejected rather than accepted and ignored. Jobs are
+  reported before the next prompt instead.
+- `trap` lets a non-interactive shell trap a signal that was ignored when it
+  started, which POSIX forbids, and a trapped signal does not cut a `wait`
+  short. Real-time signals can be listed but not trapped or sent.
+- Pathname expansion sorts by byte value, as in the C locale, rather than by
+  the locale's collation order, and `.*` does not match `.` or `..` (as in
+  bash 5.2 and later).
+- The interactive prompt asks for a here-document's body only when `<<`
+  appears in the typed line itself, not when it comes from an alias.
 
 ### Missing builtins:
 
-  - `local`: functions currently share the caller's variable scope entirely.
-  - `trap`: no signal or exit-handler registration.
-  - `umask`, `readonly`: straightforward, just not done yet.
-  - `hash`: PATH-lookup cache (`hash`/`hash -r`); still genuinely useful, not
-    legacy, worth doing alongside `command`/`type`.
-  - `builtin`: forces NAME to resolve to an actual builtin, erroring instead
-    of falling through to PATH if it isn't one (`command` already bypasses a
-    same-named function to reach a builtin, so `builtin` is a narrower,
-    stricter tool on top of that, not a replacement for it; mainly useful
-    inside a function that shadows a builtin's name and needs to call the
-    real one, e.g. a `cd` wrapper calling `builtin cd "$@"`).
   - `help`: planned. Every builtin will implement a shared `Help` trait, with
     a default impl derived from its existing `clap` command so most builtins
     get this for free; the hand-written non-`clap` builtins (`:`, `true`,
     `false`, `[`, `test`) and `help` itself provide their own impl.
-  - `ulimit`: resource limits.
-  - `times`: POSIX-specified cumulative shell/children CPU time; just not
-    done yet. Distinct from `time` below (which times one pipeline).
-  - `fc`: POSIX-specified, but its re-edit-and-rerun-from-history workflow is
-    already covered by line-editing and arrow-key recall; low priority.
-- Not POSIX, but common enough to be worth adding later: `pushd`/`popd`/`dirs`
-  (directory stack), `declare`/`typeset` (blocked on array support above),
-  `disown`, `let` (thin wrapper around the arithmetic evaluator `$(( ))`
-  already uses internally), `history` (list/clear persistent history; today
-  history is file-backed only, with no builtin to inspect or manage it from
-  the shell itself), `time` (times a single pipeline; ubiquitous in
-  interactive use despite not being POSIX-specified as a builtin).
+  - `declare`/`typeset`, blocked on array support above.
 
 ---
 
 ## TODO
-
-Gaps found by a full review pass over the interpreter, checked against
-`bash` and `dash`. Nothing here is implemented yet; the ordering is by how
-badly each one misleads, not by effort.
-
-### Silently wrong
-
-Like the trailing-redirect bug above, these return a plausible answer
-instead of an error, so a script hits them without any signal that
-something went wrong.
-
-- **Arithmetic is missing most of its operators and yields a wrong number
-  rather than complaining.** `$(( ))` covers `+ - * / %`, the comparisons,
-  `&& || !` and parentheses. POSIX also requires the bitwise and shift
-  operators (`& | ^ << >> ~`), the ternary `?:`, and the assignment forms
-  (`x = 5`, `+=`, `<<=`, ...). None are implemented, and `arith_tokenize`
-  discards any character it does not recognise instead of erroring, so
-  `$((1|2))` evaluates to `1` and `$((6&3))` to `6`.
-- **Only decimal constants are understood.** `$((0x10))` is `0` and
-  `$((010))` is `10`, where POSIX requires `16` and `8`.
-- **Division by zero evaluates to `0`** instead of being an error.
-- **The unset-only parameter expansions are missing.** The colon forms
-  (`${v:-w}`, `${v:+w}`, `${v:=w}`, `${v:?w}`) work. The POSIX forms without
-  the colon, which test for *unset* rather than unset-or-empty (`${v-w}`,
-  `${v+w}`, `${v=w}`, `${v?w}`), are not recognised by `parse_param_op` at
-  all and expand to the empty string.
-
-### Unsupported, but visibly so
-
-- **`<&` (input descriptor duplication) is a parse error.** `>&` works, but
-  the lexer has no `InFd` counterpart to its `OutFd`, so `exec 3<file;
-  cat <&3` does not parse.
-- **Globs have no bracket expressions.** `[abc]`, `[a-z]` and `[!abc]` match
-  literally; `glob_match` implements `*` and `?` only.
-- **Only the final path component is globbed.** `a/*/b` is left untouched,
-  since `glob_expand` splits on the last `/` and treats everything before it
-  as a literal directory.
-- **`~user` is not expanded**, only `~` and `~/...`.
-- **`set` implements `-e`, `-x` and `-u` only.** POSIX also specifies `-a`,
-  `-b`, `-C`, `-f`, `-m`, `-n` and `-v`, and `$-` (the active option letters)
-  is always empty.
-- **Aliases are resolved when a command runs, not while it is parsed.**
-  POSIX expands them during tokenization, so an alias can stand in for
-  partial syntax: `alias fori='for i in'` then `fori 1 2; do ...; done`
-  works in `dash` and is a parse error here, since by evaluation time the
-  grammar has already been fixed. The same difference runs the other way
-  for `alias l=cmd; l` on a single line, which this shell accepts and a
-  POSIX one does not.
-
-### Smaller
-
-- `echo`/`printf` do not check their writes, so `echo x >&-` succeeds
-  quietly where other shells report `write error: Bad file descriptor`.
-- `$0` under `-c` is the binary's path rather than the shell's name.
 
 ### Planned interactive work
 

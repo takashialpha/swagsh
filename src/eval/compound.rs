@@ -115,7 +115,7 @@ impl Shell {
         let mut status = ExitStatus::SUCCESS;
         let mut propagate = None;
         for item in items {
-            self.env.set(&fc.var, item);
+            self.env.assign(&fc.var, item)?;
             match self.run_list(&fc.body) {
                 Ok(s) => status = s,
                 Err(e) if is_break(&e) => {
@@ -193,7 +193,7 @@ impl Shell {
             .unwrap_or_default();
         for arm in &cc.arms {
             for pattern in &arm.patterns {
-                let pat = self.expand_word_to_string(pattern)?;
+                let pat = self.expand_pattern(pattern)?;
                 if glob_match(&pat, &word) {
                     return self.run_list(&arm.body);
                 }
@@ -208,7 +208,8 @@ impl Shell {
             match unsafe { fork()? } {
                 Fork::Child => {
                     // SAFETY: in child, before any allocations.
-                    unsafe { restore_child_signals(self.interactive) };
+                    unsafe { restore_child_signals(self.interactive || self.monitor) };
+                    self.reset_traps_for_subshell();
                     let status = match self.run_list(&gc.body) {
                         Ok(s) => s,
                         Err(e) => {
@@ -218,7 +219,7 @@ impl Shell {
                             ExitStatus::FAILURE
                         }
                     };
-                    std::process::exit(status.0);
+                    self.exit(status.0);
                 }
                 Fork::ParentOf(child) => return self.wait_for_pid(child),
             }

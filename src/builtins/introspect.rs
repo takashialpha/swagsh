@@ -25,11 +25,16 @@ enum Kind {
 
 fn classify(name: &str, env: &Env) -> Vec<Kind> {
     let mut kinds = Vec::new();
-    if crate::builtins::lookup_builtin(name).is_some() {
+    let builtin = crate::builtins::lookup_builtin(name).is_some();
+    let special = builtin && crate::eval::is_special_builtin(name);
+    if special {
         kinds.push(Kind::Builtin);
     }
     if env.get_function(name).is_some() {
         kinds.push(Kind::Function);
+    }
+    if builtin && !special {
+        kinds.push(Kind::Builtin);
     }
     if let Some(path) = find_in_path(name, env) {
         kinds.push(Kind::File(path));
@@ -55,7 +60,6 @@ pub struct TypeBuiltin {
 impl Builtin for TypeBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
         let mut status = ExitStatus::SUCCESS;
-        let mut printed_any = false;
         for name in &self.names {
             let mut kinds = classify(name, &shell.env);
             if kinds.is_empty() {
@@ -72,39 +76,29 @@ impl Builtin for TypeBuiltin {
                 match kind {
                     Kind::Builtin | Kind::Function if self.path_only => {}
                     Kind::Builtin if self.type_only => {
-                        println!("builtin");
-                        printed_any = true;
+                        shell.outln("builtin")?;
                     }
                     Kind::Builtin => {
-                        println!("{name} is a shell builtin");
-                        printed_any = true;
+                        shell.outln(&format!("{name} is a shell builtin"))?;
                     }
                     Kind::Function if self.type_only => {
-                        println!("function");
-                        printed_any = true;
+                        shell.outln("function")?;
                     }
                     Kind::Function => {
-                        println!("{name} is a function");
-                        printed_any = true;
+                        shell.outln(&format!("{name} is a function"))?;
                     }
                     Kind::File(path) if self.type_only => {
                         let _ = path;
-                        println!("file");
-                        printed_any = true;
+                        shell.outln("file")?;
                     }
                     Kind::File(path) if self.path_only => {
-                        println!("{path}");
-                        printed_any = true;
+                        shell.outln(&path)?;
                     }
                     Kind::File(path) => {
-                        println!("{name} is {path}");
-                        printed_any = true;
+                        shell.outln(&format!("{name} is {path}"))?;
                     }
                 }
             }
-        }
-        if printed_any {
-            shell.note_stdout("\n");
         }
         Ok(status)
     }
@@ -145,7 +139,7 @@ impl Builtin for CommandBuiltin {
         };
 
         if self.print_word || self.print_verbose {
-            return Ok(describe_command(shell, name, self.print_verbose));
+            return describe_command(shell, name, self.print_verbose);
         }
 
         // Bypassing function lookup is the entire point of `command`: a
@@ -180,27 +174,26 @@ impl Builtin for CommandBuiltin {
 /// `command -v`/`-V`: unlike `type`, only the first match is ever reported
 /// (no `-a`), and `-v`'s output is a bare word rather than `type`'s "NAME
 /// is ..." sentence.
-fn describe_command(shell: &mut Shell, name: &str, verbose: bool) -> ExitStatus {
+fn describe_command(shell: &mut Shell, name: &str, verbose: bool) -> Result<ExitStatus> {
     let Some(kind) = classify(name, &shell.env).into_iter().next() else {
         if verbose {
             emit(format!("command: {name}: not found"));
         }
-        return ExitStatus::FAILURE;
+        return Ok(ExitStatus::FAILURE);
     };
     if verbose {
         match kind {
-            Kind::Builtin => println!("{name} is a shell builtin"),
-            Kind::Function => println!("{name} is a function"),
-            Kind::File(path) => println!("{name} is {path}"),
+            Kind::Builtin => shell.outln(&format!("{name} is a shell builtin"))?,
+            Kind::Function => shell.outln(&format!("{name} is a function"))?,
+            Kind::File(path) => shell.outln(&format!("{name} is {path}"))?,
         }
     } else {
         match kind {
-            Kind::Builtin | Kind::Function => println!("{name}"),
-            Kind::File(path) => println!("{path}"),
+            Kind::Builtin | Kind::Function => shell.outln(name)?,
+            Kind::File(path) => shell.outln(&path)?,
         }
     }
-    shell.note_stdout("\n");
-    ExitStatus::SUCCESS
+    Ok(ExitStatus::SUCCESS)
 }
 
 fn find_in_path(name: &str, env: &Env) -> Option<String> {
@@ -212,4 +205,42 @@ fn find_in_path(name: &str, env: &Env) -> Option<String> {
         }
     }
     None
+}
+
+#[derive(Parser)]
+#[command(name = "hash", about = "Remember or report where commands are found")]
+pub struct HashBuiltin {
+    /// Forget every remembered location
+    #[arg(short = 'r')]
+    reset: bool,
+    names: Vec<String>,
+}
+
+impl Builtin for HashBuiltin {
+    fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
+        if self.reset {
+            shell.env.clear_command_hash();
+        }
+        if self.names.is_empty() {
+            if !self.reset {
+                for (_, path) in shell.env.hashed_commands() {
+                    shell.outln(&path)?;
+                }
+            }
+            return Ok(ExitStatus::SUCCESS);
+        }
+        let mut status = ExitStatus::SUCCESS;
+        for name in &self.names {
+            if crate::builtins::lookup_builtin(name).is_some()
+                || shell.env.get_function(name).is_some()
+            {
+                continue;
+            }
+            if shell.find_command(name).is_none() {
+                emit(format!("hash: {name}: not found"));
+                status = ExitStatus::FAILURE;
+            }
+        }
+        Ok(status)
+    }
 }

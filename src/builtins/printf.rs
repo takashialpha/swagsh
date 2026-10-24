@@ -273,10 +273,12 @@ impl Builtin for PrintfBuiltin {
             }
         }
         if let Some(name) = self.var {
-            shell.env.set(&name, output);
+            shell
+                .env
+                .assign(&name, output)
+                .map_err(|e| anyhow::anyhow!("printf: {e}"))?;
         } else {
-            print!("{output}");
-            shell.note_stdout(&output);
+            shell.out(&output)?;
         }
         Ok(ExitStatus::SUCCESS)
     }

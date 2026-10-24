@@ -2,7 +2,7 @@
 //!
 //! Builtins take POSIX-style single-dash flags (`cd -L`, `read -r -p`, ...),
 //! not a full CLI-app argument model, so [`parse_args`] strips `clap`'s
-//! defaults down to that shape: no `--version`, argv[0] omitted (builtins
+//! defaults down to that shape: no `--version`, `argv[0]` omitted (builtins
 //! are already matched by name before their handler runs), and errors
 //! reformatted to a single line on the builtin's own name instead of
 //! clap's multi-paragraph "Usage: ..." block. Color is untouched (`clap`
@@ -43,7 +43,7 @@ pub fn dispatch<B: Builtin>(shell: &mut Shell, args: &[&str]) -> Result<ExitStat
     match parse_args::<B>(args)? {
         ParsedArgs::Ok(b) => b.run(shell),
         ParsedArgs::Help => Ok(ExitStatus::SUCCESS),
-        ParsedArgs::UsageError => Ok(ExitStatus(2)),
+        ParsedArgs::UsageError => Err(super::BuiltinFailed(ExitStatus(2)).into()),
     }
 }
 

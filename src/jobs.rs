@@ -53,6 +53,8 @@ pub struct Job {
     pub id: usize,
     pub pgid: Pid,
     pub pids: Vec<Pid>,
+    /// The exit status of each of `pids` that has finished.
+    pub statuses: Vec<Option<ExitStatus>>,
     pub state: JobState,
     pub command: String,
 }
@@ -70,6 +72,7 @@ impl JobTable {
         self.jobs.push(Job {
             id,
             pgid,
+            statuses: vec![None; pids.len()],
             pids,
             state: JobState::Running,
             command,
@@ -101,10 +104,17 @@ impl JobTable {
         }
     }
 
-    fn mark_pid_done(&mut self, pid: Pid, status: ExitStatus) {
+    /// Records that `pid` exited. Its job is done once every process in it
+    /// has, with the status of the last one (a pipeline's last stage).
+    pub fn mark_pid_done(&mut self, pid: Pid, status: ExitStatus) {
         for job in &mut self.jobs {
-            if job.pids.contains(&pid) {
-                job.state = JobState::Done(status);
+            if let Some(i) = job.pids.iter().position(|&p| p == pid) {
+                job.statuses[i] = Some(status);
+                if let Some(Some(last)) = job.statuses.last()
+                    && job.statuses.iter().all(Option::is_some)
+                {
+                    job.state = JobState::Done(*last);
+                }
             }
         }
     }

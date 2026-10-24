@@ -129,7 +129,63 @@ pub struct ExitBuiltin {
 }
 
 impl Builtin for ExitBuiltin {
-    fn run(self, _shell: &mut Shell) -> Result<ExitStatus> {
-        std::process::exit(self.code.unwrap_or(0));
+    fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
+        let code = self.code.unwrap_or(shell.last_status.0);
+        // The REPL catches this to save history before exiting.
+        if shell.interactive {
+            return Err(Error::new(ExitRequest(code)));
+        }
+        shell.exit(code);
     }
+}
+
+/// `exit` in an interactive shell, unwinding to the REPL.
+#[derive(Debug)]
+pub struct ExitRequest(pub i32);
+
+impl std::fmt::Display for ExitRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "exit {}", self.0)
+    }
+}
+
+impl std::error::Error for ExitRequest {}
+
+/// `builtin NAME [ARG...]`: runs the builtin NAME even when a function of
+/// the same name would otherwise be found first.
+///
+/// # Errors
+///
+/// Returns an error if NAME is not a builtin, or whatever the builtin does.
+pub fn builtin_builtin(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+    let Some((&name, rest)) = args.split_first() else {
+        return Ok(ExitStatus::SUCCESS);
+    };
+    match crate::builtins::lookup_builtin(name) {
+        Some(f) if name != "exec" => f(shell, rest),
+        Some(_) => Err(anyhow::anyhow!("builtin: exec: run it directly")),
+        None => Err(anyhow::anyhow!("builtin: {name}: not a shell builtin")),
+    }
+}
+
+/// `let EXPR...`: evaluates each argument as `$(( ))` would, succeeding when
+/// the last one is non-zero.
+///
+/// # Errors
+///
+/// Returns an error if an expression is malformed.
+pub fn builtin_let(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+    if args.is_empty() {
+        anyhow::bail!("let: expression expected");
+    }
+    let mut last = 0;
+    for expr in args {
+        last = crate::expand::eval_arith_with(expr, &mut shell.env)
+            .map_err(|e| anyhow::anyhow!("let: {e}"))?;
+    }
+    Ok(if last == 0 {
+        ExitStatus::FAILURE
+    } else {
+        ExitStatus::SUCCESS
+    })
 }

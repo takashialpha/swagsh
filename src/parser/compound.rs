@@ -5,7 +5,7 @@ use crate::lexer::Token;
 
 use super::{ParseResult, Parser, keyword_text};
 
-impl Parser {
+impl Parser<'_> {
     pub(super) fn parse_if(&mut self) -> ParseResult<Command> {
         self.expect(&Token::If)?;
         let condition = self.parse_list()?;

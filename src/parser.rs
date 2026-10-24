@@ -1,12 +1,13 @@
 use std::fmt;
+use std::rc::Rc;
 
 use crate::ast::{
     AndOrItem, AndOrList, AndOrOp, Command, Pipeline, Program, Redirect, RedirectKind, SimpleCmd,
-    Word,
+    TimeFormat, Word,
 };
 use crate::lexer::{
-    LexError, QUOTE_END, QUOTE_END_BYTE, QUOTE_START, QUOTE_START_BYTE, RedirKind, RedirToken,
-    Token,
+    LexError, Lexer, QUOTE_END, QUOTE_END_BYTE, QUOTE_START, QUOTE_START_BYTE, RedirKind,
+    RedirToken, Token,
 };
 
 mod compound;
@@ -58,17 +59,64 @@ struct Spanned {
     token: Token,
     line: usize,
     col: usize,
+    /// Byte offset just past this token in the source, for `set -v`.
+    end: usize,
 }
 
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
 
-pub struct Parser {
+/// Alias definitions, by name, as the parser sees them.
+pub type Aliases = crate::env::AliasMap;
+
+/// What word parsing carries into the parsers it starts for `$(...)` and
+/// backtick bodies: the nesting depth so far, and the aliases to expand.
+#[derive(Clone, Copy)]
+struct Nest<'a> {
+    depth: usize,
+    aliases: Option<&'a Rc<Aliases>>,
+}
+
+impl Nest<'_> {
+    const fn deeper(self) -> Self {
+        Self {
+            depth: self.depth + 1,
+            aliases: self.aliases,
+        }
+    }
+}
+
+/// How far ahead of `pos` the token buffer is kept filled, which is as far
+/// as any lookahead in the grammar reaches (`is_function_def_ahead`).
+const LOOKAHEAD: usize = 1;
+
+/// A parser that pulls tokens from the lexer only as the grammar needs them.
+///
+/// That lets a script be parsed and run one complete command at a time
+/// ([`Parser::next_command`]), so aliases defined by one command apply to
+/// the next.
+pub struct Parser<'src> {
+    lexer: Lexer<'src>,
+    /// The buffer ends in `Token::Eof`, real or standing in for `lex_error`.
+    lexed_eof: bool,
+    /// A lex error, and the index of the `Token::Eof` pushed in its place.
+    /// Reported by whichever parse first reaches that index, so commands
+    /// before the bad text still parse (and run) normally.
+    lex_error: Option<(usize, ParseError)>,
     tokens: Vec<Spanned>,
     pos: usize,
+    /// Indices of `Token::HereDoc`s whose bodies the lexer has not read yet.
+    unfilled_heredocs: Vec<usize>,
     /// Current `parse_command` nesting depth; see `MAX_PARSE_DEPTH`.
     depth: usize,
+    aliases: Option<Rc<Aliases>>,
+    /// `(name, start, end)` token ranges produced by expanding alias `name`,
+    /// so an alias is not expanded again inside its own expansion.
+    alias_spans: Vec<(String, usize, usize)>,
+    /// The token after an alias whose value ends in a blank, which POSIX
+    /// says is checked for alias expansion too.
+    alias_next: Option<usize>,
 }
 
 /// Every level of nested compound command (`{ }`, `( )`, `if`/`while`/...)
@@ -82,66 +130,158 @@ pub struct Parser {
 /// hand.
 const MAX_PARSE_DEPTH: usize = 256;
 
-impl Parser {
-    /// # Errors
-    ///
-    /// Returns an error if `src` contains a lex error (e.g. an unterminated
-    /// quote or substitution).
-    pub fn new(src: &str) -> ParseResult<Self> {
-        Self::new_at_depth(src, 0)
+impl<'src> Parser<'src> {
+    #[must_use]
+    pub fn new(src: &'src str) -> Self {
+        Self::with_aliases(src, None)
+    }
+
+    /// [`Parser::new`], expanding the given aliases while parsing.
+    #[must_use]
+    pub fn with_aliases(src: &'src str, aliases: Option<Rc<Aliases>>) -> Self {
+        Self::new_at_depth(src, 0, aliases)
     }
 
     /// `Parser::new`, but starting the nesting counter at `depth` instead of
     /// zero.
     ///
     /// A `$(...)` or backtick substitution is parsed by handing its interior
-    /// to a *new* `Parser`, and a fresh parser used to reset `depth` to 0.
-    /// That left `MAX_PARSE_DEPTH` bounding recursion only within a single
-    /// parser instance while the nesting that actually matters crossed
-    /// instances, so a few thousand nested `$(` overflowed the stack even
-    /// though the identical depth of `{ }` was rejected cleanly. Carrying
-    /// the depth across the boundary makes the limit apply to the real
-    /// recursion.
-    fn new_at_depth(src: &str, depth: usize) -> ParseResult<Self> {
-        use crate::lexer::Lexer;
+    /// to a *new* `Parser`. Carrying the depth across that boundary makes
+    /// `MAX_PARSE_DEPTH` bound the real recursion, which crosses parser
+    /// instances: otherwise a few thousand nested `$(` would overflow the
+    /// stack even though the identical depth of `{ }` is rejected cleanly.
+    fn new_at_depth(src: &'src str, depth: usize, aliases: Option<Rc<Aliases>>) -> Self {
+        let mut parser = Self {
+            lexer: Lexer::new(src),
+            lexed_eof: false,
+            lex_error: None,
+            tokens: Vec::new(),
+            pos: 0,
+            unfilled_heredocs: Vec::new(),
+            depth,
+            aliases,
+            alias_spans: Vec::new(),
+            alias_next: None,
+        };
+        parser.fill();
+        parser
+    }
 
-        let mut lexer = Lexer::new(src);
-        // A rough one-token-per-4-source-bytes estimate (short words,
-        // frequent whitespace/newlines): cuts the repeated grow-and-copy
-        // reallocations `Vec::new()`'s zero starting capacity would
-        // otherwise do for any script of real size. Wrong by some factor
-        // just means one more/fewer reallocation, not a correctness issue.
-        let mut tokens = Vec::with_capacity(src.len() / 4);
-        let mut unfilled_heredocs = Vec::new();
+    /// Lexes until the buffer holds `LOOKAHEAD` tokens past `pos`, or ends in
+    /// `Token::Eof`, filling in here-doc bodies as the lexer reads them.
+    fn fill(&mut self) {
+        while !self.lexed_eof && self.tokens.len() <= self.pos + LOOKAHEAD {
+            self.lex_one();
+        }
+    }
 
-        loop {
-            let (line, col) = lexer.position();
-            let tok = lexer.next_token()?;
-            let done = tok == Token::Eof;
-            if matches!(tok, Token::HereDoc { .. }) {
-                unfilled_heredocs.push(tokens.len());
+    /// A here-doc's body follows the next newline, which can be well past
+    /// the lookahead; lexes ahead until the one at `idx` has it.
+    fn read_heredoc_body_at(&mut self, idx: usize) {
+        while !self.lexed_eof && self.unfilled_heredocs.contains(&idx) {
+            self.lex_one();
+        }
+    }
+
+    fn lex_one(&mut self) {
+        let (line, col) = self.lexer.position();
+        let token = match self.lexer.next_token() {
+            Ok(token) => token,
+            Err(e) => {
+                self.lex_error = Some((self.tokens.len(), e.into()));
+                Token::Eof
             }
-            tokens.push(Spanned {
-                token: tok,
-                line,
-                col,
-            });
-            let bodies = lexer.take_heredoc_bodies();
-            for (idx, body) in unfilled_heredocs.drain(..bodies.len()).zip(bodies) {
-                if let Token::HereDoc { body: slot, .. } = &mut tokens[idx].token {
-                    *slot = body;
-                }
-            }
-            if done {
-                break;
+        };
+        self.lexed_eof = token == Token::Eof;
+        if matches!(token, Token::HereDoc { .. }) {
+            self.unfilled_heredocs.push(self.tokens.len());
+        }
+        self.tokens.push(Spanned {
+            token,
+            line,
+            col,
+            end: self.lexer.offset(),
+        });
+        let bodies = self.lexer.take_heredoc_bodies();
+        for (idx, body) in self.unfilled_heredocs.drain(..bodies.len()).zip(bodies) {
+            if let Token::HereDoc { body: slot, .. } = &mut self.tokens[idx].token {
+                *slot = body;
             }
         }
+    }
 
-        Ok(Self {
-            tokens,
-            pos: 0,
-            depth,
-        })
+    /// The pending lex error, if parsing has reached the point where it was
+    /// found.
+    fn reached_lex_error(&self) -> Option<&ParseError> {
+        self.lex_error
+            .as_ref()
+            .filter(|(idx, _)| self.pos >= *idx)
+            .map(|(_, e)| e)
+    }
+
+    /// Replaces the word at `pos` with the tokens of the alias it names, if
+    /// it names one that is not already being expanded at this point.
+    /// Returns whether it did.
+    fn expand_alias(&mut self) -> ParseResult<bool> {
+        let pos = self.pos;
+        let Token::Word(name) = &self.tokens[pos].token else {
+            return Ok(false);
+        };
+        let Some(value) = self.aliases.as_ref().and_then(|a| a.get(name)) else {
+            return Ok(false);
+        };
+        self.alias_spans.retain(|(_, _, end)| *end > pos);
+        if self
+            .alias_spans
+            .iter()
+            .any(|(active, start, end)| active == name && (*start..*end).contains(&pos))
+        {
+            return Ok(false);
+        }
+        let (name, value) = (name.clone(), value.clone());
+        let Spanned { line, col, end, .. } = self.tokens[pos];
+        let lexed = lex_alias_value(&value)?;
+        let replacement: Vec<Spanned> = lexed
+            .tokens
+            .into_iter()
+            .map(|token| Spanned {
+                token,
+                line,
+                col,
+                end,
+            })
+            .collect();
+        let added = replacement.len();
+        self.tokens.splice(pos..=pos, replacement);
+        let shift = |i: &mut usize| {
+            if *i > pos {
+                *i = *i + added - 1;
+            }
+        };
+        for (_, _, span_end) in &mut self.alias_spans {
+            shift(span_end);
+        }
+        for idx in &mut self.unfilled_heredocs {
+            shift(idx);
+        }
+        if let Some((idx, _)) = &mut self.lex_error {
+            shift(idx);
+        }
+        // Here-docs in the value take their bodies from the input after the
+        // next newline, in token order with any already waiting there.
+        let first = self.unfilled_heredocs.iter().filter(|&&i| i < pos).count();
+        for (at, (offset, (delim, strip_tabs))) in (first..).zip(lexed.pending) {
+            self.unfilled_heredocs.insert(at, pos + offset);
+            self.lexer.insert_pending_heredoc(at, delim, strip_tabs);
+        }
+        self.alias_spans.push((name, pos, pos + added));
+        if value.ends_with([' ', '\t']) {
+            self.alias_next = Some(pos + added);
+        } else if let Some(next) = &mut self.alias_next {
+            shift(next);
+        }
+        self.fill();
+        Ok(true)
     }
 
     // ------------------------------------------------------------------
@@ -158,12 +298,15 @@ impl Parser {
         &self.tokens[self.pos]
     }
 
+    /// Moves past the current token, returning it. Every way `pos` moves
+    /// goes through here, which keeps the lookahead buffer filled.
     fn advance(&mut self) -> &Token {
-        let t = &self.tokens[self.pos].token;
+        let current = self.pos;
         if self.pos + 1 < self.tokens.len() {
             self.pos += 1;
         }
-        t
+        self.fill();
+        &self.tokens[current].token
     }
 
     fn expect(&mut self, expected: &Token) -> ParseResult<()> {
@@ -171,6 +314,9 @@ impl Parser {
             self.advance();
             Ok(())
         } else {
+            if let Some(e) = self.reached_lex_error() {
+                return Err(e.clone());
+            }
             let sp = self.peek_spanned();
             Err(ParseError {
                 line: sp.line,
@@ -187,6 +333,9 @@ impl Parser {
     /// unexpected token, so this check alone is enough to tell the two
     /// apart everywhere `err`/`expect` are used.
     fn err(&self, msg: impl Into<String>) -> ParseError {
+        if let Some(e) = self.reached_lex_error() {
+            return e.clone();
+        }
         let sp = self.peek_spanned();
         ParseError {
             line: sp.line,
@@ -223,7 +372,82 @@ impl Parser {
         if *self.peek() != Token::Eof {
             return Err(self.err(format!("unexpected token `{}`", self.peek())));
         }
+        if let Some(e) = self.reached_lex_error() {
+            return Err(e.clone());
+        }
         Ok(Program { body })
+    }
+
+    /// Parses the next complete command: everything up to the end of its
+    /// line, which may hold several `;`- or `&`-separated lists, or span
+    /// lines inside a compound command. `None` at end of input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if that command is malformed.
+    pub fn next_command(&mut self, aliases: Option<Rc<Aliases>>) -> ParseResult<Option<Program>> {
+        self.aliases = aliases;
+        self.discard_consumed();
+        while matches!(self.peek(), Token::Newline) {
+            self.advance();
+        }
+        if *self.peek() == Token::Eof {
+            return self
+                .reached_lex_error()
+                .map_or(Ok(None), |e| Err(e.clone()));
+        }
+        let mut body = Vec::new();
+        loop {
+            body.push(self.parse_and_or()?);
+            match self.peek() {
+                Token::Newline => {
+                    self.advance();
+                    break;
+                }
+                Token::Eof => break,
+                _ if self.at_list_terminator() => {
+                    return Err(self.err(format!("unexpected token `{}`", self.peek())));
+                }
+                _ => {}
+            }
+        }
+        if let Some(e) = self.reached_lex_error() {
+            return Err(e.clone());
+        }
+        Ok(Some(Program { body }))
+    }
+
+    /// The source consumed by the last [`Parser::next_command`], up to the
+    /// byte offset this returns.
+    #[must_use]
+    pub fn consumed_offset(&self) -> usize {
+        self.pos
+            .checked_sub(1)
+            .and_then(|i| self.tokens.get(i))
+            .map_or(0, |t| t.end)
+    }
+
+    /// Drops tokens already parsed, so a long script's buffer does not grow
+    /// without bound.
+    fn discard_consumed(&mut self) {
+        let n = self.pos.saturating_sub(1);
+        if n == 0 {
+            return;
+        }
+        self.tokens.drain(..n);
+        self.pos -= n;
+        for idx in &mut self.unfilled_heredocs {
+            *idx -= n;
+        }
+        self.alias_spans.retain(|(_, _, end)| *end > n);
+        for (_, start, end) in &mut self.alias_spans {
+            *start = start.saturating_sub(n);
+            *end -= n;
+        }
+        self.alias_next = self.alias_next.and_then(|i| i.checked_sub(n));
+        if let Some((idx, _)) = &mut self.lex_error {
+            *idx = idx.saturating_sub(n);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -324,6 +548,18 @@ impl Parser {
     // ------------------------------------------------------------------
 
     fn parse_pipeline(&mut self) -> ParseResult<Pipeline> {
+        // `time` is reserved only here, at the start of a pipeline.
+        let timed = if *self.peek() == Token::Word("time".to_owned()) {
+            self.advance();
+            if *self.peek() == Token::Word("-p".to_owned()) {
+                self.advance();
+                Some(TimeFormat::Posix)
+            } else {
+                Some(TimeFormat::Default)
+            }
+        } else {
+            None
+        };
         let negated = self.eat(&Token::Bang);
         // Almost always exactly one: most commands aren't part of a `|`
         // pipeline. See `parse_and_or`'s `items` for the same reasoning.
@@ -336,7 +572,11 @@ impl Parser {
             commands.push(self.parse_command()?);
         }
 
-        Ok(Pipeline { commands, negated })
+        Ok(Pipeline {
+            commands,
+            negated,
+            timed,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -361,6 +601,7 @@ impl Parser {
     }
 
     fn parse_command_inner(&mut self) -> ParseResult<Command> {
+        while self.expand_alias()? {}
         let compound = match self.peek() {
             Token::If => self.parse_if(),
             Token::For => self.parse_for(),
@@ -412,6 +653,15 @@ impl Parser {
         let mut redirects = Vec::new();
 
         loop {
+            if self.alias_next == Some(self.pos) {
+                self.alias_next = None;
+                if self.expand_alias()? {
+                    // The expansion's own first word is checked again, the
+                    // way it would be if the value were re-read as input.
+                    while self.expand_alias()? {}
+                    continue;
+                }
+            }
             if let Token::Word(w) = self.peek().clone() {
                 self.advance();
                 words.push(self.parse_word_str(w)?);
@@ -472,7 +722,11 @@ impl Parser {
             return Ok(Word::Literal(raw));
         }
 
-        let mut parts = decompose_word(&raw, self.depth, false)?;
+        let nest = Nest {
+            depth: self.depth,
+            aliases: self.aliases.as_ref(),
+        };
+        let mut parts = decompose_word(&raw, nest, false)?;
         if parts.len() == 1
             && let Some(part) = parts.pop()
         {
@@ -486,6 +740,7 @@ impl Parser {
     // ------------------------------------------------------------------
 
     fn parse_redirect(&mut self) -> ParseResult<Redirect> {
+        self.read_heredoc_body_at(self.pos);
         match self.advance().clone() {
             Token::Redir(RedirToken { kind, fd }) => {
                 let target_tok = self.peek().clone();
@@ -505,9 +760,12 @@ impl Parser {
 
                 let (rk, default_fd) = match kind {
                     RedirKind::Out => (RedirectKind::Out, 1),
+                    RedirKind::Clobber => (RedirectKind::Clobber, 1),
                     RedirKind::Append => (RedirectKind::Append, 1),
                     RedirKind::In => (RedirectKind::In, 0),
-                    RedirKind::OutFd => (RedirectKind::FdOut, 1),
+                    RedirKind::ReadWrite => (RedirectKind::ReadWrite, 0),
+                    RedirKind::OutFd => (RedirectKind::Dup, 1),
+                    RedirKind::InFd => (RedirectKind::Dup, 0),
                     RedirKind::BothOut => (RedirectKind::Both, 1),
                 };
 
@@ -548,7 +806,7 @@ impl Parser {
 
 fn parse_dollar(
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
-    depth: usize,
+    nest: Nest<'_>,
 ) -> ParseResult<Option<Word>> {
     match chars.peek().map(|(_, c)| *c) {
         Some('(') => {
@@ -563,8 +821,8 @@ fn parse_dollar(
             }
             let fragment = collect_balanced(chars, '(', ')')?;
             let inner = &fragment[2..fragment.len() - 1];
-            let prog = Parser::new_at_depth(inner, depth + 1)
-                .and_then(Parser::parse)
+            let prog = Parser::new_at_depth(inner, nest.depth + 1, nest.aliases.cloned())
+                .parse()
                 .map_err(|e| ParseError {
                     msg: format!("in command substitution: {}", e.msg),
                     ..e
@@ -648,17 +906,18 @@ const fn keyword_text(tok: &Token) -> Option<&'static str> {
 /// Splits a lexed word buffer into `Word` parts, resolving `$`/backtick
 /// expansions and backslash escapes as it goes. `in_dquotes` selects which
 /// escape rule the trailing `'\\'` arm applies: outside quotes, `\X` always
-/// collapses to the literal `X` (any character); inside double quotes,
+/// becomes a quoted `X` (any character), so it loses any special meaning
+/// such as globbing or tilde expansion; inside double quotes,
 /// POSIX narrows that to `\$ \` \" \\` and a trailing `\<newline>` (dropped
 /// entirely); a backslash before anything else stays a literal backslash
 /// followed by that character, e.g. `"\t"` is the two characters `\` and
 /// `t`, not a tab.
-fn decompose_word(raw: &str, depth: usize, in_dquotes: bool) -> ParseResult<Vec<Word>> {
+fn decompose_word(raw: &str, nest: Nest<'_>, in_dquotes: bool) -> ParseResult<Vec<Word>> {
     // Backstop for the nesting this function reaches on its own (a quoted
     // region re-enters it, a `$(...)` re-enters the whole parser). The
     // sub-parsers below carry `depth` onward so the limit spans every hop,
     // not just the ones inside one `Parser`.
-    if depth > MAX_PARSE_DEPTH {
+    if nest.depth > MAX_PARSE_DEPTH {
         return Err(ParseError {
             line: 0,
             col: 0,
@@ -680,7 +939,7 @@ fn decompose_word(raw: &str, depth: usize, in_dquotes: bool) -> ParseResult<Vec<
 
     while let Some((_, ch)) = chars.next() {
         match ch {
-            '$' => match parse_dollar(&mut chars, depth)? {
+            '$' => match parse_dollar(&mut chars, nest)? {
                 Some(word) => {
                     flush_lit!();
                     parts.push(word);
@@ -702,12 +961,12 @@ fn decompose_word(raw: &str, depth: usize, in_dquotes: bool) -> ParseResult<Vec<
 
             '"' => {
                 flush_lit!();
-                parts.push(read_double_quoted(&mut chars, depth)?);
+                parts.push(read_double_quoted(&mut chars, nest)?);
             }
 
             '`' => {
                 flush_lit!();
-                parts.push(read_backtick(&mut chars, depth)?);
+                parts.push(read_backtick(&mut chars, nest)?);
             }
 
             '\\' if in_dquotes => match chars.peek().map(|&(_, c)| c) {
@@ -724,7 +983,8 @@ fn decompose_word(raw: &str, depth: usize, in_dquotes: bool) -> ParseResult<Vec<
 
             '\\' => {
                 if let Some((_, next)) = chars.next() {
-                    lit.push(next);
+                    flush_lit!();
+                    parts.push(Word::Quoted(Box::new(Word::Literal(next.to_string()))));
                 }
             }
 
@@ -745,7 +1005,7 @@ fn decompose_word(raw: &str, depth: usize, in_dquotes: bool) -> ParseResult<Vec<
 /// it as a single [`Word::Quoted`].
 fn read_double_quoted(
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
-    depth: usize,
+    nest: Nest<'_>,
 ) -> ParseResult<Word> {
     let mut inner = String::new();
     while let Some((_, c)) = chars.next() {
@@ -768,10 +1028,13 @@ fn read_double_quoted(
             '$' if chars.peek().map(|&(_, c)| c) == Some('(') => {
                 inner.push_str(&collect_balanced(chars, '(', ')')?);
             }
+            '$' if chars.peek().map(|&(_, c)| c) == Some('{') => {
+                inner.push_str(&collect_balanced(chars, '{', '}')?);
+            }
             _ => inner.push(c),
         }
     }
-    let mut sub_parts = decompose_word(&inner, depth + 1, true)?;
+    let mut sub_parts = decompose_word(&inner, nest.deeper(), true)?;
     let inner_word = if sub_parts.len() == 1 {
         sub_parts.remove(0)
     } else {
@@ -784,7 +1047,7 @@ fn read_double_quoted(
 /// and returns it as a [`Word::CmdSub`].
 fn read_backtick(
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
-    depth: usize,
+    nest: Nest<'_>,
 ) -> ParseResult<Word> {
     let mut inner = String::new();
     while let Some((_, c)) = chars.next() {
@@ -799,7 +1062,7 @@ fn read_backtick(
             _ => inner.push(c),
         }
     }
-    let program = Parser::new_at_depth(&inner, depth + 1)?.parse()?;
+    let program = Parser::new_at_depth(&inner, nest.depth + 1, nest.aliases.cloned()).parse()?;
     Ok(Word::CmdSub(Box::new(program.into_command())))
 }
 
@@ -844,9 +1107,123 @@ fn collect_balanced(
 // Public convenience
 // ---------------------------------------------------------------------------
 
+/// Parses `raw`, already-lexed word text such as a `${var:-word}` operand,
+/// into a [`Word`], with backslashes following double-quote rules when
+/// `in_dquotes`.
+///
+/// # Errors
+///
+/// Returns an error if a quote or substitution in `raw` is left unclosed.
+pub(crate) fn parse_word(
+    raw: &str,
+    in_dquotes: bool,
+    aliases: Option<&Rc<Aliases>>,
+) -> ParseResult<Word> {
+    let marked;
+    let raw = if in_dquotes || !raw.contains('\'') {
+        raw
+    } else {
+        marked = mark_single_quotes(raw);
+        &marked
+    };
+    let mut parts = decompose_word(raw, Nest { depth: 0, aliases }, in_dquotes)?;
+    Ok(if parts.len() == 1 {
+        parts.remove(0)
+    } else {
+        Word::Compound(parts)
+    })
+}
+
+/// Replaces the `'` around each single-quoted region of `raw` with
+/// [`QUOTE_START`]/[`QUOTE_END`], as the lexer does for ordinary words; text
+/// inside `${...}` reaches the parser without that marking.
+fn mark_single_quotes(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    let mut in_dquotes = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                out.push(c);
+                out.extend(chars.next());
+            }
+            '"' => {
+                in_dquotes = !in_dquotes;
+                out.push(c);
+            }
+            '\'' if !in_dquotes => {
+                out.push(QUOTE_START);
+                out.extend(chars.by_ref().take_while(|&c| c != '\''));
+                out.push(QUOTE_END);
+            }
+            '$' if matches!(chars.peek(), Some('(' | '{')) => {
+                out.push(c);
+                let Some(open) = chars.next() else { break };
+                let close = if open == '(' { ')' } else { '}' };
+                out.push(open);
+                let mut depth = 1usize;
+                for c in chars.by_ref() {
+                    out.push(c);
+                    if c == open {
+                        depth += 1;
+                    } else if c == close {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// # Errors
 ///
 /// Returns an error if `src` fails to lex or parse.
 pub fn parse(src: &str) -> ParseResult<Program> {
-    Parser::new(src)?.parse()
+    Parser::new(src).parse()
+}
+
+/// [`parse`], expanding `aliases` while parsing.
+///
+/// # Errors
+///
+/// Returns an error if `src` fails to lex or parse.
+pub fn parse_with_aliases(src: &str, aliases: Rc<Aliases>) -> ParseResult<Program> {
+    Parser::with_aliases(src, Some(aliases)).parse()
+}
+
+/// An alias's value, lexed into the tokens that replace the aliased word.
+struct AliasTokens {
+    tokens: Vec<Token>,
+    /// Here-docs among `tokens` still waiting for a body, by index, with
+    /// their delimiter and `<<-` flag.
+    pending: Vec<(usize, (String, bool))>,
+}
+
+fn lex_alias_value(value: &str) -> ParseResult<AliasTokens> {
+    let mut lexer = Lexer::new(value);
+    let mut tokens = Vec::new();
+    let mut unfilled = Vec::new();
+    while !lexer.is_exhausted() {
+        let token = lexer.next_token()?;
+        if matches!(token, Token::HereDoc { .. }) {
+            unfilled.push(tokens.len());
+        }
+        tokens.push(token);
+        let bodies = lexer.take_heredoc_bodies();
+        for (idx, body) in unfilled.drain(..bodies.len()).zip(bodies) {
+            if let Token::HereDoc { body: slot, .. } = &mut tokens[idx] {
+                *slot = body;
+            }
+        }
+    }
+    let pending = unfilled
+        .into_iter()
+        .zip(lexer.take_pending_heredocs())
+        .collect();
+    Ok(AliasTokens { tokens, pending })
 }

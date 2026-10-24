@@ -9,6 +9,10 @@
 //! is already in the dependency graph (via `rustyline`), and its 0.2 surface
 //! is the most stable FFI target in the ecosystem.
 //!
+//! The password-database lookup behind `~user` ([`home_dir_of`]) and the
+//! CPU-time query behind `times`/`time` ([`cpu_times`]) live here too, since
+//! rustix has no API for either.
+//!
 //! Everything else the shell needs (`fs`, `io`, `pipe`, `termios`, `process`,
 //! `fd`) still comes from rustix's stable public API.
 //!
@@ -156,4 +160,76 @@ pub unsafe fn unblock_all_signals() -> Result<(), Errno> {
 /// The errno left behind by the most recent failing libc call.
 fn last_errno() -> Errno {
     Errno::from_raw_os_error(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+}
+
+/// The home directory of the user named `user`, from the password database
+/// (`getpwnam_r(3)`, so NSS sources such as LDAP count too). Used for `~user`
+/// tilde expansion; rustix has no password-database API.
+#[must_use]
+pub fn home_dir_of(user: &str) -> Option<String> {
+    let name = std::ffi::CString::new(user).ok()?;
+    let mut buf = vec![0u8; 1024];
+    loop {
+        // SAFETY: `passwd` is a plain C struct of integers and pointers, for
+        // which an all-zero bit pattern is a valid starting state.
+        let mut pwd: libc::passwd = unsafe { core::mem::zeroed() };
+        let mut result: *mut libc::passwd = core::ptr::null_mut();
+        // SAFETY: every pointer is valid for the duration of the call, and
+        // `buf.len()` is the true size of `buf`.
+        let rc = unsafe {
+            libc::getpwnam_r(
+                name.as_ptr(),
+                &raw mut pwd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &raw mut result,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < 1 << 20 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: on success `pw_dir` points at a NUL-terminated string
+        // inside `buf`, which is still alive here.
+        let dir = unsafe { CStr::from_ptr(pwd.pw_dir) };
+        return Some(dir.to_string_lossy().into_owned());
+    }
+}
+
+/// User and system CPU time, from `getrusage(2)`.
+#[derive(Clone, Copy, Default)]
+pub struct CpuTimes {
+    pub user: std::time::Duration,
+    pub system: std::time::Duration,
+}
+
+/// CPU time used by this process, or with `children`, by every child it
+/// has waited for. Used by `times` and `time`; rustix has no `getrusage`.
+#[must_use]
+pub fn cpu_times(children: bool) -> CpuTimes {
+    let who = if children {
+        libc::RUSAGE_CHILDREN
+    } else {
+        libc::RUSAGE_SELF
+    };
+    // SAFETY: `rusage` is a plain C struct of integers, for which an
+    // all-zero bit pattern is a valid starting state.
+    let mut usage: libc::rusage = unsafe { core::mem::zeroed() };
+    // SAFETY: `usage` is valid for writes for the duration of the call.
+    if unsafe { libc::getrusage(who, &raw mut usage) } != 0 {
+        return CpuTimes::default();
+    }
+    let duration = |tv: libc::timeval| {
+        std::time::Duration::new(
+            u64::try_from(tv.tv_sec).unwrap_or(0),
+            u32::try_from(tv.tv_usec).unwrap_or(0) * 1000,
+        )
+    };
+    CpuTimes {
+        user: duration(usage.ru_utime),
+        system: duration(usage.ru_stime),
+    }
 }

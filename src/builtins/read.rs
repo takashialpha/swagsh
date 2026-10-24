@@ -153,8 +153,7 @@ impl Builtin for ReadBuiltin {
         let (raw_bytes, hit_delim) =
             read_until_delim(delim, self.raw).map_err(|e| anyhow!("read: {}", strerror(e)))?;
         if echo_guard.is_some_and(|g| g.is_active()) {
-            println!();
-            shell.note_stdout("\n");
+            shell.outln("")?;
         } else if hit_delim && delim == b'\n' {
             // No `-s`, so the terminal's own local echo already showed the
             // newline the user typed to submit this line; nothing of ours
@@ -171,7 +170,10 @@ impl Builtin for ReadBuiltin {
         let ifs = shell.env.get("IFS").unwrap_or_else(|| " \t\n".to_owned());
         let fields = split_fields(&line, &ifs, names.len(), self.raw);
         for (name, value) in names.iter().zip(fields) {
-            shell.env.set(name, value);
+            shell
+                .env
+                .assign(name, value)
+                .map_err(|e| anyhow!("read: {e}"))?;
         }
 
         Ok(if hit_delim {

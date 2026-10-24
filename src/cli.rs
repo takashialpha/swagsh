@@ -7,7 +7,8 @@ use clap::Parser;
 #[derive(Debug, Parser, Clone)]
 #[command(name = "swagsh", version)]
 pub struct Cli {
-    /// Execute CMD then exit. Remaining positionals become $1, $2, ...
+    /// Execute CMD then exit. The first remaining positional becomes $0, the
+    /// rest $1, $2, ...
     #[arg(short = 'c', value_name = "CMD")]
     pub command: Option<String>,
 
@@ -28,7 +29,7 @@ pub struct Cli {
     pub login: bool,
 
     /// Without -c: first positional is the script, the rest become $1, $2, ...
-    /// With -c: all positionals become $1, $2, ...
+    /// With -c: the first becomes $0, the rest $1, $2, ...
     #[arg(value_name = "ARGS")]
     pub positionals: Vec<String>,
 }
@@ -47,7 +48,7 @@ impl Cli {
         }
     }
 
-    /// True if argv[0] starts with `-`, the convention used by login programs.
+    /// True if `argv[0]` starts with `-`, the convention used by login programs.
     #[must_use]
     pub fn is_login_shell(argv0: &str) -> bool {
         argv0.starts_with('-')

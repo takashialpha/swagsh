@@ -4,7 +4,8 @@
 pub enum Word {
     /// Bare literal text, no expansion needed.
     Literal(String),
-    /// `$VAR` or `${VAR}`.
+    /// `$VAR` or `${...}`, holding the text between the braces (`VAR:-word`,
+    /// `#VAR`, ...) for `parse_param_op` to interpret at expansion time.
     Var(String),
     /// `$(( expr ))` arithmetic expansion.
     Arith(String),
@@ -25,15 +26,21 @@ pub enum Word {
 pub enum RedirectKind {
     /// `>file`
     Out,
+    /// `>|file`: like `Out`, but ignores `set -C`.
+    Clobber,
     /// `>>file`
     Append,
     /// `<file`
     In,
-    /// `2>file` : fd is stored in `RedirectOp.fd`
-    FdOut,
+    /// `<>file`: open for reading and writing, creating it if needed.
+    ReadWrite,
+    /// `>&N` or `<&N`: duplicate descriptor `N` onto [`Redirect::fd`]
+    /// (`2>&1`), or close it when `N` is `-`.
+    Dup,
     /// `&>file`: stdout + stderr
     Both,
-    /// `<<DELIM` here-document body. `quoted=true` when delim was single-quoted.
+    /// `<<DELIM` here-document body. `quoted` is true when any part of the
+    /// delimiter was quoted, which turns off expansion of the body.
     HereDoc { raw_body: String, quoted: bool },
     /// `<<<word` (herestring)
     HereString,
@@ -64,6 +71,17 @@ pub struct SimpleCmd {
 pub struct Pipeline {
     pub commands: Vec<Command>,
     pub negated: bool,
+    /// `time` (or `time -p`, for POSIX's output format) before it.
+    pub timed: Option<TimeFormat>,
+}
+
+/// How `time` reports a pipeline's times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeFormat {
+    /// `real\t0m0.010s`, as bash and ksh print it.
+    Default,
+    /// `time -p`: `real 0.01`.
+    Posix,
 }
 
 /// The body of an `if` statement.
@@ -154,7 +172,7 @@ pub struct AndOrItem {
 }
 
 /// A sequence of pipelines joined by `&&` / `||`.
-/// `async` marks a trailing `&` (background execution).
+/// `is_async` marks a trailing `&` (background execution).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AndOrList {
     pub items: Vec<AndOrItem>,

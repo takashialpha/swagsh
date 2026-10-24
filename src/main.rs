@@ -4,7 +4,7 @@ use clap::Parser as _;
 use swagsh::cli::Cli;
 use swagsh::env::Env;
 use swagsh::errfmt::{emit, strerror};
-use swagsh::eval::Shell;
+use swagsh::eval::{Shell, SyntaxError};
 use swagsh::{parser, repl, signal};
 
 fn main() -> Result<()> {
@@ -12,7 +12,12 @@ fn main() -> Result<()> {
     let argv0 = std::env::args().next().unwrap_or_default();
     let cli = Cli::parse();
 
-    let (script, args) = cli.split_positionals();
+    let (script, mut args) = cli.split_positionals();
+    let dollar_zero = match (&cli.command, &script) {
+        (Some(_), _) if !args.is_empty() => Some(args.remove(0)),
+        (None, Some(path)) => Some(path.display().to_string()),
+        _ => None,
+    };
 
     let mut env = Env::from_process();
     if !args.is_empty() {
@@ -36,11 +41,13 @@ fn main() -> Result<()> {
 
     if let Some(cmd) = &cli.command {
         let mut shell = Shell::new(env, false);
+        shell.arg0 = dollar_zero.unwrap_or(shell.arg0);
         return run_and_exit(&mut shell, cmd, &cli);
     }
 
     if let Some(path) = &script {
         let mut shell = Shell::new(env, false);
+        shell.arg0 = dollar_zero.unwrap_or(shell.arg0);
         let src = std::fs::read_to_string(path)
             .map_err(|e| anyhow!("{}: {}", path.display(), strerror(e)))?;
         return run_and_exit(&mut shell, &src, &cli);
@@ -65,21 +72,18 @@ fn main() -> Result<()> {
 /// `run_function` run in this same process) take exactly this path, so
 /// skipping it here left them unformatted for `-c` and script invocations.
 fn run_and_exit(shell: &mut Shell, src: &str, cli: &Cli) -> Result<()> {
-    let program = match parser::parse(src) {
-        Ok(p) => p,
-        Err(e) => {
-            emit(e);
-            std::process::exit(1);
-        }
-    };
     if cli.no_execute {
+        if let Err(e) = parser::parse(src) {
+            emit(e);
+            std::process::exit(2);
+        }
         return Ok(());
     }
-    match shell.run_program(&program) {
-        Ok(status) => std::process::exit(status.0),
+    match shell.run_source(src, "") {
+        Ok(status) => shell.exit(status.0),
         Err(e) => {
-            emit(e);
-            std::process::exit(1);
+            emit(&e);
+            shell.exit(if e.is::<SyntaxError>() { 2 } else { 1 });
         }
     }
 }

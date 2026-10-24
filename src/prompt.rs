@@ -99,7 +99,9 @@ pub fn history_file(env: &Env) -> Option<std::path::PathBuf> {
         if raw.is_empty() {
             return None;
         }
-        return Some(std::path::PathBuf::from(expand_tilde(&raw, env)));
+        return Some(std::path::PathBuf::from(
+            expand_tilde(&raw, env).into_owned(),
+        ));
     }
     env.get("HOME")
         .map(|h| std::path::PathBuf::from(h).join(".swagsh_history"))

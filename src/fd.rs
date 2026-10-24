@@ -109,6 +109,40 @@ pub fn open_write(path: &std::path::Path, append: bool) -> Result<RawFd> {
     Ok(fd.into_raw_fd())
 }
 
+/// Opens `path` for `>` under `set -C`: an existing regular file is an
+/// error rather than being truncated, while anything else that already
+/// exists (`/dev/null`, a FIFO, ...) is opened as usual.
+///
+/// # Errors
+///
+/// Returns an error if `path` is an existing regular file, or if the
+/// underlying `open` syscall fails.
+pub fn open_write_noclobber(path: &std::path::Path) -> Result<RawFd> {
+    let mode = Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH;
+    match fs::open(path, OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL, mode) {
+        Ok(fd) => Ok(fd.into_raw_fd()),
+        Err(rustix::io::Errno::EXIST) if !path.is_file() => {
+            Ok(fs::open(path, OFlags::WRONLY, Mode::empty())?.into_raw_fd())
+        }
+        Err(rustix::io::Errno::EXIST) => anyhow::bail!("cannot overwrite existing file"),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Opens `path` for reading and writing, creating it if it does not exist.
+///
+/// # Errors
+///
+/// Returns an error if the underlying `open` syscall fails.
+pub fn open_read_write(path: &std::path::Path) -> Result<RawFd> {
+    let fd = fs::open(
+        path,
+        OFlags::RDWR | OFlags::CREATE,
+        Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+    )?;
+    Ok(fd.into_raw_fd())
+}
+
 /// Opens `path` for reading.
 ///
 /// # Errors
@@ -123,28 +157,35 @@ pub fn open_read(path: &std::path::Path) -> Result<RawFd> {
 ///
 /// # Errors
 ///
-/// Returns an error if the underlying `fcntl` syscall fails.
+/// Returns an error if the underlying `fcntl` syscall fails, `BADF` when
+/// `fd` is not open.
 pub fn dup_save(fd: RawFd) -> rustix::io::Result<RawFd> {
-    // SAFETY: fd is a valid, open descriptor at every call site.
+    // SAFETY: borrowed only for the `fcntl` call, which reports `BADF`
+    // rather than misbehaving if `fd` is not open.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     let duped = fcntl_dupfd_cloexec(borrowed, 10)?;
     Ok(duped.into_raw_fd())
 }
 
-/// Saves a copy of each fd in `fds`, returning `(original, saved)` pairs.
+/// Saves a copy of each fd in `fds`, returning `(original, saved)` pairs. A
+/// descriptor that is not open is recorded as `None`, so restoring closes
+/// whatever a redirect opened there.
 ///
 /// # Errors
 ///
-/// Returns an error if duplicating any descriptor fails; any descriptors
-/// already saved are closed before returning.
-pub fn save_fds(fds: &[RawFd]) -> Result<Vec<(RawFd, RawFd)>> {
+/// Returns an error if duplicating an open descriptor fails; any
+/// descriptors already saved are closed before returning.
+pub fn save_fds(fds: &[RawFd]) -> Result<Vec<(RawFd, Option<RawFd>)>> {
     let mut saved = Vec::with_capacity(fds.len());
     for &fd in fds {
         match dup_save(fd) {
-            Ok(saved_fd) => saved.push((fd, saved_fd)),
+            Ok(saved_fd) => saved.push((fd, Some(saved_fd))),
+            Err(rustix::io::Errno::BADF) => saved.push((fd, None)),
             Err(e) => {
                 for (_, s) in saved {
-                    close_raw(s);
+                    if let Some(s) = s {
+                        close_raw(s);
+                    }
                 }
                 return Err(e.into());
             }
@@ -154,15 +195,21 @@ pub fn save_fds(fds: &[RawFd]) -> Result<Vec<(RawFd, RawFd)>> {
 }
 
 /// Restores each `(original, saved)` fd pair produced by [`save_fds`],
-/// closing the saved copy afterwards.
+/// closing the saved copy afterwards, or closing `original` if it was not
+/// open when saved.
 ///
 /// # Errors
 ///
 /// Returns an error if restoring any descriptor fails.
-pub fn restore_fds(saved: Vec<(RawFd, RawFd)>) -> Result<()> {
+pub fn restore_fds(saved: Vec<(RawFd, Option<RawFd>)>) -> Result<()> {
     for (original, saved_fd) in saved {
-        dup2_raw(saved_fd, original)?;
-        close_raw(saved_fd);
+        match saved_fd {
+            Some(saved_fd) => {
+                dup2_raw(saved_fd, original)?;
+                close_raw(saved_fd);
+            }
+            None => close_if_open(original),
+        }
     }
     Ok(())
 }
