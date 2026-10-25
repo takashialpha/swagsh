@@ -1,4 +1,5 @@
 use std::fmt;
+use std::rc::Rc;
 
 use anyhow::{Error, Result};
 use rustix::process::{Pid, Signal, getpid, setpgid};
@@ -13,11 +14,16 @@ use crate::fd::{restore_fds, save_fds, write_raw};
 use crate::jobs::{ExitStatus, JobTable};
 use crate::parser::{ParseError, Parser};
 use crate::signal::{sig_interrupt_action, take_interrupted, take_pending_traps};
-use crate::sys::{SigHandler, sigaction};
+use crate::sys::{SigHandler, sigaction, sigaction_raw};
 
+pub use assign::{ExpandedAssign, ExpandedValue};
+
+mod assign;
 mod compound;
+mod cond;
 mod exec;
 mod expand;
+mod param;
 
 // ---------------------------------------------------------------------------
 // Control-flow signals: propagate through the call stack via anyhow::Error.
@@ -190,6 +196,18 @@ pub struct Shell {
     pub noexec: bool,
     /// `set -v`: echo each command's source to stderr as it is read.
     pub verbose: bool,
+    /// The `shopt` options.
+    pub shopt: Shopt,
+    /// A login shell (`shopt login_shell`).
+    pub login: bool,
+    /// Commands read at the prompt so far, for the prompt's `\#`.
+    pub command_number: usize,
+    /// `set -H`: history expansion (`!!`) at the prompt. On by default in an
+    /// interactive shell.
+    pub histexpand: bool,
+    /// `set -b`: announce a background job's completion or stop as soon as
+    /// it happens, not before the next prompt.
+    pub notify: bool,
     /// `set -m`: job control. On by default only for interactive shells.
     /// Pipelines get their own process group and the terminal, and `fg`/`bg`
     /// work.
@@ -205,14 +223,124 @@ pub struct Shell {
     /// `trap` actions by signal number, with `0` for `EXIT`. An empty action
     /// means the signal is ignored.
     pub traps: std::collections::BTreeMap<i32, String>,
+    /// The assignment arguments of the declaration command about to run
+    /// (`declare a=(x y)`), which reach it as markers; see
+    /// [`Shell::declaration`].
+    decl_assigns: Vec<ExpandedAssign>,
+    /// The shell's ends of the pipes of process substitutions (`<(cmd)`),
+    /// kept open until the command they were expanded for finishes.
+    proc_subs: Vec<rustix::fd::RawFd>,
+    /// `${PIPESTATUS[@]}`: the exit status of each command of the last
+    /// pipeline.
+    pipestatus: Vec<i32>,
+    /// The functions running, innermost last, for `FUNCNAME`,
+    /// `BASH_SOURCE` and `BASH_LINENO`.
+    frames: Vec<Frame>,
+    /// The files being read, the script first and then whatever it
+    /// sourced, innermost last.
+    pub sources: Vec<Rc<str>>,
+    /// Running a script file, rather than `-c` or at a prompt; `FUNCNAME`
+    /// then ends in `main`.
+    pub script: bool,
+    /// `-c`'s command string, for `BASH_EXECUTION_STRING`.
+    pub command_string: Option<String>,
+    /// `$BASH_SUBSHELL`: how many subshells deep this one is.
+    subshell: u32,
+    /// `$BASH_COMMAND`: the command running, kept while `ERR` or `DEBUG`
+    /// traps are set, for them to show.
+    bash_command: String,
+    /// `$LINENO`: the line of the simple command running.
+    lineno: usize,
+    /// Children reaped while waiting for another (see `wait_for_pid`), whose
+    /// statuses wait here for whoever waits for them.
+    reaped: Vec<crate::jobs::Waited>,
+    /// The status of the last command substitution, which an assignment
+    /// with no command takes as its own.
+    pub(crate) cmdsub_status: Option<ExitStatus>,
+    /// `$$`: the pid of the shell itself, which subshells keep.
+    pub shell_pid: u32,
     /// A trap action is running, so pending traps wait until it finishes.
     in_trap: bool,
+    /// Signals whose disposition at startup has been looked up, and those
+    /// of them that were ignored, both with bit `n - 1` for signal `n`. A
+    /// non-interactive shell may not trap a signal ignored on entry. Looked
+    /// up only when `trap` first touches a signal, so startup pays nothing.
+    signals_checked: u64,
+    ignored_on_entry: u64,
     /// How many `if`/`while`/`until` *condition* lists currently enclose
     /// execution: `errexit` doesn't apply inside one (a command's failure
     /// there is "explicitly tested", not a script-ending error), the same
     /// way `loop_depth` scopes `break`/`continue`. A counter, not a bool,
     /// since conditions can nest (`if while false; do :; done`).
     pub condition_depth: u32,
+}
+
+/// The keys in `Shell::traps` of bash's conditions that are not signals:
+/// `ERR`, after a command fails; `DEBUG`, before each command; `RETURN`,
+/// after a function or a sourced file returns.
+pub const TRAP_ERR: i32 = -1;
+pub const TRAP_DEBUG: i32 = -2;
+pub const TRAP_RETURN: i32 = -3;
+
+/// A running function, for `FUNCNAME`, `BASH_SOURCE` and `BASH_LINENO`.
+#[derive(Debug)]
+struct Frame {
+    name: String,
+    /// The file it was defined in.
+    file: Rc<str>,
+    /// The line it was called from.
+    line: usize,
+}
+
+/// The options `shopt` sets. Those not here are not supported, and
+/// `shopt` rejects them by name.
+#[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)] // one per independent option
+pub struct Shopt {
+    /// Typing a directory's name at the prompt changes to it.
+    pub autocd: bool,
+    /// Pathname expansion matches names starting with `.` too.
+    pub dotglob: bool,
+    /// A pattern that matches no file is an error.
+    pub failglob: bool,
+    /// `**` in a pattern matches any depth of directories.
+    pub globstar: bool,
+    /// History is appended to `$HISTFILE` on exit rather than replacing it.
+    pub histappend: bool,
+    /// Command substitutions keep `set -e` on.
+    pub inherit_errexit: bool,
+    /// The last command of a pipeline runs in the shell itself when job
+    /// control is off, so `... | read x` sets `x`.
+    pub lastpipe: bool,
+    /// Pathname expansion ignores case.
+    pub nocaseglob: bool,
+    /// `case` and `[[ == ]]`, `[[ =~ ]]` ignore case.
+    pub nocasematch: bool,
+    /// A pattern that matches no file expands to nothing.
+    pub nullglob: bool,
+    /// `.` and `source` look for a name without a `/` on `$PATH`.
+    pub sourcepath: bool,
+    /// `echo` interprets backslash escapes without `-e`.
+    pub xpg_echo: bool,
+}
+
+impl Default for Shopt {
+    fn default() -> Self {
+        Self {
+            autocd: false,
+            dotglob: false,
+            failglob: false,
+            globstar: false,
+            histappend: false,
+            inherit_errexit: true,
+            lastpipe: false,
+            nocaseglob: false,
+            nocasematch: false,
+            nullglob: false,
+            sourcepath: true,
+            xpg_echo: false,
+        }
+    }
 }
 
 /// A command that does not parse, found by [`Shell::run_source`].
@@ -284,12 +412,32 @@ impl Shell {
             noglob: false,
             noexec: false,
             verbose: false,
+            shopt: Shopt::default(),
+            login: false,
+            command_number: 1,
+            notify: false,
+            histexpand: interactive,
             monitor: interactive,
             history: Vec::new(),
             history_changed: false,
             dir_stack: Vec::new(),
             traps: std::collections::BTreeMap::new(),
             in_trap: false,
+            shell_pid: std::process::id(),
+            decl_assigns: Vec::new(),
+            pipestatus: Vec::new(),
+            frames: Vec::new(),
+            sources: Vec::new(),
+            script: false,
+            command_string: None,
+            subshell: 0,
+            bash_command: String::new(),
+            lineno: 0,
+            proc_subs: Vec::new(),
+            reaped: Vec::new(),
+            cmdsub_status: None,
+            signals_checked: if interactive { u64::MAX } else { 0 },
+            ignored_on_entry: 0,
             condition_depth: 0,
         }
     }
@@ -299,6 +447,9 @@ impl Shell {
     /// our own and the terminal, and ignore the job-control stop signals.
     pub fn set_monitor(&mut self, enable: bool) {
         if enable && !self.monitor && !self.interactive {
+            for sig in [Signal::TTOU, Signal::TTIN, Signal::TSTP] {
+                self.was_ignored_on_entry(sig.as_raw());
+            }
             let _ = setpgid(Some(self.pgid), Some(self.pgid));
             let _ = tcsetpgrp(std::io::stdin(), self.pgid);
             // SAFETY: the shell is single-threaded.
@@ -311,10 +462,80 @@ impl Shell {
         self.monitor = enable;
     }
 
+    /// Whether signal `sig` was ignored when the shell started, in a shell
+    /// for which that matters: POSIX does not let a non-interactive shell
+    /// trap or reset such a signal.
+    pub fn was_ignored_on_entry(&mut self, sig: i32) -> bool {
+        let Some(bit) = u32::try_from(sig)
+            .ok()
+            .filter(|n| (1..=64).contains(n))
+            .map(|n| 1u64 << (n - 1))
+        else {
+            return false;
+        };
+        if self.signals_checked & bit == 0 {
+            self.signals_checked |= bit;
+            if crate::sys::is_ignored(sig) {
+                self.ignored_on_entry |= bit;
+            }
+        }
+        self.ignored_on_entry & bit != 0
+    }
+
+    /// What `set -x` puts before each command: `$PS4`, parameter-expanded,
+    /// `+ ` by default.
+    pub(crate) fn xtrace_prefix(&mut self) -> String {
+        let ps4 = self.env.get("PS4").unwrap_or_else(|| "+ ".to_owned());
+        if !ps4.contains(['$', '`']) {
+            return ps4;
+        }
+        self.expand_raw_text(&ps4).unwrap_or(ps4)
+    }
+
+    /// An argument of a declaration command (`declare`, `export`, ...) as
+    /// an assignment, if it is one: an assignment word, which arrives as a
+    /// marker, or `NAME=VALUE` text.
+    #[must_use]
+    pub fn declaration(&self, arg: &str) -> Option<ExpandedAssign> {
+        arg.strip_prefix('\0').map_or_else(
+            || ExpandedAssign::parse(arg),
+            |index| {
+                index
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| self.decl_assigns.get(i))
+                    .cloned()
+            },
+        )
+    }
+
+    /// Records an expanded assignment argument of a declaration command,
+    /// returning the marker that stands for it among the arguments.
+    fn mark_declaration(&mut self, assign: ExpandedAssign) -> String {
+        self.decl_assigns.push(assign);
+        format!("\0{}", self.decl_assigns.len() - 1)
+    }
+
+    /// Turns markers back into `NAME=VALUE` text, for a declaration command
+    /// that turned out to be a function or an external program.
+    fn unmark_declarations(&self, args: Vec<String>) -> Vec<String> {
+        if !args.iter().any(|a| a.starts_with('\0')) {
+            return args;
+        }
+        args.into_iter()
+            .map(|a| {
+                self.declaration(&a)
+                    .filter(|_| a.starts_with('\0'))
+                    .map_or(a, |d| d.display())
+            })
+            .collect()
+    }
+
     /// Exits the shell with `code`, running the `EXIT` trap first if one is
     /// set. The exit status stays `code` unless the trap itself calls
     /// `exit`.
     pub fn exit(&mut self, code: i32) -> ! {
+        self.run_pending_traps();
         if let Some(action) = self.traps.remove(&0)
             && !action.is_empty()
         {
@@ -338,8 +559,8 @@ impl Shell {
         }
         self.in_trap = true;
         let status = self.last_status;
-        for sig in 1..64 {
-            if pending & (1 << sig) == 0 {
+        for sig in 1..=64 {
+            if pending & (1 << (sig - 1)) == 0 {
                 continue;
             }
             if let Some(action) = self.traps.get(&sig).filter(|a| !a.is_empty()).cloned() {
@@ -357,6 +578,30 @@ impl Shell {
         self.in_trap = false;
     }
 
+    /// Runs the action of pseudo-signal trap `key` (`ERR`, `DEBUG`,
+    /// `RETURN`), if one is set and no trap is already running. `$?` is the
+    /// same afterwards.
+    pub(crate) fn run_trap(&mut self, key: i32) {
+        if self.in_trap || self.traps.is_empty() {
+            return;
+        }
+        let Some(action) = self.traps.get(&key).filter(|a| !a.is_empty()).cloned() else {
+            return;
+        };
+        self.in_trap = true;
+        let status = self.last_status;
+        match self.run_source(&action, "trap: ") {
+            Ok(_) => {}
+            Err(e) if is_break(&e) || is_continue(&e) || is_return(&e) => {}
+            Err(e) => match e.downcast_ref() {
+                Some(ExitRequest(code)) => self.exit(*code),
+                None => emit(e),
+            },
+        }
+        self.last_status = status;
+        self.in_trap = false;
+    }
+
     /// In a forked subshell: POSIX resets every trap that is not ignoring
     /// its signal back to the default.
     pub fn reset_traps_for_subshell(&mut self) {
@@ -364,14 +609,13 @@ impl Shell {
             if action.is_empty() {
                 return true;
             }
-            if let Some(signal) = Signal::from_named_raw(sig) {
-                // SAFETY: the subshell is single-threaded.
-                let _ = unsafe { sigaction(signal, SigHandler::Default) };
-            }
+            // SAFETY: the subshell is single-threaded.
+            let _ = unsafe { sigaction_raw(sig, SigHandler::Default) };
             false
         });
         self.interactive = false;
         self.monitor = false;
+        self.subshell += 1;
     }
 
     /// `$-`: the letters of the options currently on.
@@ -379,9 +623,11 @@ impl Shell {
     pub fn option_flags(&self) -> String {
         [
             ('a', self.env.allexport),
+            ('b', self.notify),
             ('C', self.noclobber),
             ('e', self.errexit),
             ('f', self.noglob),
+            ('H', self.histexpand),
             ('i', self.interactive),
             ('m', self.monitor),
             ('n', self.noexec),
@@ -456,7 +702,11 @@ impl Shell {
     /// "explicitly tested" by the operator that follows it, so only the
     /// chain's final outcome is a candidate to exit on.
     pub fn check_errexit(&mut self, status: ExitStatus, negated: bool) {
-        if self.errexit && self.condition_depth == 0 && !negated && !status.is_success() {
+        if self.condition_depth != 0 || negated || status.is_success() {
+            return;
+        }
+        self.run_trap(TRAP_ERR);
+        if self.errexit {
             self.exit(status.0);
         }
     }
@@ -532,16 +782,34 @@ impl Shell {
         if self.noexec && !self.interactive {
             return Ok(ExitStatus::SUCCESS);
         }
+        let proc_subs = self.proc_subs.len();
+        let result = self.run_command_inner(cmd);
+        if self.proc_subs.len() > proc_subs {
+            for fd in self.proc_subs.drain(proc_subs..) {
+                crate::fd::close_raw(fd);
+            }
+        }
+        result
+    }
+
+    fn run_command_inner(&mut self, cmd: &Command) -> Result<ExitStatus> {
         match cmd {
             Command::Simple(sc) => self.run_simple(sc),
             Command::Pipeline(p) => self.run_pipeline(p),
             Command::If(ic) => self.run_if(ic),
             Command::For(fc) => self.run_for(fc),
+            Command::ArithFor(fc) => self.run_arith_for(fc),
+            Command::Select(fc) => self.run_select(fc),
+            Command::Coproc(name, body) => self.run_coproc(name, body),
+            Command::Arith(expr) => Ok(self.run_arith(expr)),
+            Command::Cond(expr) => self.run_cond(expr),
             Command::While(wc) => self.run_while(wc),
             Command::Case(cc) => self.run_case(cc),
             Command::Group(gc) => self.run_group(gc),
             Command::FunctionDef(fd) => {
-                self.env.define_function(fd.name.clone(), *fd.body.clone());
+                let source = self.sources.last().cloned().unwrap_or_else(|| Rc::from(""));
+                self.env
+                    .define_function(fd.name.clone(), *fd.body.clone(), source);
                 Ok(ExitStatus::SUCCESS)
             }
             Command::Redirected(inner, redirects) => {
@@ -551,6 +819,14 @@ impl Shell {
     }
 
     fn run_simple(&mut self, sc: &SimpleCmd) -> Result<ExitStatus> {
+        self.lineno = sc.line;
+        if !self.traps.is_empty()
+            && !self.in_trap
+            && (self.traps.contains_key(&TRAP_DEBUG) || self.traps.contains_key(&TRAP_ERR))
+        {
+            self.bash_command = exec::describe_simple(sc);
+            self.run_trap(TRAP_DEBUG);
+        }
         let (assignments, resolved) = self.resolve_simple(sc)?;
         if self.xtrace {
             self.print_xtrace(&assignments, &resolved);
@@ -559,14 +835,29 @@ impl Shell {
             Resolved::AssignOnly => {
                 // Nothing to run (`resolve_simple` already set the vars):
                 // apply redirects for their side effects, e.g. `> file`
-                // still truncates it.
-                self.with_redirects(&sc.redirects, false, |_| Ok(ExitStatus::SUCCESS))
+                // still truncates it. POSIX: the status is that of the last
+                // command substitution, if there was one.
+                let status = self.cmdsub_status.take().unwrap_or(ExitStatus::SUCCESS);
+                self.with_redirects(&sc.redirects, false, |_| Ok(status))
             }
             Resolved::Builtin(f, name, args) => {
                 let special = is_special_builtin(&name);
                 self.run_builtin(sc, f, &name, &args, &assignments, special)
             }
-            Resolved::Function(_, body, args) => self.run_function(sc, &body, &args, &assignments),
+            Resolved::Function(name, body, args) => {
+                self.run_function(sc, name, &body, &args, &assignments)
+            }
+            Resolved::External(words)
+                if self.interactive
+                    && self.shopt.autocd
+                    && words.len() == 1
+                    && std::path::Path::new(&words[0]).is_dir() =>
+            {
+                eprintln!("cd -- {}", words[0]);
+                builtins::lookup_builtin("cd").map_or(Ok(ExitStatus::FAILURE), |cd| {
+                    self.run_builtin(sc, cd, "cd", &words, &assignments, false)
+                })
+            }
             Resolved::External(words) => self.run_external(sc, &words, &assignments),
         }
     }
@@ -575,7 +866,7 @@ impl Shell {
     /// with `$PS4` (defaulting to `"+ "`), before it runs. Values are
     /// space-joined without re-quoting: simple, not always round-trippable,
     /// but that's the conventional shell `-x` trace format.
-    fn print_xtrace(&self, assignments: &[String], resolved: &Resolved) {
+    fn print_xtrace(&mut self, assignments: &[String], resolved: &Resolved) {
         let mut trace: Vec<&str> = assignments.iter().map(String::as_str).collect();
         match resolved {
             Resolved::AssignOnly => {}
@@ -586,8 +877,9 @@ impl Shell {
             Resolved::External(words) => trace.extend(words.iter().map(String::as_str)),
         }
         if !trace.is_empty() {
-            let ps4 = self.env.get("PS4").unwrap_or_else(|| "+ ".to_owned());
-            eprintln!("{ps4}{}", trace.join(" "));
+            let line = trace.join(" ");
+            let ps4 = self.xtrace_prefix();
+            eprintln!("{ps4}{line}");
         }
     }
 
@@ -603,6 +895,7 @@ impl Shell {
     /// this resolution logic in one place means both paths agree on what
     /// counts as a builtin, a function, or an external command.
     fn resolve_simple(&mut self, sc: &SimpleCmd) -> Result<(Vec<String>, Resolved)> {
+        self.cmdsub_status = None;
         let assign_count = sc
             .words
             .iter()
@@ -610,15 +903,16 @@ impl Shell {
             .count();
         let (assign_words, cmd_words) = sc.words.split_at(assign_count);
         let mut cmd_words = self.expand_command_words(cmd_words)?.into_iter();
+        let assigns = assign_words.iter().filter_map(|w| match w {
+            Word::Assign(a) => Some(a.as_ref()),
+            _ => None,
+        });
 
         let Some(name) = cmd_words.next() else {
             // Performed in order, so `a=1 b=$a` sees the new `a`.
             let mut assignments = Vec::with_capacity(assign_words.len());
-            for word in assign_words {
-                let assign = self.expand_assignment(word)?;
-                let (name, value) = split_assignment(&assign);
-                self.env.assign(name, value)?;
-                assignments.push(assign);
+            for assign in assigns {
+                assignments.extend(self.perform_assign(assign)?);
             }
             return Ok((assignments, Resolved::AssignOnly));
         };
@@ -627,14 +921,15 @@ impl Shell {
         let mut assignments = Vec::with_capacity(assign_words.len());
         let mut saved = Vec::new();
         let mut result = Ok(());
-        for (i, word) in assign_words.iter().enumerate() {
-            match self.expand_assignment(word) {
+        for (i, assign) in assigns.enumerate() {
+            let text = self.expand_assign(assign).and_then(|e| {
+                if self.env.is_readonly(&e.name) {
+                    return Err(crate::env::ReadonlyError(e.name).into());
+                }
+                e.environment_text(self.env.get_ref(&e.name))
+            });
+            match text {
                 Ok(assign) => {
-                    let name = split_assignment(&assign).0;
-                    if self.env.is_readonly(name) {
-                        result = Err(crate::env::ReadonlyError(name.to_owned()).into());
-                        break;
-                    }
                     if i + 1 < assign_words.len() {
                         let (name, value) = split_assignment(&assign);
                         saved.push((name.to_owned(), self.env.get(name)));
@@ -661,6 +956,7 @@ impl Shell {
             return Ok((assignments, Resolved::Builtin(f, name, args)));
         }
         if let Some(body) = self.env.get_function(&name) {
+            let args = self.unmark_declarations(args);
             return Ok((assignments, Resolved::Function(name, body, args)));
         }
         if let Some(f) = builtin {
@@ -668,7 +964,7 @@ impl Shell {
         }
 
         let mut full_words = vec![name];
-        full_words.extend(args);
+        full_words.extend(self.unmark_declarations(args));
         Ok((assignments, Resolved::External(full_words)))
     }
 
@@ -772,6 +1068,7 @@ impl Shell {
     fn run_function(
         &mut self,
         sc: &SimpleCmd,
+        name: String,
         body: &Command,
         args: &[String],
         assignments: &[String],
@@ -785,7 +1082,18 @@ impl Shell {
         // duration of this call.
         let outer_loop_depth = std::mem::take(&mut self.loop_depth);
         self.env.push_scope();
+        let file = self
+            .env
+            .function_source(&name)
+            .unwrap_or_else(|| Rc::from(""));
+        self.frames.push(Frame {
+            name,
+            file,
+            line: sc.line,
+        });
         let result = self.with_redirects(&sc.redirects, false, |shell| shell.run_command(body));
+        self.frames.pop();
+        self.run_trap(TRAP_RETURN);
         self.env.pop_scope();
         self.loop_depth = outer_loop_depth;
         self.env.set_positional_args(old_args);
@@ -863,7 +1171,7 @@ enum Resolved {
     /// The function's own name, kept around for `xtrace` display (`run_function`
     /// itself doesn't need it: a function's `$0` stays whatever the caller's
     /// was, unlike positional args) alongside its body and arguments.
-    Function(String, std::rc::Rc<Command>, Vec<String>),
+    Function(String, Rc<Command>, Vec<String>),
     /// `name` followed by its arguments.
     External(Vec<String>),
 }
@@ -874,14 +1182,8 @@ enum Resolved {
 
 /// Whether `word`, as written, is a `NAME=value` assignment. Decided before
 /// expansion, so `$v` holding `a=b` is an ordinary word.
-pub(crate) fn is_assignment_word(word: &Word) -> bool {
-    match word {
-        Word::Literal(s) => is_assignment(s),
-        Word::Compound(parts) => {
-            matches!(parts.first(), Some(Word::Literal(s)) if is_assignment(s))
-        }
-        _ => false,
-    }
+pub(crate) const fn is_assignment_word(word: &Word) -> bool {
+    matches!(word, Word::Assign(_))
 }
 
 #[must_use]

@@ -113,7 +113,10 @@ pub struct SourceBuiltin {
 /// searched for as a bare name across `search_path` (`-p`'s argument, or
 /// `$PATH` if `-p` wasn't given) the same way an external command is.
 fn resolve_source_path(filename: &str, search_path: Option<&str>, shell: &Shell) -> String {
-    if filename.contains('/') || std::path::Path::new(filename).exists() {
+    if filename.contains('/')
+        || std::path::Path::new(filename).exists()
+        || (search_path.is_none() && !shell.shopt.sourcepath)
+    {
         return filename.to_owned();
     }
     let search_path = search_path
@@ -140,7 +143,10 @@ impl Builtin for SourceBuiltin {
         // stay visible to the sourced script.
         let old_args = (!self.arguments.is_empty())
             .then(|| shell.env.replace_positional_args(self.arguments.clone()));
+        shell.sources.push(std::rc::Rc::from(resolved.as_str()));
         let result = shell.run_source(&src, &format!("source: {resolved}: "));
+        shell.sources.pop();
+        shell.run_trap(crate::eval::TRAP_RETURN);
         if let Some(old) = old_args {
             shell.env.set_positional_args(old);
         }

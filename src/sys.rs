@@ -9,9 +9,12 @@
 //! is already in the dependency graph (via `rustyline`), and its 0.2 surface
 //! is the most stable FFI target in the ecosystem.
 //!
-//! The password-database lookup behind `~user` ([`home_dir_of`]) and the
-//! CPU-time query behind `times`/`time` ([`cpu_times`]) live here too, since
-//! rustix has no API for either.
+//! So do the other C library services rustix has no API for: the
+//! password-database lookup behind `~user` ([`home_dir_of`]), the CPU-time
+//! query behind `times`/`time` ([`cpu_times`]), locale collation for sorting
+//! globs ([`set_collation`], [`strcoll`]), the real-time signals
+//! ([`sigaction_raw`], [`kill`]) along with signal descriptions, and the
+//! regular expressions of `[[ =~ ]]` ([`regex_match`]).
 //!
 //! Everything else the shell needs (`fs`, `io`, `pipe`, `termios`, `process`,
 //! `fd`) still comes from rustix's stable public API.
@@ -97,8 +100,7 @@ pub enum SigHandler {
 /// Installs `handler` as `sig`'s disposition, with no flags and an empty mask.
 ///
 /// That fixed shape is all this shell has ever needed, which is why there is
-/// no builder here: every previous call site passed empty flags and an empty
-/// mask too.
+/// no builder here.
 ///
 /// # Safety
 ///
@@ -110,6 +112,22 @@ pub enum SigHandler {
 /// Returns the `sigaction(2)` errno, which for the fixed set of signals used
 /// here means only that the kernel rejected the signal number.
 pub unsafe fn sigaction(sig: Signal, handler: SigHandler) -> Result<(), Errno> {
+    // SAFETY: the caller upholds the same contract.
+    unsafe { sigaction_raw(sig.as_raw(), handler) }
+}
+
+/// [`sigaction`] by signal number, for the real-time signals rustix has no
+/// `Signal` value for.
+///
+/// # Safety
+///
+/// As for [`sigaction`].
+///
+/// # Errors
+///
+/// Returns the `sigaction(2)` errno, `EINVAL` for a number the kernel does
+/// not accept.
+pub unsafe fn sigaction_raw(signum: c_int, handler: SigHandler) -> Result<(), Errno> {
     // SAFETY: `libc::sigaction` is a plain C struct of integers and pointers,
     // for which an all-zero bit pattern is a valid starting state; every field
     // this shell cares about is assigned below.
@@ -126,11 +144,59 @@ pub unsafe fn sigaction(sig: Signal, handler: SigHandler) -> Result<(), Errno> {
     unsafe { libc::sigemptyset(&raw mut act.sa_mask) };
     // SAFETY: `act` is fully initialised above, and a null `oldact` simply
     // declines to be told the previous disposition.
-    let rc = unsafe { libc::sigaction(sig.as_raw(), &raw const act, core::ptr::null_mut()) };
+    let rc = unsafe { libc::sigaction(signum, &raw const act, core::ptr::null_mut()) };
     if rc < 0 {
         return Err(last_errno());
     }
     Ok(())
+}
+
+/// Whether signal `signum` is currently ignored (`SIG_IGN`).
+#[must_use]
+pub fn is_ignored(signum: c_int) -> bool {
+    // SAFETY: as in `sigaction_raw`, all-zero is a valid `sigaction`.
+    let mut old: libc::sigaction = unsafe { core::mem::zeroed() };
+    // SAFETY: a null `act` only queries; `old` is valid for writes.
+    let rc = unsafe { libc::sigaction(signum, core::ptr::null(), &raw mut old) };
+    rc == 0 && old.sa_sigaction == libc::SIG_IGN
+}
+
+/// The real-time signal numbers, `SIGRTMIN` to `SIGRTMAX`. The C library
+/// reserves the first few for itself, so the bounds are its to say.
+#[must_use]
+pub fn rt_signals() -> core::ops::RangeInclusive<c_int> {
+    libc::SIGRTMIN()..=libc::SIGRTMAX()
+}
+
+/// Sends signal `signum` to `pid`, or to process group `-pid` when `pid`
+/// is negative, as `kill(2)` does. rustix only sends signals it has a
+/// `Signal` value for, which leaves out the real-time ones.
+///
+/// # Errors
+///
+/// Returns the `kill(2)` errno.
+pub fn kill(pid: c_int, signum: c_int) -> Result<(), Errno> {
+    // SAFETY: `kill` takes two integers and touches no memory.
+    if unsafe { libc::kill(pid, signum) } < 0 {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
+/// The C library's description of signal `signum` (`strsignal(3)`), such
+/// as `Terminated`.
+#[must_use]
+pub fn signal_description(signum: c_int) -> String {
+    // SAFETY: `strsignal` returns a pointer to a NUL-terminated string that
+    // stays valid until the next call; it is copied out at once.
+    let ptr = unsafe { libc::strsignal(signum) };
+    if ptr.is_null() {
+        return format!("Signal {signum}");
+    }
+    // SAFETY: checked non-null above; see the previous comment.
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Unblocks every signal for the calling thread.
@@ -232,4 +298,153 @@ pub fn cpu_times(children: bool) -> CpuTimes {
         user: duration(usage.ru_utime),
         system: duration(usage.ru_stime),
     }
+}
+
+/// Switches the C library's collation (`LC_COLLATE`) to `locale`. False if
+/// the locale is not installed, leaving the collation as it was.
+#[must_use]
+pub fn set_collation(locale: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(locale) else {
+        return false;
+    };
+    // SAFETY: `name` is a valid C string for the duration of the call; the
+    // shell is single-threaded whenever it sorts.
+    !unsafe { libc::setlocale(libc::LC_COLLATE, name.as_ptr()) }.is_null()
+}
+
+/// Compares two strings in the collation set by [`set_collation`]
+/// (`strcoll(3)`).
+#[must_use]
+pub fn strcoll(a: &CStr, b: &CStr) -> core::cmp::Ordering {
+    // SAFETY: both are valid NUL-terminated strings.
+    unsafe { libc::strcoll(a.as_ptr(), b.as_ptr()) }.cmp(&0)
+}
+
+/// The byte range of a regular expression's whole match, then of each of its
+/// groups, `None` for one that took no part.
+pub type RegexGroups = Vec<Option<(usize, usize)>>;
+
+/// Matches `text` against the POSIX extended regular expression `pattern`
+/// (`regcomp(3)`, `regexec(3)`), for `[[ text =~ pattern ]]`, ignoring
+/// case with `nocase`. On a match,
+/// the byte range of the whole match and of each group, `None` for a group
+/// that took no part.
+///
+/// # Errors
+///
+/// Returns the C library's message for a pattern that does not compile.
+pub fn regex_match(pattern: &str, text: &str, nocase: bool) -> Result<Option<RegexGroups>, String> {
+    let groups = 1 + regex_groups(pattern);
+    let pattern = std::ffi::CString::new(pattern).map_err(|e| e.to_string())?;
+    let text = std::ffi::CString::new(text).map_err(|e| e.to_string())?;
+    // SAFETY: `regex_t` is a plain C struct, for which all-zero is a valid
+    // state before `regcomp` fills it in.
+    let mut re: libc::regex_t = unsafe { core::mem::zeroed() };
+    let flags = libc::REG_EXTENDED | if nocase { libc::REG_ICASE } else { 0 };
+    // SAFETY: `re` is valid for writes and `pattern` is a C string.
+    let rc = unsafe { libc::regcomp(&raw mut re, pattern.as_ptr(), flags) };
+    if rc != 0 {
+        let mut buf = [0u8; 256];
+        // SAFETY: `re` was passed to `regcomp`, and `buf` is writable for
+        // its length.
+        unsafe { libc::regerror(rc, &raw const re, buf.as_mut_ptr().cast(), buf.len()) };
+        // SAFETY: as above; `regfree` is fine after a failed `regcomp`.
+        unsafe { libc::regfree(&raw mut re) };
+        let msg = CStr::from_bytes_until_nul(&buf).map_or_else(
+            |_| "invalid regular expression".to_owned(),
+            |m| m.to_string_lossy().into_owned(),
+        );
+        return Err(msg);
+    }
+    let mut matches = vec![
+        libc::regmatch_t {
+            rm_so: -1,
+            rm_eo: -1
+        };
+        groups
+    ];
+    // SAFETY: `re` is compiled, `text` is a C string, and `matches` has room
+    // for `groups` entries.
+    let rc = unsafe {
+        libc::regexec(
+            &raw const re,
+            text.as_ptr(),
+            groups,
+            matches.as_mut_ptr(),
+            0,
+        )
+    };
+    // SAFETY: `re` was compiled by `regcomp` and is not used again.
+    unsafe { libc::regfree(&raw mut re) };
+    if rc != 0 {
+        return Ok(None);
+    }
+    Ok(Some(
+        matches
+            .iter()
+            .map(|m| {
+                Some((
+                    usize::try_from(m.rm_so).ok()?,
+                    usize::try_from(m.rm_eo).ok()?,
+                ))
+            })
+            .collect(),
+    ))
+}
+
+/// The number of groups in extended regular expression `pattern`: its
+/// `(`s outside bracket expressions and not escaped. `regex_t` keeps its
+/// own count private.
+fn regex_groups(pattern: &str) -> usize {
+    let mut groups = 0;
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '(' => groups += 1,
+            '[' => {
+                // A `]` right after `[` or `[^` is part of the expression.
+                chars.next_if_eq(&'^');
+                chars.next_if_eq(&']');
+                for c in chars.by_ref() {
+                    if c == ']' {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    groups
+}
+
+/// The local time now, formatted by `strftime(3)` with `format`, for the
+/// prompt's `\d`, `\t` and `\D{...}`.
+#[must_use]
+pub fn strftime_now(format: &str) -> String {
+    let Ok(format) = std::ffi::CString::new(format) else {
+        return String::new();
+    };
+    // SAFETY: a null argument asks `time` only for its return value.
+    let now = unsafe { libc::time(core::ptr::null_mut()) };
+    // SAFETY: `tm` is a plain C struct, for which all-zero is valid.
+    let mut tm: libc::tm = unsafe { core::mem::zeroed() };
+    // SAFETY: both pointers are valid for the call.
+    if unsafe { libc::localtime_r(&raw const now, &raw mut tm) }.is_null() {
+        return String::new();
+    }
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is writable for its length, `format` is a C string and
+    // `tm` was filled in above.
+    let len = unsafe {
+        libc::strftime(
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            format.as_ptr(),
+            &raw const tm,
+        )
+    };
+    String::from_utf8_lossy(&buf[..len]).into_owned()
 }

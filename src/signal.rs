@@ -1,4 +1,6 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+
+use rustix::fd::RawFd;
 
 use rustix::process::Signal;
 
@@ -27,16 +29,16 @@ pub const fn sig_interrupt_action() -> SigHandler {
     SigHandler::Handler(handle_sigint)
 }
 
-/// One bit per signal number that has arrived since [`take_pending_traps`]
-/// last drained it, set by [`handle_trapped`] for every signal with a `trap`
-/// action.
+/// The trapped signals that have arrived since [`take_pending_traps`] last
+/// drained them, set by [`handle_trapped`]: bit `n - 1` for signal `n`, so
+/// all 64 Linux signals fit.
 static PENDING_TRAPS: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn handle_trapped(signum: core::ffi::c_int) {
-    if let Ok(bit) = u32::try_from(signum)
-        && bit < 64
+    if let Ok(n) = u32::try_from(signum)
+        && (1..=64).contains(&n)
     {
-        PENDING_TRAPS.fetch_or(1 << bit, Ordering::SeqCst);
+        PENDING_TRAPS.fetch_or(1 << (n - 1), Ordering::SeqCst);
     }
 }
 
@@ -47,8 +49,17 @@ pub const fn trap_action() -> SigHandler {
     SigHandler::Handler(handle_trapped)
 }
 
+/// The lowest-numbered trapped signal that has arrived and not yet been
+/// drained, leaving it pending.
+pub fn first_pending_trap() -> Option<i32> {
+    match PENDING_TRAPS.load(Ordering::SeqCst) {
+        0 => None,
+        bits => i32::try_from(bits.trailing_zeros() + 1).ok(),
+    }
+}
+
 /// Drains the set of trapped signals that arrived since the last call, as a
-/// bitmask by signal number.
+/// bitmask with bit `n - 1` for signal `n`.
 pub fn take_pending_traps() -> u64 {
     // Checked first so the common case, nothing pending, is a plain load:
     // this runs before every command.
@@ -56,6 +67,33 @@ pub fn take_pending_traps() -> u64 {
         return 0;
     }
     PENDING_TRAPS.swap(0, Ordering::SeqCst)
+}
+
+/// Where [`handle_sigchld`] writes a byte for each `SIGCHLD`, or -1 for
+/// nowhere.
+static SIGCHLD_PIPE: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn handle_sigchld(_signum: core::ffi::c_int) {
+    let fd = SIGCHLD_PIPE.load(Ordering::SeqCst);
+    if fd >= 0 {
+        // A write to a non-blocking pipe is async-signal-safe; a full pipe
+        // already says there is something to look at.
+        let _ = crate::fd::write_raw(fd, b"c");
+    }
+}
+
+/// Makes every `SIGCHLD` write a byte to `fd`, a non-blocking pipe, or with
+/// `None`, restores the default disposition. For waiting on children
+/// alongside other descriptors.
+pub fn notify_sigchld(fd: Option<RawFd>) {
+    SIGCHLD_PIPE.store(fd.unwrap_or(-1), Ordering::SeqCst);
+    let handler = if fd.is_some() {
+        SigHandler::Handler(handle_sigchld)
+    } else {
+        SigHandler::Default
+    };
+    // SAFETY: the handler only stores to an atomic and writes to a pipe.
+    let _ = unsafe { sigaction(Signal::CHILD, handler) };
 }
 
 /// Reports and clears whether `SIGINT` has arrived since the last call.

@@ -46,7 +46,7 @@ boundaries:
     #!/bin/sh
     set -eu
     # `libc` is allowed in src/sys.rs and nowhere else. That module exists to
-    # be the single place holding the four libc-like primitives rustix will not
+    # be the single place holding the C library services rustix will not
     # expose publicly, so that a future backend change stays a one-file edit.
     # Nothing enforces this in the language, hence the grep.
     # `grep -v ': *//'` drops comment lines: these modules explain themselves

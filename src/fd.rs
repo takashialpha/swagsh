@@ -71,11 +71,45 @@ pub fn raw_pipe() -> rustix::io::Result<(RawFd, RawFd)> {
 ///
 /// # Errors
 ///
-/// Returns an error if the underlying `read` syscall fails.
+/// Returns an error if the underlying `read` syscall fails, `EBADF` for a
+/// descriptor that is not open.
 pub fn read_raw(fd: RawFd, buf: &mut [u8]) -> rustix::io::Result<usize> {
-    // SAFETY: fd is a valid open pipe read-end at every call site.
+    // SAFETY: the descriptor is only borrowed for the one `read` call, and
+    // nothing closes it meanwhile; one that is not open just fails.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     read(borrowed, buf)
+}
+
+/// A copy of `fd` on the lowest free descriptor from `min` up, which
+/// programs the shell runs inherit.
+///
+/// # Errors
+///
+/// Returns the `fcntl(2)` errno.
+pub fn dup_at_least(fd: RawFd, min: RawFd) -> rustix::io::Result<RawFd> {
+    // SAFETY: as in `read_raw`.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let fd = fcntl_dupfd_cloexec(borrowed, min)?;
+    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty())?;
+    Ok(fd.into_raw_fd())
+}
+
+/// Marks `fd` close-on-exec, so programs the shell runs do not inherit it.
+pub fn set_cloexec(fd: RawFd) {
+    // SAFETY: as in `read_raw`.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let _ = rustix::io::fcntl_setfd(borrowed, rustix::io::FdFlags::CLOEXEC);
+}
+
+/// Moves `fd`'s file offset back by `n` bytes. False if it cannot seek (a
+/// pipe or terminal).
+pub fn seek_back(fd: RawFd, n: usize) -> bool {
+    // SAFETY: as in `read_raw`.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let Ok(n) = i64::try_from(n) else {
+        return false;
+    };
+    fs::seek(borrowed, fs::SeekFrom::Current(-n)).is_ok()
 }
 
 /// Writes `buf` to `fd`.

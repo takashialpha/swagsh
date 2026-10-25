@@ -12,8 +12,10 @@
 //! to stay compatible with.
 
 pub(crate) mod ast;
+pub(crate) mod brace;
 pub(crate) mod builtins;
 pub mod cli;
+pub(crate) mod collate;
 pub mod env;
 pub mod errfmt;
 pub mod eval;
@@ -22,7 +24,9 @@ pub(crate) mod fd;
 pub(crate) mod jobs;
 pub(crate) mod lexer;
 pub mod parser;
+pub(crate) mod pattern;
 pub(crate) mod prompt;
 pub mod repl;
 pub mod signal;
 pub(crate) mod sys;
+pub(crate) mod unparse;

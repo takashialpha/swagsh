@@ -33,6 +33,9 @@ fn main() -> Result<()> {
         }
     }
 
+    // For scripts to tell they run in swagsh; not exported.
+    env.set("SWAGSH_VERSION", env!("CARGO_PKG_VERSION"));
+
     if env.get("SHELL").is_none_or(|s| s.is_empty())
         && let Ok(exe) = std::env::current_exe()
     {
@@ -42,12 +45,15 @@ fn main() -> Result<()> {
     if let Some(cmd) = &cli.command {
         let mut shell = Shell::new(env, false);
         shell.arg0 = dollar_zero.unwrap_or(shell.arg0);
+        shell.command_string = Some(cmd.clone());
         return run_and_exit(&mut shell, cmd, &cli);
     }
 
     if let Some(path) = &script {
         let mut shell = Shell::new(env, false);
         shell.arg0 = dollar_zero.unwrap_or(shell.arg0);
+        shell.script = true;
+        shell.sources.push(path.to_string_lossy().into());
         let src = std::fs::read_to_string(path)
             .map_err(|e| anyhow!("{}: {}", path.display(), strerror(e)))?;
         return run_and_exit(&mut shell, &src, &cli);
@@ -55,6 +61,7 @@ fn main() -> Result<()> {
 
     let is_login = cli.login || Cli::is_login_shell(&argv0);
     let mut shell = Shell::new(env, true);
+    shell.login = is_login;
     if !cli.no_rc {
         repl::source_startup_files(&mut shell, is_login);
     }

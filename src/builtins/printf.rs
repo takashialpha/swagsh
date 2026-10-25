@@ -274,8 +274,7 @@ impl Builtin for PrintfBuiltin {
         }
         if let Some(name) = self.var {
             shell
-                .env
-                .assign(&name, output)
+                .assign_target(&name, output)
                 .map_err(|e| anyhow::anyhow!("printf: {e}"))?;
         } else {
             shell.out(&output)?;

@@ -159,6 +159,7 @@ impl Builtin for CommandBuiltin {
         let empty_sc = crate::ast::SimpleCmd {
             words: Vec::new(),
             redirects: Vec::new(),
+            line: 0,
         };
         let result = shell.run_external(&empty_sc, &self.command_and_args, &[]);
         if let Some(old) = old_path {

@@ -36,7 +36,7 @@ hello, takashi
 ~ ❯ sleep 5 &
 [1] 9182
 ~ ❯ jobs
-[1]  Running    sleep 5
+[1]+  Running                    sleep 5 &
 ~ ❯
 ```
 
@@ -48,16 +48,16 @@ hello, takashi
 <tr>
 <td width="50%">
 
-🔧 **Shell grammar**
+🔧 **Shell language**
 
-The constructs you expect: pipelines, redirections, control flow, functions, subshells, and here-documents.
+POSIX sh, plus bash's arrays, `[[ ]]`, `(( ))` and most of its other extensions; so all you expect.
 
 </td>
 <td width="50%">
 
 🔤 **Expansions**
 
-Variable, tilde, glob, command substitution, arithmetic, and parameter operators.
+Parameter, brace, glob, arithmetic, and command and process substitution.
 
 </td>
 </tr>
@@ -66,14 +66,14 @@ Variable, tilde, glob, command substitution, arithmetic, and parameter operators
 
 ⚙️ **Job control**
 
-Background jobs, foreground and background switching, stopping, and signalling.
+Background jobs, `fg`/`bg`, signals and completion notices.
 
 </td>
 <td>
 
 💬 **Prompt and history**
 
-Customisable `$PS1`, persistent history with `$HISTFILE`/`$HISTSIZE`.
+Custom `$PS1` and persistent history.
 
 </td>
 </tr>
@@ -143,34 +143,24 @@ Build with the latest stable Rust: swagsh tracks the stable channel rather than 
 
 ---
 
-## Known limitations
+## Compatibility notes
 
-- No shell arrays (`arr=(a b c)`, `${arr[@]}`); a language-level gap, not a
-  missing builtin, and the reason `declare`/`typeset`/`mapfile`/`readarray`
-  are absent too: they would need this first.
-- `set -b` (report background jobs the moment they finish) is not
-  implemented, and is rejected rather than accepted and ignored. Jobs are
-  reported before the next prompt instead.
-- `trap` lets a non-interactive shell trap a signal that was ignored when it
-  started, which POSIX forbids, and a trapped signal does not cut a `wait`
-  short. Real-time signals can be listed but not trapped or sent.
-- Pathname expansion sorts by byte value, as in the C locale, rather than by
-  the locale's collation order, and `.*` does not match `.` or `..` (as in
-  bash 5.2 and later).
-- The interactive prompt asks for a here-document's body only when `<<`
-  appears in the typed line itself, not when it comes from an alias.
+swagsh runs POSIX sh scripts, and most bash scripts. Where it differs from
+bash, it is on purpose:
 
-### Missing builtins:
-
-  - `help`: planned. Every builtin will implement a shared `Help` trait, with
-    a default impl derived from its existing `clap` command so most builtins
-    get this for free; the hand-written non-`clap` builtins (`:`, `true`,
-    `false`, `[`, `test`) and `help` itself provide their own impl.
-  - `declare`/`typeset`, blocked on array support above.
+- `.*` never matches `.` or `..` (as in bash 5.2 and later).
+- Associative arrays list their keys in sorted order.
+- `BASH_VERSION` is unset; scripts can check `SWAGSH_VERSION` instead.
+- `shopt` takes the options `shopt` lists, and rejects the rest by name.
 
 ---
 
 ## TODO
+
+### Planned
+
+- `help`: a shared `Help` trait for every builtin, by default derived from
+  its `clap` command.
 
 ### Planned interactive work
 

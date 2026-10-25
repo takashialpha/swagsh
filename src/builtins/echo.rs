@@ -25,7 +25,7 @@ fn is_echo_option(arg: &str) -> bool {
 
 #[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
 pub fn builtin_echo(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
-    let mut interpret_escapes = false;
+    let mut interpret_escapes = shell.shopt.xpg_echo;
     let mut no_newline = false;
     let mut start = 0;
     for arg in args {

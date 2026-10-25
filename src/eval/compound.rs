@@ -1,9 +1,14 @@
 use crate::sys::{Fork, fork};
+use std::fmt::Write as _;
+
 use anyhow::Result;
 
-use crate::ast::{AndOrList, AndOrOp, CaseClause, ForClause, GroupCmd, IfClause, WhileClause};
+use crate::ast::{
+    AndOrList, AndOrOp, ArithForClause, CaseArm, CaseClause, CaseEnd, ForClause, GroupCmd,
+    IfClause, WhileClause,
+};
 use crate::errfmt::emit;
-use crate::expand::glob_match;
+use crate::expand::glob_match_case;
 use crate::jobs::ExitStatus;
 use crate::signal::restore_child_signals;
 
@@ -143,6 +148,139 @@ impl Shell {
         propagate.map_or(Ok(status), |sig| Err(anyhow::Error::new(sig)))
     }
 
+    /// `(( expression ))`: status 0 when the expression is not zero, 1
+    /// when it is or cannot be evaluated.
+    pub(super) fn run_arith(&mut self, expr: &str) -> ExitStatus {
+        match self.eval_arith_value(expr) {
+            Ok(0) => ExitStatus::FAILURE,
+            Ok(_) => ExitStatus::SUCCESS,
+            Err(e) => {
+                emit(e);
+                ExitStatus::FAILURE
+            }
+        }
+    }
+
+    pub(super) fn run_arith_for(&mut self, fc: &ArithForClause) -> Result<ExitStatus> {
+        if !fc.init.trim().is_empty() {
+            self.eval_arith_value(&fc.init)?;
+        }
+        self.loop_depth += 1;
+        let mut status = ExitStatus::SUCCESS;
+        let mut propagate = None;
+        let result = loop {
+            if !fc.condition.trim().is_empty() {
+                match self.eval_arith_value(&fc.condition) {
+                    Ok(0) => break Ok(()),
+                    Ok(_) => {}
+                    Err(e) => break Err(e),
+                }
+            }
+            match self.run_list(&fc.body) {
+                Ok(s) => status = s,
+                Err(e) if is_break(&e) => {
+                    status = ExitStatus::SUCCESS;
+                    let n = loop_signal_level(&e);
+                    if n > 1 {
+                        propagate = Some(LoopSignal::Break(n - 1));
+                    }
+                    break Ok(());
+                }
+                Err(e) if is_continue(&e) => {
+                    let n = loop_signal_level(&e);
+                    if n > 1 {
+                        propagate = Some(LoopSignal::Continue(n - 1));
+                        break Ok(());
+                    }
+                }
+                Err(e) => break Err(e),
+            }
+            if !fc.step.trim().is_empty()
+                && let Err(e) = self.eval_arith_value(&fc.step)
+            {
+                break Err(e);
+            }
+        };
+        self.loop_depth -= 1;
+        result?;
+        propagate.map_or(Ok(status), |sig| Err(anyhow::Error::new(sig)))
+    }
+
+    /// `select`: shows the items as a numbered menu on standard error, reads
+    /// a line, sets `REPLY` to it and the variable to the item it numbers
+    /// (empty for anything else), and runs the body; an empty line shows
+    /// the menu again, and the end of input ends the loop.
+    pub(super) fn run_select(&mut self, fc: &ForClause) -> Result<ExitStatus> {
+        let items = self.expand_words(&fc.items)?;
+        if items.is_empty() {
+            return Ok(ExitStatus::SUCCESS);
+        }
+        let width = items.len().to_string().len();
+        let mut menu = String::new();
+        for (i, item) in items.iter().enumerate() {
+            let _ = writeln!(menu, "{:>width$}) {item}", i + 1);
+        }
+        self.loop_depth += 1;
+        let mut status = ExitStatus::SUCCESS;
+        let mut propagate = None;
+        let mut show_menu = true;
+        let result = loop {
+            if show_menu {
+                eprint!("{menu}");
+            }
+            let ps3 = self.env.get("PS3").unwrap_or_else(|| "#? ".to_owned());
+            eprint!("{ps3}");
+            let (line, found) = match crate::builtins::read_line(0) {
+                Ok(read) => read,
+                Err(e) => break Err(e.into()),
+            };
+            if !found && line.is_empty() {
+                eprintln!();
+                status = ExitStatus::FAILURE;
+                break Ok(());
+            }
+            let line = String::from_utf8_lossy(&line).into_owned();
+            show_menu = line.trim().is_empty();
+            if show_menu {
+                continue;
+            }
+            let chosen = line
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|i| items.get(i))
+                .cloned()
+                .unwrap_or_default();
+            self.env.set("REPLY", line);
+            if let Err(e) = self.env.assign(&fc.var, chosen) {
+                break Err(e.into());
+            }
+            match self.run_list(&fc.body) {
+                Ok(s) => status = s,
+                Err(e) if is_break(&e) => {
+                    status = ExitStatus::SUCCESS;
+                    let n = loop_signal_level(&e);
+                    if n > 1 {
+                        propagate = Some(LoopSignal::Break(n - 1));
+                    }
+                    break Ok(());
+                }
+                Err(e) if is_continue(&e) => {
+                    let n = loop_signal_level(&e);
+                    if n > 1 {
+                        propagate = Some(LoopSignal::Continue(n - 1));
+                        break Ok(());
+                    }
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        self.loop_depth -= 1;
+        result?;
+        propagate.map_or(Ok(status), |sig| Err(anyhow::Error::new(sig)))
+    }
+
     pub(super) fn run_while(&mut self, wc: &WhileClause) -> Result<ExitStatus> {
         self.loop_depth += 1;
         let mut status = ExitStatus::SUCCESS;
@@ -186,20 +324,34 @@ impl Shell {
     }
 
     pub(super) fn run_case(&mut self, cc: &CaseClause) -> Result<ExitStatus> {
-        let word = self
-            .expand_word(&cc.word)?
-            .into_iter()
-            .next()
-            .unwrap_or_default();
+        // Neither field-split nor pathname-expanded.
+        let word = self.expand_word_to_string(&cc.word)?;
+        let mut status = ExitStatus::SUCCESS;
+        let mut fall_through = false;
         for arm in &cc.arms {
-            for pattern in &arm.patterns {
-                let pat = self.expand_pattern(pattern)?;
-                if glob_match(&pat, &word) {
-                    return self.run_list(&arm.body);
-                }
+            let matched = fall_through || self.arm_matches(arm, &word)?;
+            fall_through = false;
+            if !matched {
+                continue;
+            }
+            status = self.run_list(&arm.body)?;
+            match arm.end {
+                CaseEnd::Break => return Ok(status),
+                CaseEnd::FallThrough => fall_through = true,
+                CaseEnd::Continue => {}
             }
         }
-        Ok(ExitStatus::SUCCESS)
+        Ok(status)
+    }
+
+    fn arm_matches(&mut self, arm: &CaseArm, word: &str) -> Result<bool> {
+        for pattern in &arm.patterns {
+            let nocase = self.shopt.nocasematch;
+            if glob_match_case(&self.expand_pattern(pattern)?, word, nocase) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub(super) fn run_group(&mut self, gc: &GroupCmd) -> Result<ExitStatus> {

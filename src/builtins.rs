@@ -1,5 +1,6 @@
 mod alias;
 pub mod cli;
+pub mod declare;
 mod dirs;
 mod echo;
 mod env;
@@ -13,7 +14,8 @@ pub mod limits;
 mod printf;
 mod read;
 pub mod script;
-mod test;
+mod shopt;
+pub mod test;
 mod trap;
 mod wait;
 
@@ -69,13 +71,14 @@ pub static BUILTINS: &[(&str, BuiltinFn)] = &[
     ("cd", dispatch::<dirs::CdBuiltin>),
     ("command", dispatch::<introspect::CommandBuiltin>),
     ("continue", dispatch::<flow::ContinueBuiltin>),
+    ("declare", declare::builtin_declare),
     ("dirs", dispatch::<dirs::DirsBuiltin>),
     ("disown", dispatch::<jobs::DisownBuiltin>),
     ("echo", echo::builtin_echo),
     ("eval", dispatch::<script::EvalBuiltin>),
     ("exec", script::builtin_exec_unreachable),
     ("exit", dispatch::<flow::ExitBuiltin>),
-    ("export", dispatch::<env::ExportBuiltin>),
+    ("export", declare::builtin_export),
     ("false", flow::builtin_false),
     ("fc", dispatch::<history::FcBuiltin>),
     ("fg", dispatch::<jobs::FgBuiltin>),
@@ -85,28 +88,48 @@ pub static BUILTINS: &[(&str, BuiltinFn)] = &[
     ("jobs", dispatch::<jobs::JobsBuiltin>),
     ("kill", dispatch::<kill::KillBuiltin>),
     ("let", flow::builtin_let),
-    ("local", dispatch::<env::LocalBuiltin>),
+    ("local", declare::builtin_local),
+    ("mapfile", dispatch::<declare::MapfileBuiltin>),
     ("popd", dispatch::<dirs::PopdBuiltin>),
     ("printf", dispatch::<printf::PrintfBuiltin>),
     ("pushd", dispatch::<dirs::PushdBuiltin>),
     ("pwd", dispatch::<dirs::PwdBuiltin>),
     ("read", dispatch::<read::ReadBuiltin>),
-    ("readonly", dispatch::<env::ReadonlyBuiltin>),
+    ("readarray", dispatch::<declare::MapfileBuiltin>),
+    ("readonly", declare::builtin_readonly),
     ("return", dispatch::<flow::ReturnBuiltin>),
     ("set", env::builtin_set),
     ("shift", dispatch::<env::ShiftBuiltin>),
+    ("shopt", shopt::builtin_shopt),
     ("source", dispatch::<script::SourceBuiltin>),
     ("test", test::builtin_test),
     ("times", dispatch::<limits::TimesBuiltin>),
     ("trap", trap::builtin_trap),
     ("true", flow::builtin_true),
     ("type", dispatch::<introspect::TypeBuiltin>),
+    ("typeset", declare::builtin_declare),
     ("ulimit", limits::builtin_ulimit),
     ("umask", dispatch::<limits::UmaskBuiltin>),
     ("unalias", dispatch::<alias::UnaliasBuiltin>),
     ("unset", dispatch::<env::UnsetBuiltin>),
     ("wait", dispatch::<wait::WaitBuiltin>),
 ];
+
+/// Reads one line from descriptor `fd`, as `read -r` does, without the
+/// newline; and whether the line ended in one rather than at end of input.
+///
+/// # Errors
+///
+/// Returns an error if the read fails.
+pub fn read_line(fd: i32) -> std::io::Result<(Vec<u8>, bool)> {
+    read::read_until_delim(fd, b'\n', true)
+}
+
+/// The `shopt` options that are on, for `BASHOPTS`.
+#[must_use]
+pub fn shopt_on(shell: &Shell) -> Vec<&'static str> {
+    shopt::on(shell)
+}
 
 #[inline]
 pub fn lookup_builtin(name: &str) -> Option<BuiltinFn> {

@@ -10,6 +10,9 @@ const UTF8_CONT_END: u8 = 0xBF; // last continuation byte
 // These control characters (SOH/STX) cannot appear in valid shell source.
 pub const QUOTE_START: char = '\x01';
 pub const QUOTE_END: char = '\x02';
+/// Marks a process substitution in a lexed word: followed by `<` or `>`,
+/// then the command as a `$(...)`.
+pub const PROC_SUB: char = '\x03';
 pub const QUOTE_START_BYTE: u8 = QUOTE_START as u8;
 pub const QUOTE_END_BYTE: u8 = QUOTE_END as u8;
 
@@ -29,6 +32,10 @@ pub enum Token {
     AndAnd,
     Semi,
     SemiSemi,
+    /// `;&`, ending a `case` arm that falls through.
+    SemiAmp,
+    /// `;;&`, ending a `case` arm after which matching goes on.
+    SemiSemiAmp,
     LParen,
     RParen,
     LBrace,
@@ -37,8 +44,15 @@ pub enum Token {
     // Redirections
     Redir(RedirToken),
     // Here-documents & here-strings
-    HereDoc { body: String, quoted: bool },
+    HereDoc {
+        body: String,
+        quoted: bool,
+    },
     HereString(String),
+    /// `(( expression ))`, with the expression's text.
+    ArithCmd(String),
+    /// `name=(items)` or `name+=(items)`.
+    ArrayAssign(Box<ArrayLiteral>),
     // Reserved words
     If,
     Then,
@@ -59,10 +73,38 @@ pub enum Token {
     Eof,
 }
 
+/// A token inside `[[ ... ]]`, where `(`, `)`, `<` and `>` belong to the
+/// expression rather than to the shell, and newlines are blanks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CondToken {
+    Word(String),
+    And,
+    Or,
+    Not,
+    LParen,
+    RParen,
+    Less,
+    Greater,
+    /// The closing `]]`.
+    End,
+}
+
+/// The text of `name=(items)`: `head` is `name=` or `name+=`, and each item
+/// is lexed as a word. Boxed in its token, which it would otherwise make
+/// twice as large.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrayLiteral {
+    pub head: String,
+    pub items: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedirToken {
     pub kind: RedirKind,
     pub fd: Option<i32>,
+    /// `{name}>file`: the variable that gets the descriptor's number.
+    /// Boxed, as rare: it would otherwise make every token larger.
+    pub fd_var: Option<Box<str>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +131,8 @@ impl fmt::Display for Token {
             Self::AndAnd => f.write_str("&&"),
             Self::Semi => f.write_str(";"),
             Self::SemiSemi => f.write_str(";;"),
+            Self::SemiAmp => f.write_str(";&"),
+            Self::SemiSemiAmp => f.write_str(";;&"),
             Self::LParen => f.write_str("("),
             Self::RParen => f.write_str(")"),
             Self::LBrace => f.write_str("{"),
@@ -97,6 +141,7 @@ impl fmt::Display for Token {
             Self::Newline => f.write_str("\\n"),
             Self::Eof => f.write_str("<EOF>"),
             Self::HereDoc { .. } => f.write_str("here-doc"),
+            Self::ArrayAssign(literal) => write!(f, "{}(", literal.head),
             _ => write!(f, "{self:?}"),
         }
     }
@@ -145,6 +190,10 @@ pub struct Lexer<'src> {
     /// after the parser looked ahead past the newline) still gets its body.
     bodies_due: bool,
     heredoc_bodies: Vec<String>,
+    /// A here-doc body running into the end of input is reported through
+    /// [`Lexer::heredoc_ran_out`] instead of with a warning.
+    hold_unterminated: bool,
+    heredoc_ran_out: bool,
 }
 
 impl<'src> Lexer<'src> {
@@ -158,6 +207,8 @@ impl<'src> Lexer<'src> {
             pending_heredocs: Vec::new(),
             bodies_due: false,
             heredoc_bodies: Vec::new(),
+            hold_unterminated: false,
+            heredoc_ran_out: false,
         }
     }
 
@@ -541,6 +592,20 @@ impl<'src> Lexer<'src> {
         })
     }
 
+    /// Makes a here-doc body that runs into the end of input set
+    /// [`Lexer::heredoc_ran_out`] rather than warn, for input that may still
+    /// grow, as at the interactive prompt.
+    pub const fn hold_unterminated_heredocs(&mut self) {
+        self.hold_unterminated = true;
+    }
+
+    /// A here-doc body ran into the end of input; see
+    /// [`Lexer::hold_unterminated_heredocs`].
+    #[must_use]
+    pub const fn heredoc_ran_out(&self) -> bool {
+        self.heredoc_ran_out
+    }
+
     /// Collects body lines until a line equal to `delim` is found.
     fn read_heredoc_body(&mut self, delim: &str, strip_tabs: bool) -> String {
         let mut body = String::new();
@@ -588,9 +653,13 @@ impl<'src> Lexer<'src> {
                     body.push_str(check);
                     body.push('\n');
                 }
-                crate::errfmt::emit(format!(
-                    "warning: here-document delimited by end-of-file (wanted `{delim}`)"
-                ));
+                if self.hold_unterminated {
+                    self.heredoc_ran_out = true;
+                } else {
+                    crate::errfmt::emit(format!(
+                        "warning: here-document delimited by end-of-file (wanted `{delim}`)"
+                    ));
+                }
                 break;
             }
             body.push_str(check);
@@ -654,7 +723,11 @@ impl<'src> Lexer<'src> {
             }
             _ => return Err(self.err("internal error: lex_redir called on a non-redirection")),
         };
-        Ok(Token::Redir(RedirToken { kind, fd }))
+        Ok(Token::Redir(RedirToken {
+            kind,
+            fd,
+            fd_var: None,
+        }))
     }
 
     // ------------------------------------------------------------------
@@ -666,8 +739,38 @@ impl<'src> Lexer<'src> {
     /// Returns an error if a quote or substitution inside the word is
     /// malformed or left unclosed.
     pub fn lex_word_into(&mut self, buf: &mut String) -> Result<(), LexError> {
+        self.lex_word(buf, false).map(drop)
+    }
+
+    /// Lexes a word into `buf`. With `arrays`, a word `name=` or `name+=`
+    /// followed by `(` is an array assignment, whose items are returned.
+    ///
+    /// Inside the subscript of an assignment word, `a[i + 1]=v`, blanks and
+    /// operators are part of the word, as in bash.
+    #[inline]
+    fn lex_word(
+        &mut self,
+        buf: &mut String,
+        arrays: bool,
+    ) -> Result<Option<Vec<String>>, LexError> {
         loop {
-            match self.peek() {
+            let next = self.peek();
+            match next {
+                Some(b'[') if crate::expand::is_name(buf) && self.subscript_assignment_ahead() => {
+                    self.lex_subscript(buf)?;
+                }
+                Some(b'(') if arrays && is_array_head(buf) => {
+                    return self.lex_array_items().map(Some);
+                }
+                Some(b'(') if is_extglob_open(buf) => self.lex_extglob_group(buf)?,
+                Some(b @ (b'<' | b'>')) if buf.is_empty() && self.peek2() == Some(b'(') => {
+                    // `<(cmd)` or `>(cmd)`: a process substitution.
+                    buf.push(PROC_SUB);
+                    buf.push(b as char);
+                    self.advance();
+                    self.advance();
+                    self.lex_cmd_sub(buf)?;
+                }
                 None
                 | Some(
                     b' ' | b'\t' | b'\r' | b'\n' | b';' | b'|' | b'&' | b'(' | b')' | b'<' | b'>',
@@ -716,39 +819,7 @@ impl<'src> Lexer<'src> {
                 }
                 Some(b'$') => {
                     self.advance();
-                    match self.peek() {
-                        Some(b'(') => {
-                            self.advance();
-                            self.lex_cmd_sub(buf)?;
-                        }
-                        Some(b'{') => {
-                            self.advance();
-                            self.lex_param_expand(buf)?;
-                        }
-                        _ => {
-                            buf.push('$');
-                            match self.peek() {
-                                Some(
-                                    b'@' | b'*' | b'#' | b'?' | b'-' | b'$' | b'!' | b'0'..=b'9',
-                                ) => {
-                                    if let Some(b) = self.advance() {
-                                        buf.push(b as char);
-                                    }
-                                }
-                                Some(b'a'..=b'z' | b'A'..=b'Z' | b'_') => {
-                                    while matches!(
-                                        self.peek(),
-                                        Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
-                                    ) {
-                                        if let Some(b) = self.advance() {
-                                            buf.push(b as char);
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
+                    self.lex_dollar(buf)?;
                 }
                 Some(b'`') => {
                     self.advance();
@@ -765,7 +836,412 @@ impl<'src> Lexer<'src> {
                 }
             }
         }
+        Ok(None)
+    }
+
+    /// Moves back to byte `offset`, at `line` and `col`, to lex what follows
+    /// again in another way (the inside of `[[ ... ]]`).
+    pub const fn rewind(&mut self, offset: usize, line: usize, col: usize) {
+        self.pos = offset;
+        self.line = line;
+        self.col = col;
+    }
+
+    /// The next token inside `[[ ... ]]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error at the end of input, where the expression is
+    /// incomplete, or on a character that cannot start a token.
+    pub fn cond_token(&mut self) -> Result<CondToken, LexError> {
+        loop {
+            match self.peek() {
+                Some(b' ' | b'\t' | b'\r' | b'\n') => {
+                    self.advance();
+                }
+                Some(b'\\') if self.peek2() == Some(b'\n') => {
+                    self.advance();
+                    self.advance();
+                }
+                // Blanks were just skipped, so a `#` starts a word: a comment.
+                Some(b'#') => self.skip_comment(),
+                _ => break,
+            }
+        }
+        let after = |n: usize| self.src.get(self.pos + n).copied();
+        let ends = |b: Option<u8>| {
+            b.is_none_or(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b';' | b'&' | b'|' | b')'))
+        };
+        let (token, len) = match self.peek() {
+            None => return Err(self.err_incomplete("unterminated `[[`")),
+            Some(b']') if after(1) == Some(b']') && ends(after(2)) => (CondToken::End, 2),
+            Some(b'(') => (CondToken::LParen, 1),
+            Some(b')') => (CondToken::RParen, 1),
+            Some(b'&') if after(1) == Some(b'&') => (CondToken::And, 2),
+            Some(b'|') if after(1) == Some(b'|') => (CondToken::Or, 2),
+            Some(b'<') => (CondToken::Less, 1),
+            Some(b'>') => (CondToken::Greater, 1),
+            Some(b'!') if ends(after(1)) => (CondToken::Not, 1),
+            _ => {
+                let mut buf = String::new();
+                self.lex_word(&mut buf, false)?;
+                if buf.is_empty() {
+                    return Err(self.err("unexpected character in `[[`"));
+                }
+                return Ok(CondToken::Word(buf));
+            }
+        };
+        for _ in 0..len {
+            self.advance();
+        }
+        Ok(token)
+    }
+
+    /// The right side of `=~` inside `[[ ... ]]`: one word, in which `(`,
+    /// `)` and `|` belong to the regular expression.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a quote or expansion in it is not closed.
+    pub fn cond_regex(&mut self) -> Result<String, LexError> {
+        while matches!(self.peek(), Some(b' ' | b'\t')) {
+            self.advance();
+        }
+        let mut buf = String::new();
+        let mut depth = 0usize;
+        while let Some(b) = self.peek() {
+            match b {
+                b' ' | b'\t' | b'\r' | b'\n' | b')' if depth == 0 => break,
+                b'&' if depth == 0 && self.peek2() == Some(b'&') => break,
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b'\'' => {
+                    self.advance();
+                    buf.push(QUOTE_START);
+                    self.lex_single_quoted(&mut buf)?;
+                    buf.push(QUOTE_END);
+                    continue;
+                }
+                b'"' => {
+                    self.advance();
+                    self.lex_double_quoted(&mut buf)?;
+                    continue;
+                }
+                b'$' if self.peek2() != Some(b')')
+                    && self.peek2().is_some_and(|n| !n.is_ascii_whitespace()) =>
+                {
+                    self.advance();
+                    self.lex_dollar(&mut buf)?;
+                    continue;
+                }
+                b'\\' => {
+                    self.advance();
+                    buf.push('\\');
+                    if let Some(n) = self.peek() {
+                        let start = self.pos;
+                        self.advance();
+                        if n < UTF8_CONT_START {
+                            buf.push(n as char);
+                        } else {
+                            self.push_utf8(&mut buf, start);
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            let start = self.pos;
+            self.advance();
+            if b < UTF8_CONT_START {
+                buf.push(b as char);
+            } else {
+                self.push_utf8(&mut buf, start);
+            }
+        }
+        Ok(buf)
+    }
+
+    /// The rest of a `$'...'` string, after its opening quote: decoded, and
+    /// marked as quoted like a single-quoted string.
+    fn lex_ansi_c_quoted(&mut self, buf: &mut String) -> Result<(), LexError> {
+        let start = self.pos;
+        loop {
+            match self.advance() {
+                None => return Err(self.err_incomplete("unterminated $'...' string")),
+                Some(b'\\') => {
+                    self.advance();
+                }
+                Some(b'\'') => break,
+                Some(_) => {}
+            }
+        }
+        let raw = String::from_utf8_lossy(&self.src[start..self.pos - 1]);
+        buf.push(QUOTE_START);
+        buf.push_str(&crate::expand::ansi_c_unescape(&raw));
+        buf.push(QUOTE_END);
         Ok(())
+    }
+
+    /// `;`, `;;`, `;&` or `;;&`, from the first `;`.
+    fn lex_semicolon(&mut self) -> Token {
+        self.advance();
+        let double = self.peek() == Some(b';');
+        if double {
+            self.advance();
+        }
+        if self.peek() == Some(b'&') && self.peek2() != Some(b'&') {
+            self.advance();
+            return if double {
+                Token::SemiSemiAmp
+            } else {
+                Token::SemiAmp
+            };
+        }
+        if double { Token::SemiSemi } else { Token::Semi }
+    }
+
+    /// From a `((`: where the `))` that closes it as an arithmetic command
+    /// starts. `None` if the parentheses close some other way, as in the
+    /// nested subshells `((cd /tmp) && ls)`.
+    fn arith_command_end(&self) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut i = self.pos + 2;
+        while let Some(&b) = self.src.get(i) {
+            match b {
+                b'(' => depth += 1,
+                b')' if depth > 0 => depth -= 1,
+                b')' => return (self.src.get(i + 1) == Some(&b')')).then_some(i),
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// What follows a `$` in a word: `$'...'`, `$(...)`, `${...}`, or a
+    /// parameter name.
+    #[inline]
+    fn lex_dollar(&mut self, buf: &mut String) -> Result<(), LexError> {
+        match self.peek() {
+            Some(b'\'') => {
+                self.advance();
+                self.lex_ansi_c_quoted(buf)?;
+            }
+            Some(b'(') => {
+                self.advance();
+                self.lex_cmd_sub(buf)?;
+            }
+            Some(b'{') => {
+                self.advance();
+                self.lex_param_expand(buf)?;
+            }
+            _ => {
+                buf.push('$');
+                match self.peek() {
+                    Some(b'@' | b'*' | b'#' | b'?' | b'-' | b'$' | b'!' | b'0'..=b'9') => {
+                        if let Some(b) = self.advance() {
+                            buf.push(b as char);
+                        }
+                    }
+                    Some(b'a'..=b'z' | b'A'..=b'Z' | b'_') => {
+                        while matches!(
+                            self.peek(),
+                            Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+                        ) {
+                            if let Some(b) = self.advance() {
+                                buf.push(b as char);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The character after a backslash, taken whole into `buf`.
+    fn push_escaped(&mut self, buf: &mut String) {
+        let Some(b) = self.peek() else {
+            return;
+        };
+        let start = self.pos;
+        self.advance();
+        if b < UTF8_CONT_START {
+            buf.push(b as char);
+        } else {
+            self.push_utf8(buf, start);
+        }
+    }
+
+    /// The subscript of an assignment word, `[i + 1]` in `a[i + 1]=v`, from
+    /// its `[` to its `]`: blanks and operators in it are part of the word,
+    /// as in bash, while quotes and expansions are lexed as anywhere else.
+    fn lex_subscript(&mut self, buf: &mut String) -> Result<(), LexError> {
+        let mut depth = 0usize;
+        while let Some(b) = self.peek() {
+            match b {
+                b'\n' => break,
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                b'\'' => {
+                    self.advance();
+                    buf.push(QUOTE_START);
+                    self.lex_single_quoted(buf)?;
+                    buf.push(QUOTE_END);
+                    continue;
+                }
+                b'"' => {
+                    self.advance();
+                    self.lex_double_quoted(buf)?;
+                    continue;
+                }
+                b'$' => {
+                    self.advance();
+                    self.lex_dollar(buf)?;
+                    continue;
+                }
+                b'\\' => {
+                    buf.push('\\');
+                    self.advance();
+                    self.push_escaped(buf);
+                    continue;
+                }
+                _ => {}
+            }
+            let start = self.pos;
+            self.advance();
+            if b < UTF8_CONT_START {
+                buf.push(b as char);
+            } else {
+                self.push_utf8(buf, start);
+            }
+            if depth == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// The `(...)` of an extended pattern such as `@(a|b)`, from its `(`:
+    /// `|` and nested groups belong to the word.
+    fn lex_extglob_group(&mut self, buf: &mut String) -> Result<(), LexError> {
+        let mut depth = 0usize;
+        while let Some(b) = self.peek() {
+            match b {
+                b'\n' => break,
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b'\'' => {
+                    self.advance();
+                    buf.push(QUOTE_START);
+                    self.lex_single_quoted(buf)?;
+                    buf.push(QUOTE_END);
+                    continue;
+                }
+                b'"' => {
+                    self.advance();
+                    self.lex_double_quoted(buf)?;
+                    continue;
+                }
+                b'$' => {
+                    self.advance();
+                    self.lex_dollar(buf)?;
+                    continue;
+                }
+                b'\\' => {
+                    buf.push('\\');
+                    self.advance();
+                    self.push_escaped(buf);
+                    continue;
+                }
+                _ => {}
+            }
+            let start = self.pos;
+            self.advance();
+            if b < UTF8_CONT_START {
+                buf.push(b as char);
+            } else {
+                self.push_utf8(buf, start);
+            }
+            if depth == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// From a `[` after a name: whether a matching `]` followed by `=` or
+    /// `+=` comes before the end of the line, making the word an
+    /// assignment to an array element.
+    fn subscript_assignment_ahead(&self) -> bool {
+        let mut depth = 0usize;
+        let mut i = self.pos;
+        while let Some(&b) = self.src.get(i) {
+            match b {
+                b'\n' => return false,
+                b'\\' => i += 1,
+                b'\'' | b'"' => {
+                    i += 1;
+                    while let Some(&c) = self.src.get(i) {
+                        if c == b {
+                            break;
+                        }
+                        if c == b'\\' && b == b'"' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                b'[' => depth += 1,
+                b']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        let rest = &self.src[i + 1..];
+                        return rest.starts_with(b"=") || rest.starts_with(b"+=");
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// The items of an array assignment, from its `(` to its `)`. They may
+    /// span lines and hold comments.
+    fn lex_array_items(&mut self) -> Result<Vec<String>, LexError> {
+        self.advance();
+        let mut items = Vec::new();
+        loop {
+            match self.peek() {
+                Some(b' ' | b'\t' | b'\r' | b'\n') => {
+                    self.advance();
+                    continue;
+                }
+                Some(b'\\') if self.peek2() == Some(b'\n') => {
+                    self.advance();
+                    self.advance();
+                    continue;
+                }
+                Some(b'#') => {
+                    self.skip_comment();
+                    continue;
+                }
+                Some(b')') => {
+                    self.advance();
+                    return Ok(items);
+                }
+                None => return Err(self.err_incomplete("unterminated array assignment")),
+                _ => {}
+            }
+            let mut item = String::new();
+            self.lex_word(&mut item, false)?;
+            if item.is_empty() {
+                return Err(self.err("unexpected character in array assignment"));
+            }
+            items.push(item);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -826,16 +1302,17 @@ impl<'src> Lexer<'src> {
                     Token::Ampersand
                 });
             }
-            Some(b';') => {
-                self.advance();
-                return Ok(if self.peek() == Some(b';') {
-                    self.advance();
-                    Token::SemiSemi
-                } else {
-                    Token::Semi
-                });
-            }
+            Some(b';') => return Ok(self.lex_semicolon()),
             Some(b'(') => {
+                if self.peek2() == Some(b'(')
+                    && let Some(end) = self.arith_command_end()
+                {
+                    let text = String::from_utf8_lossy(&self.src[self.pos + 2..end]).into_owned();
+                    while self.pos < end + 2 {
+                        self.advance();
+                    }
+                    return Ok(Token::ArithCmd(text));
+                }
                 self.advance();
                 return Ok(Token::LParen);
             }
@@ -857,16 +1334,23 @@ impl<'src> Lexer<'src> {
                 self.advance();
                 return Ok(Token::RBrace);
             }
-            Some(b'!') => {
+            // Reserved only as a word of its own: `!=` and `!x` are words.
+            // `!(...)` is an extended pattern.
+            Some(b'!') if self.peek2().is_none_or(|b| b != b'(' && ends_word(b)) => {
                 self.advance();
                 return Ok(Token::Bang);
             }
-            Some(b'<' | b'>') => return self.lex_redir(None),
+            Some(b'<' | b'>') if self.peek2() != Some(b'(') => return self.lex_redir(None),
             _ => {}
         }
 
         let mut buf = String::new();
-        self.lex_word_into(&mut buf)?;
+        if let Some(items) = self.lex_word(&mut buf, true)? {
+            return Ok(Token::ArrayAssign(Box::new(ArrayLiteral {
+                head: buf,
+                items,
+            })));
+        }
 
         // A leading digit run only introduces a redirection if it actually
         // fits a file descriptor. `9999999999>file` is not fd 9999999999:
@@ -881,6 +1365,18 @@ impl<'src> Lexer<'src> {
             && let Ok(fd) = buf.parse::<i32>()
         {
             return self.lex_redir(Some(fd));
+        }
+        // `{name}>file`: the shell picks the descriptor and sets `name`.
+        if matches!(self.peek(), Some(b'<' | b'>'))
+            && let Some(name) = buf.strip_prefix('{').and_then(|b| b.strip_suffix('}'))
+            && crate::expand::is_name(name.split_once('[').map_or(name, |(n, _)| n))
+            && (!name.contains('[') || name.ends_with(']'))
+        {
+            let mut token = self.lex_redir(None)?;
+            if let Token::Redir(redir) = &mut token {
+                redir.fd_var = Some(name.into());
+            }
+            return Ok(token);
         }
 
         Ok(keyword_or_word(buf))
@@ -905,4 +1401,27 @@ fn keyword_or_word(buf: String) -> Token {
         "function" => Token::Function,
         _ => Token::Word(buf),
     }
+}
+
+/// `name=` or `name+=`: what may come right before an array assignment's
+/// `(`.
+fn is_array_head(buf: &str) -> bool {
+    buf.strip_suffix('=')
+        .map(|n| n.strip_suffix('+').unwrap_or(n))
+        .is_some_and(crate::expand::is_name)
+}
+
+/// A byte that ends an unquoted word.
+const fn ends_word(b: u8) -> bool {
+    matches!(
+        b,
+        b' ' | b'\t' | b'\r' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>'
+    )
+}
+
+/// A word so far ending in one of `? * + @ !` (not a `$?`, `$*`, ... before
+/// it), which a `(` turns into an extended pattern group.
+fn is_extglob_open(buf: &str) -> bool {
+    let mut rev = buf.chars().rev();
+    matches!(rev.next(), Some('?' | '*' | '+' | '@' | '!')) && rev.next() != Some('$')
 }

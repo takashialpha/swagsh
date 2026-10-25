@@ -2,12 +2,13 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::ast::{
-    AndOrItem, AndOrList, AndOrOp, Command, Pipeline, Program, Redirect, RedirectKind, SimpleCmd,
-    TimeFormat, Word,
+    AndOrItem, AndOrList, AndOrOp, ArrayItem, Assign, AssignValue, Command, Pipeline, Program,
+    Redirect, RedirectKind, SimpleCmd, TimeFormat, Word,
 };
+use crate::expand::{find_unnested, is_name};
 use crate::lexer::{
-    LexError, Lexer, QUOTE_END, QUOTE_END_BYTE, QUOTE_START, QUOTE_START_BYTE, RedirKind,
-    RedirToken, Token,
+    ArrayLiteral, LexError, Lexer, PROC_SUB, QUOTE_END, QUOTE_END_BYTE, QUOTE_START,
+    QUOTE_START_BYTE, RedirKind, RedirToken, Token,
 };
 
 mod compound;
@@ -27,6 +28,10 @@ pub struct ParseError {
     /// token. The REPL uses this to decide whether to prompt for more
     /// input (`> `) instead of reporting a hard error.
     pub incomplete: bool,
+    /// The input ended inside a here-document body (only reported by
+    /// [`parse_with_aliases`]), so the next line belongs to the body as it
+    /// stands rather than being shell syntax.
+    pub in_heredoc: bool,
 }
 
 impl fmt::Display for ParseError {
@@ -44,6 +49,7 @@ impl From<LexError> for ParseError {
             col: e.col,
             msg: e.msg.to_owned(),
             incomplete: e.incomplete,
+            in_heredoc: false,
         }
     }
 }
@@ -90,6 +96,9 @@ impl Nest<'_> {
 /// How far ahead of `pos` the token buffer is kept filled, which is as far
 /// as any lookahead in the grammar reaches (`is_function_def_ahead`).
 const LOOKAHEAD: usize = 1;
+
+/// The commands whose `name=value` arguments are assignment words.
+const DECLARATION_COMMANDS: [&str; 5] = ["declare", "export", "local", "readonly", "typeset"];
 
 /// A parser that pulls tokens from the lexer only as the grammar needs them.
 ///
@@ -192,7 +201,7 @@ impl<'src> Parser<'src> {
                 Token::Eof
             }
         };
-        self.lexed_eof = token == Token::Eof;
+        self.lexed_eof = matches!(token, Token::Eof);
         if matches!(token, Token::HereDoc { .. }) {
             self.unfilled_heredocs.push(self.tokens.len());
         }
@@ -323,6 +332,7 @@ impl<'src> Parser<'src> {
                 col: sp.col,
                 msg: format!("expected `{expected}`, got `{}`", sp.token),
                 incomplete: sp.token == Token::Eof,
+                in_heredoc: false,
             })
         }
     }
@@ -342,6 +352,7 @@ impl<'src> Parser<'src> {
             col: sp.col,
             msg: msg.into(),
             incomplete: sp.token == Token::Eof,
+            in_heredoc: false,
         }
     }
 
@@ -368,6 +379,21 @@ impl<'src> Parser<'src> {
     ///
     /// Returns an error if the token stream doesn't form a valid program.
     pub fn parse(mut self) -> ParseResult<Program> {
+        let result = self.parse_program();
+        if self.lexer.heredoc_ran_out() {
+            let (line, col) = self.lexer.position();
+            return Err(ParseError {
+                line,
+                col,
+                msg: "here-document not terminated".to_owned(),
+                incomplete: true,
+                in_heredoc: true,
+            });
+        }
+        result
+    }
+
+    fn parse_program(&mut self) -> ParseResult<Program> {
         let body = self.parse_list()?;
         if *self.peek() != Token::Eof {
             return Err(self.err(format!("unexpected token `{}`", self.peek())));
@@ -485,6 +511,8 @@ impl<'src> Parser<'src> {
                 | Token::RBrace
                 | Token::In
                 | Token::SemiSemi
+                | Token::SemiAmp
+                | Token::SemiSemiAmp
         )
     }
 
@@ -549,9 +577,9 @@ impl<'src> Parser<'src> {
 
     fn parse_pipeline(&mut self) -> ParseResult<Pipeline> {
         // `time` is reserved only here, at the start of a pipeline.
-        let timed = if *self.peek() == Token::Word("time".to_owned()) {
+        let timed = if matches!(self.peek(), Token::Word(w) if w == "time") {
             self.advance();
-            if *self.peek() == Token::Word("-p".to_owned()) {
+            if matches!(self.peek(), Token::Word(w) if w == "-p") {
                 self.advance();
                 Some(TimeFormat::Posix)
             } else {
@@ -605,6 +633,14 @@ impl<'src> Parser<'src> {
         let compound = match self.peek() {
             Token::If => self.parse_if(),
             Token::For => self.parse_for(),
+            Token::ArithCmd(expr) => {
+                let expr = expr.clone();
+                self.advance();
+                Ok(Command::Arith(expr))
+            }
+            Token::Word(w) if w == "[[" => self.parse_cond(),
+            Token::Word(w) if w == "select" && self.is_select_ahead() => self.parse_select(),
+            Token::Word(w) if w == "coproc" => return self.parse_coproc(),
             Token::While => self.parse_while(false),
             Token::Until => self.parse_while(true),
             Token::Case => self.parse_case(),
@@ -649,8 +685,13 @@ impl<'src> Parser<'src> {
         // reasoning). `redirects` stays `Vec::new()`: most commands have
         // none at all, so pre-sizing it would waste an allocation outright
         // more often than it would save one.
+        let line = self.peek_spanned().line;
         let mut words = Vec::with_capacity(1);
         let mut redirects = Vec::new();
+        // Assignment words are recognized before the command name, and
+        // after it when it is a declaration command, as in bash.
+        let mut assigning = true;
+        let mut named = false;
 
         loop {
             if self.alias_next == Some(self.pos) {
@@ -664,7 +705,35 @@ impl<'src> Parser<'src> {
             }
             if let Token::Word(w) = self.peek().clone() {
                 self.advance();
-                words.push(self.parse_word_str(w)?);
+                let w = if assigning && w.contains('=') {
+                    match self.parse_assign_word(w)? {
+                        Ok(assign) => {
+                            words.push(Word::Assign(Box::new(assign)));
+                            continue;
+                        }
+                        Err(w) => w,
+                    }
+                } else {
+                    w
+                };
+                if !named {
+                    named = true;
+                    assigning = assigning && DECLARATION_COMMANDS.contains(&w.as_str());
+                }
+                self.push_words(w, &mut words)?;
+                continue;
+            }
+            if matches!(self.peek(), Token::ArrayAssign(_)) {
+                if !assigning {
+                    return Err(self.err("unexpected `(`"));
+                }
+                let Token::ArrayAssign(literal) = self.advance().clone() else {
+                    continue;
+                };
+                let ArrayLiteral { head, items } = *literal;
+                words.push(Word::Assign(Box::new(
+                    self.parse_array_assign(&head, &items)?,
+                )));
                 continue;
             }
             if matches!(
@@ -693,12 +762,113 @@ impl<'src> Parser<'src> {
             return Err(self.err("expected a command"));
         }
 
-        Ok(SimpleCmd { words, redirects })
+        Ok(SimpleCmd {
+            words,
+            redirects,
+            line,
+        })
     }
 
     // ------------------------------------------------------------------
     // Word parsing
     // ------------------------------------------------------------------
+
+    /// Parses `raw` into the words its brace expansion makes, onto `words`.
+    pub(super) fn push_words(&self, raw: String, words: &mut Vec<Word>) -> ParseResult<()> {
+        if !raw.contains('{') {
+            words.push(self.parse_word_str(raw)?);
+            return Ok(());
+        }
+        let expanded = crate::brace::expand(&raw)
+            .ok_or_else(|| self.err("brace expansion makes too many words"))?;
+        for raw in expanded {
+            words.push(self.parse_word_str(raw)?);
+        }
+        Ok(())
+    }
+
+    /// Parses `raw` as an assignment word if it is one: a name, perhaps a
+    /// subscript, then `=` or `+=`. Hands `raw` back if it is not.
+    fn parse_assign_word(&self, mut raw: String) -> ParseResult<Result<Assign, String>> {
+        let name_end = raw
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(raw.len());
+        if !is_name(&raw[..name_end]) {
+            return Ok(Err(raw));
+        }
+        let mut rest = name_end;
+        let mut index = None;
+        if raw[rest..].starts_with('[') {
+            let Some(close) = find_unnested(&raw[rest + 1..], |c| c == ']') else {
+                return Ok(Err(raw));
+            };
+            index = Some(rest + 1..rest + 1 + close);
+            rest += close + 2;
+        }
+        let (append, value_start) = if raw[rest..].starts_with("+=") {
+            (true, rest + 2)
+        } else if raw[rest..].starts_with('=') {
+            (false, rest + 1)
+        } else {
+            return Ok(Err(raw));
+        };
+        if index.as_ref().is_some_and(std::ops::Range::is_empty) {
+            return Err(self.err(format!("{}[]: bad array subscript", &raw[..name_end])));
+        }
+        let name = raw[..name_end].to_owned();
+        let index = index
+            .map(|r| self.parse_word_str(raw[r].to_owned()))
+            .transpose()?;
+        // The value reuses the word's own buffer.
+        raw.replace_range(..value_start, "");
+        Ok(Ok(Assign {
+            name,
+            index,
+            append,
+            value: AssignValue::Scalar(self.parse_word_str(raw)?),
+        }))
+    }
+
+    /// `name=(items)`, from its lexed head (`name=` or `name+=`) and items.
+    // Kept out of line: rare, and inlined it bloats the hot parser
+    // frames that call it.
+    #[inline(never)]
+    fn parse_array_assign(&self, head: &str, raw_items: &[String]) -> ParseResult<Assign> {
+        let name = head.trim_end_matches('=');
+        let (name, append) = name.strip_suffix('+').map_or((name, false), |n| (n, true));
+        let mut items = Vec::with_capacity(raw_items.len());
+        for raw in raw_items {
+            if let Some(inner) = raw.strip_prefix('[')
+                && let Some(close) = find_unnested(inner, |c| c == ']')
+            {
+                let after = &inner[close + 1..];
+                let (append, value) = after
+                    .strip_prefix("+=")
+                    .map_or_else(|| (false, after.strip_prefix('=')), |v| (true, Some(v)));
+                if let Some(value) = value {
+                    items.push(ArrayItem {
+                        index: Some(self.parse_word_str(inner[..close].to_owned())?),
+                        append,
+                        value: self.parse_word_str(value.to_owned())?,
+                    });
+                    continue;
+                }
+            }
+            let mut values = Vec::new();
+            self.push_words(raw.clone(), &mut values)?;
+            items.extend(values.into_iter().map(|value| ArrayItem {
+                index: None,
+                append: false,
+                value,
+            }));
+        }
+        Ok(Assign {
+            name: name.to_owned(),
+            index: None,
+            append,
+            value: AssignValue::Array(items),
+        })
+    }
 
     // Takes `raw` by value, not `&str`: every call site already holds an
     // owned `String` at the point it calls this (each already had to
@@ -742,7 +912,7 @@ impl<'src> Parser<'src> {
     fn parse_redirect(&mut self) -> ParseResult<Redirect> {
         self.read_heredoc_body_at(self.pos);
         match self.advance().clone() {
-            Token::Redir(RedirToken { kind, fd }) => {
+            Token::Redir(RedirToken { kind, fd, fd_var }) => {
                 let target_tok = self.peek().clone();
                 let target = match target_tok {
                     Token::Word(w) => {
@@ -773,6 +943,7 @@ impl<'src> Parser<'src> {
                     kind: rk,
                     fd: fd.unwrap_or(default_fd),
                     target,
+                    fd_var,
                 })
             }
 
@@ -783,6 +954,7 @@ impl<'src> Parser<'src> {
                 },
                 fd: 0,
                 target: Word::Literal(String::new()),
+                fd_var: None,
             }),
 
             Token::HereString(s) => Ok(Redirect {
@@ -793,6 +965,7 @@ impl<'src> Parser<'src> {
                 // `parse_word_str` is what every other redirect target
                 // above already goes through for exactly that reason.
                 target: self.parse_word_str(s)?,
+                fd_var: None,
             }),
 
             other => Err(self.err(format!("expected redirection, got `{other}`"))),
@@ -899,6 +1072,7 @@ const fn keyword_text(tok: &Token) -> Option<&'static str> {
         // of a command is just that character as text (`echo }` prints `}`).
         Token::LBrace => "{",
         Token::RBrace => "}",
+        Token::Bang => "!",
         _ => return None,
     })
 }
@@ -923,6 +1097,7 @@ fn decompose_word(raw: &str, nest: Nest<'_>, in_dquotes: bool) -> ParseResult<Ve
             col: 0,
             msg: "too deeply nested".to_owned(),
             incomplete: false,
+            in_heredoc: false,
         });
     }
     let mut parts: Vec<Word> = Vec::new();
@@ -946,6 +1121,15 @@ fn decompose_word(raw: &str, nest: Nest<'_>, in_dquotes: bool) -> ParseResult<Ve
                 }
                 None => lit.push('$'),
             },
+
+            PROC_SUB => {
+                flush_lit!();
+                let output = chars.next().is_some_and(|(_, c)| c == '>');
+                chars.next_if(|&(_, c)| c == '$');
+                if let Some(Word::CmdSub(cmd)) = parse_dollar(&mut chars, nest)? {
+                    parts.push(Word::ProcSub { cmd, output });
+                }
+            }
 
             QUOTE_START => {
                 flush_lit!();
@@ -1053,12 +1237,17 @@ fn read_backtick(
     while let Some((_, c)) = chars.next() {
         match c {
             '`' => break,
-            '\\' => {
-                inner.push('\\');
-                if let Some((_, next)) = chars.next() {
-                    inner.push(next);
+            // POSIX: inside backquotes a backslash quotes only `$`, `` ` ``
+            // and `\`, and is removed before them; an escaped backquote is
+            // how one nests.
+            '\\' => match chars.next() {
+                Some((_, quoted @ ('$' | '`' | '\\'))) => inner.push(quoted),
+                Some((_, other)) => {
+                    inner.push('\\');
+                    inner.push(other);
                 }
-            }
+                None => inner.push('\\'),
+            },
             _ => inner.push(c),
         }
     }
@@ -1097,6 +1286,7 @@ fn collect_balanced(
             col: 0,
             msg: format!("unterminated `{open}...{close}` in word"),
             incomplete: true,
+            in_heredoc: false,
         });
     }
 
@@ -1187,13 +1377,20 @@ pub fn parse(src: &str) -> ParseResult<Program> {
     Parser::new(src).parse()
 }
 
-/// [`parse`], expanding `aliases` while parsing.
+/// [`parse`], expanding `aliases` while parsing, for input typed at the
+/// prompt.
+///
+/// A here-document whose body runs into the end of `src`, wherever its
+/// `<<` came from, makes the input incomplete (see
+/// [`ParseError::in_heredoc`]) instead of ending there with a warning.
 ///
 /// # Errors
 ///
 /// Returns an error if `src` fails to lex or parse.
 pub fn parse_with_aliases(src: &str, aliases: Rc<Aliases>) -> ParseResult<Program> {
-    Parser::with_aliases(src, Some(aliases)).parse()
+    let mut parser = Parser::with_aliases(src, Some(aliases));
+    parser.lexer.hold_unterminated_heredocs();
+    parser.parse()
 }
 
 /// An alias's value, lexed into the tokens that replace the aliased word.

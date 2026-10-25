@@ -1,12 +1,14 @@
-use std::io::{Read, Write};
+use std::io::Write;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use rustix::termios::{LocalModes, OptionalActions, Termios, tcgetattr, tcsetattr};
 
 use crate::errfmt::strerror;
-use crate::eval::Shell;
+use crate::eval::{ExpandedAssign, ExpandedValue, Shell};
+use crate::fd::{read_raw, seek_back};
 use crate::jobs::ExitStatus;
+use rustix::fd::RawFd;
 
 use super::Builtin;
 
@@ -43,48 +45,65 @@ impl Drop for EchoGuard {
     }
 }
 
-/// Reads raw bytes up to (and excluding) `delim`, one byte at a time: a
-/// buffered read would over-consume past the delimiter, stranding input a
-/// later command (or a second `read`) still needs. In non-raw mode, a
-/// backslash immediately before `delim` escapes it: both bytes are dropped
-/// and reading continues, matching a shell's usual backslash-newline
-/// continuation but generalized to `-d`'s delimiter.
+/// Reads raw bytes from descriptor `fd` up to (and excluding) `delim`,
+/// never consuming input past it, which would strand what a later command
+/// (or a second `read`) still needs: a file is read in blocks and its
+/// offset moved back over what was not used, anything else (a pipe, a
+/// terminal) one byte at a time. In non-raw mode, a backslash immediately
+/// before `delim` escapes it: both bytes are dropped and reading continues,
+/// matching a shell's usual backslash-newline continuation but generalized
+/// to `-d`'s delimiter.
 ///
 /// Returns the bytes read and whether `delim` was actually seen (`false`
 /// means EOF cut the read short, the caller's cue to report failure while
 /// still assigning whatever partial data came through).
-// False positive: every path through the loop below is a `return`
-// immediately after `stdin`'s last use, so there's no unnecessary
-// contention window for `drop(stdin)` to shorten.
-#[allow(clippy::significant_drop_tightening)]
-fn read_until_delim(delim: u8, raw: bool) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut stdin = std::io::stdin().lock();
+pub(super) fn read_until_delim(
+    fd: RawFd,
+    delim: u8,
+    raw: bool,
+) -> std::io::Result<(Vec<u8>, bool)> {
     let mut out = Vec::new();
-    let mut byte = [0u8; 1];
+    let mut block = [0u8; 512];
+    // Probed with an empty seek: only a file can take its input back.
+    let size = if seek_back(fd, 0) { block.len() } else { 1 };
     loop {
-        if stdin.read(&mut byte)? == 0 {
-            return Ok((out, false));
-        }
-        let b = byte[0];
-        if b == delim {
+        let n = match read_raw(fd, &mut block[..size]) {
+            Ok(0) => return Ok((out, false)),
+            Ok(n) => n,
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let mut i = 0;
+        while i < n {
+            let b = block[i];
+            i += 1;
+            if b != delim {
+                out.push(b);
+                continue;
+            }
             if !raw && out.last() == Some(&b'\\') {
                 out.pop();
                 continue;
             }
+            if i < n {
+                seek_back(fd, n - i);
+            }
             return Ok((out, true));
         }
-        out.push(b);
     }
 }
 
 /// Splits `line` into exactly `n_vars` fields on `ifs`, the way `read`
 /// assigns its trailing variable everything left over (IFS included) rather
-/// than continuing to split. In non-raw mode a backslash makes the next
-/// character literal, both stripped from the output and exempted from
-/// acting as a field separator.
-fn split_fields(line: &str, ifs: &str, n_vars: usize, raw: bool) -> Vec<String> {
+/// than continuing to split; with `None`, into as many fields as there are
+/// (`read -a`). In non-raw mode a backslash makes the next character
+/// literal, both stripped from the output and exempted from acting as a
+/// field separator.
+fn split_fields(line: &str, ifs: &str, n_vars: Option<usize>, raw: bool) -> Vec<String> {
     let is_ifs = |c: char| ifs.contains(c);
-    let mut fields = Vec::with_capacity(n_vars);
+    let all = n_vars.is_none();
+    let n_vars = n_vars.unwrap_or(usize::MAX);
+    let mut fields = Vec::new();
     let mut cur = String::new();
     let mut chars = line.chars().peekable();
     while chars.peek().is_some_and(|&c| is_ifs(c)) {
@@ -108,9 +127,11 @@ fn split_fields(line: &str, ifs: &str, n_vars: usize, raw: bool) -> Vec<String> 
     }
     let trimmed = cur.trim_end_matches(is_ifs).len();
     cur.truncate(trimmed);
-    fields.push(cur);
-    while fields.len() < n_vars {
-        fields.push(String::new());
+    if !(all && cur.is_empty()) {
+        fields.push(cur);
+    }
+    if !all {
+        fields.resize(n_vars, String::new());
     }
     fields
 }
@@ -133,6 +154,9 @@ pub struct ReadBuiltin {
     /// Read until the first character of DELIM instead of newline
     #[arg(short = 'd')]
     delim: Option<String>,
+    /// Assign the words read to the indexed array ARRAY, one per element
+    #[arg(short = 'a', value_name = "ARRAY")]
+    array: Option<String>,
     names: Vec<String>,
 }
 
@@ -151,7 +175,7 @@ impl Builtin for ReadBuiltin {
 
         let echo_guard = self.silent.then(EchoGuard::disable);
         let (raw_bytes, hit_delim) =
-            read_until_delim(delim, self.raw).map_err(|e| anyhow!("read: {}", strerror(e)))?;
+            read_until_delim(0, delim, self.raw).map_err(|e| anyhow!("read: {}", strerror(e)))?;
         if echo_guard.is_some_and(|g| g.is_active()) {
             shell.outln("")?;
         } else if hit_delim && delim == b'\n' {
@@ -162,17 +186,36 @@ impl Builtin for ReadBuiltin {
         }
         let line = String::from_utf8_lossy(&raw_bytes).into_owned();
 
+        let ifs = shell.env.get("IFS").unwrap_or_else(|| " \t\n".to_owned());
+        if let Some(array) = self.array {
+            let items = split_fields(&line, &ifs, None, self.raw)
+                .into_iter()
+                .map(|v| (None, false, v))
+                .collect();
+            let assign = ExpandedAssign {
+                name: array,
+                index: None,
+                append: false,
+                value: ExpandedValue::Array(items),
+            };
+            shell
+                .apply_assign(&assign)
+                .map_err(|e| anyhow!("read: {e}"))?;
+            return Ok(if hit_delim {
+                ExitStatus::SUCCESS
+            } else {
+                ExitStatus::FAILURE
+            });
+        }
         let names: Vec<&str> = if self.names.is_empty() {
             vec!["REPLY"]
         } else {
             self.names.iter().map(String::as_str).collect()
         };
-        let ifs = shell.env.get("IFS").unwrap_or_else(|| " \t\n".to_owned());
-        let fields = split_fields(&line, &ifs, names.len(), self.raw);
+        let fields = split_fields(&line, &ifs, Some(names.len()), self.raw);
         for (name, value) in names.iter().zip(fields) {
             shell
-                .env
-                .assign(name, value)
+                .assign_target(name, value)
                 .map_err(|e| anyhow!("read: {e}"))?;
         }
 

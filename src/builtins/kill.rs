@@ -1,10 +1,11 @@
 use anyhow::{Result, anyhow, bail};
 use clap::Parser;
-use rustix::process::{Pid, Signal, kill_process, kill_process_group};
+use rustix::process::Signal;
 
 use crate::errfmt::emit;
 use crate::eval::Shell;
 use crate::jobs::ExitStatus;
+use crate::sys::{kill, rt_signals};
 
 use super::Builtin;
 use super::jobs::find_job;
@@ -48,36 +49,17 @@ const SIGNAL_TABLE: &[(&str, Signal)] = &[
     ("SYS", Signal::SYS),
 ];
 
-// Real-time signals (`SIGRTMIN`..`SIGRTMAX`) are listing-only here, not
-// sendable: rustix's `Signal::from_raw_unchecked` docs explicitly say a
-// `Signal` built from a number in that range "must not be used to send,
-// consume, or block any signals" (a real syscall-safety constraint tied to
-// glibc's own bookkeeping for the range, not rustix being overcautious);
-// the safe constructor for that lives in the separate `rustix-libc-wrappers`
-// crate, which isn't a dependency here. So `kill -l` can name and list
-// them (pure display, no `Signal` value involved), but `kill -RTMIN+1 pid`
-// errors out honestly instead of doing something unsound.
-//
-// The 34..=64 bounds are glibc's standard reservation (33 signals used by
-// pthreads for cancellation/setuid internals, 31 left over for
-// applications) on essentially every mainstream Linux distribution; a
-// libc with a different split (musl, notably, doesn't reserve any) would
-// see the wrong range here. Hard-coded rather than queried at runtime via
-// libc's `SIGRTMIN()`/`SIGRTMAX()` functions, since that would mean adding
-// `libc` as a direct dependency for two integers.
-const SIGRTMIN: i32 = 34;
-const SIGRTMAX: i32 = 64;
-
 /// The conventional real-time signal naming: `SIGRTMIN`, `SIGRTMIN+1`, ...,
 /// `SIGRTMAX-1`, `SIGRTMAX`, switching from a `RTMIN+` to a `RTMAX-` offset
 /// at whichever is closer to `n` (ties go to `RTMIN+`: with `SIGRTMIN`/
 /// `SIGRTMAX` 34/64, `49` is `RTMIN+15` not `RTMAX-15`).
 fn rt_signal_name(n: i32) -> Option<String> {
-    if !(SIGRTMIN..=SIGRTMAX).contains(&n) {
+    let rt = rt_signals();
+    if !rt.contains(&n) {
         return None;
     }
-    let below = n - SIGRTMIN;
-    let above = SIGRTMAX - n;
+    let below = n - rt.start();
+    let above = rt.end() - n;
     Some(if below <= above {
         if below == 0 {
             "RTMIN".to_owned()
@@ -95,27 +77,22 @@ fn rt_signal_name(n: i32) -> Option<String> {
 /// or `RTMAX` (already `SIG`-stripped and upper-cased by the caller) back
 /// to a raw signal number.
 fn parse_rt_name(bare: &str) -> Option<i32> {
-    if bare == "RTMIN" {
-        return Some(SIGRTMIN);
-    }
-    if bare == "RTMAX" {
-        return Some(SIGRTMAX);
-    }
-    if let Some(n) = bare.strip_prefix("RTMIN+") {
-        let raw = SIGRTMIN + n.parse::<i32>().ok()?;
-        return (raw <= SIGRTMAX).then_some(raw);
-    }
-    if let Some(n) = bare.strip_prefix("RTMAX-") {
-        let raw = SIGRTMAX - n.parse::<i32>().ok()?;
-        return (raw >= SIGRTMIN).then_some(raw);
-    }
-    None
+    let rt = rt_signals();
+    let n = if bare == "RTMIN" {
+        *rt.start()
+    } else if bare == "RTMAX" {
+        *rt.end()
+    } else if let Some(n) = bare.strip_prefix("RTMIN+") {
+        rt.start().checked_add(n.parse().ok()?)?
+    } else {
+        rt.end()
+            .checked_sub(bare.strip_prefix("RTMAX-")?.parse().ok()?)?
+    };
+    rt.contains(&n).then_some(n)
 }
 
-/// Name lookup by raw signal number for `kill -l NUM`, covering both the
-/// fixed table (1-31) and the dynamically-named real-time range. Pure
-/// display: never constructs a `Signal`, so the real-time restriction
-/// above doesn't apply to this direction.
+/// The name of signal `n` without `SIG`, covering both the fixed table and
+/// the real-time range.
 pub(super) fn signal_name_by_raw(n: i32) -> Option<String> {
     if let Some((name, _)) = SIGNAL_TABLE.iter().find(|(_, s)| s.as_raw() == n) {
         return Some((*name).to_owned());
@@ -123,10 +100,9 @@ pub(super) fn signal_name_by_raw(n: i32) -> Option<String> {
     rt_signal_name(n)
 }
 
-/// Number lookup by name for `kill -l NAME`, the other pure-display
-/// direction `parse_signal` (which also has to reject the real-time case
-/// for actually sending) doesn't cover.
-fn signal_number_by_name(spec: &str) -> Option<i32> {
+/// The number of the signal named `spec`, in any case and with or without
+/// `SIG`, real-time names included.
+pub(super) fn signal_number_by_name(spec: &str) -> Option<i32> {
     let upper = spec.to_uppercase();
     let bare = upper.strip_prefix("SIG").unwrap_or(upper.as_str());
     if let Some((_, sig)) = SIGNAL_TABLE.iter().find(|(name, _)| *name == bare) {
@@ -135,42 +111,33 @@ fn signal_number_by_name(spec: &str) -> Option<i32> {
     parse_rt_name(bare)
 }
 
-pub(super) fn parse_signal_name(s: &str) -> Option<Signal> {
-    let upper = s.to_uppercase();
-    let bare = upper.strip_prefix("SIG").unwrap_or(upper.as_str());
+/// Every signal number there is: the fixed table, then the real-time ones.
+pub(super) fn all_signals() -> impl Iterator<Item = i32> {
     SIGNAL_TABLE
         .iter()
-        .find(|(name, _)| *name == bare)
-        .map(|(_, sig)| *sig)
+        .map(|(_, s)| s.as_raw())
+        .chain(rt_signals())
 }
 
-fn parse_signal(spec: &str) -> Result<Signal> {
-    if let Ok(n) = spec.parse::<i32>() {
-        if (SIGRTMIN..=SIGRTMAX).contains(&n) {
-            bail!(
-                "kill: real-time signals (SIGRTMIN..SIGRTMAX) can be listed with -l but not sent"
-            );
+/// A signal by name or number; `0` is the null signal, which only checks
+/// that the target exists.
+fn parse_signal(spec: &str) -> Result<i32> {
+    let n = match spec.parse::<i32>() {
+        Ok(n) => n,
+        Err(_) => {
+            signal_number_by_name(spec).ok_or_else(|| anyhow!("kill: invalid signal: {spec}"))?
         }
-        return Signal::from_named_raw(n).ok_or_else(|| anyhow!("kill: invalid signal: {spec}"));
+    };
+    if n != 0 && signal_name_by_raw(n).is_none() {
+        bail!("kill: invalid signal: {spec}");
     }
-    if let Some(sig) = parse_signal_name(spec) {
-        return Ok(sig);
-    }
-    let upper = spec.to_uppercase();
-    let bare = upper.strip_prefix("SIG").unwrap_or(upper.as_str());
-    if parse_rt_name(bare).is_some() {
-        bail!("kill: real-time signals (SIGRTMIN..SIGRTMAX) can be listed with -l but not sent");
-    }
-    Err(anyhow!("kill: invalid signal: {spec}"))
+    Ok(n)
 }
 
 fn builtin_kill_list(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     if args.is_empty() {
-        for (i, (name, _)) in SIGNAL_TABLE.iter().enumerate() {
-            shell.outln(&format!("{:2}) SIG{name}", i + 1))?;
-        }
-        for n in SIGRTMIN..=SIGRTMAX {
-            if let Some(name) = rt_signal_name(n) {
+        for n in all_signals() {
+            if let Some(name) = signal_name_by_raw(n) {
                 shell.outln(&format!("{n:2}) SIG{name}"))?;
             }
         }
@@ -178,7 +145,8 @@ fn builtin_kill_list(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     }
     for spec in args {
         if let Ok(n) = spec.parse::<i32>() {
-            let name = signal_name_by_raw(n)
+            // An exit status of a process killed by a signal names it too.
+            let name = signal_name_by_raw(if n > 128 { n - 128 } else { n })
                 .ok_or_else(|| anyhow!("kill: {spec}: invalid signal number"))?;
             shell.outln(&name)?;
         } else {
@@ -236,7 +204,7 @@ impl Builtin for KillBuiltin {
         {
             (parse_signal(&first[1..])?, self.targets[1..].to_vec())
         } else {
-            (Signal::TERM, self.targets)
+            (Signal::TERM.as_raw(), self.targets)
         };
 
         if targets.is_empty() {
@@ -256,18 +224,18 @@ impl Builtin for KillBuiltin {
                 // Without job control the job has no process group of its
                 // own, so signal each of its processes instead.
                 let result = if shell.monitor {
-                    kill_process_group(job.pgid, sig)
+                    kill(-job.pgid.as_raw_nonzero().get(), sig)
                 } else {
-                    job.pids.iter().try_for_each(|&pid| kill_process(pid, sig))
+                    job.pids
+                        .iter()
+                        .try_for_each(|&pid| kill(pid.as_raw_nonzero().get(), sig))
                 };
                 result.map_err(|e| anyhow!("kill: ({target}) - {}", crate::errfmt::strerror(e)))?;
             } else {
-                let raw: i32 = target
+                let pid: i32 = target
                     .parse()
                     .map_err(|_| anyhow!("kill: invalid pid: {target}"))?;
-                let pid =
-                    Pid::from_raw(raw).ok_or_else(|| anyhow!("kill: invalid pid: {target}"))?;
-                kill_process(pid, sig)
+                kill(pid, sig)
                     .map_err(|e| anyhow!("kill: ({target}) - {}", crate::errfmt::strerror(e)))?;
             }
         }

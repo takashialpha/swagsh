@@ -11,11 +11,43 @@ pub enum Word {
     Arith(String),
     /// `$(cmd)` or backtick form.
     CmdSub(Box<Command>),
+    /// `<(cmd)`, or with `output`, `>(cmd)`: the name of a pipe from or to
+    /// `cmd`.
+    ProcSub { cmd: Box<Command>, output: bool },
     /// A sequence of word-parts concatenated at expansion time.
     Compound(Vec<Self>),
     /// Content from a single- or double-quoted region.
     /// Suppresses IFS word-splitting and glob expansion on the result.
     Quoted(Box<Self>),
+    /// An assignment, before a command or as an argument of `declare` and
+    /// the other declaration commands.
+    Assign(Box<Assign>),
+}
+
+/// `name=value`, `name+=value`, `name[index]=value` or `name=(items)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assign {
+    pub name: String,
+    /// `name[index]=`: the subscript, still to be expanded.
+    pub index: Option<Word>,
+    /// `+=`: append to the current value instead of replacing it.
+    pub append: bool,
+    pub value: AssignValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssignValue {
+    Scalar(Word),
+    /// `name=(items)`: a whole array.
+    Array(Vec<ArrayItem>),
+}
+
+/// One item of `name=(items)`: a value, or `[index]=value`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrayItem {
+    pub index: Option<Word>,
+    pub append: bool,
+    pub value: Word,
 }
 
 // ---------------------------------------------------------------------------
@@ -52,6 +84,9 @@ pub struct Redirect {
     /// Source file descriptor (default 1 for out, 0 for in).
     pub fd: i32,
     pub target: Word,
+    /// `{name}>file`: the descriptor is a new one, which stays open after
+    /// the command, and `name` gets its number. Boxed, as rare.
+    pub fd_var: Option<Box<str>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +98,8 @@ pub struct Redirect {
 pub struct SimpleCmd {
     pub words: Vec<Word>,
     pub redirects: Vec<Redirect>,
+    /// The line it starts on, for `$LINENO`.
+    pub line: usize,
 }
 
 /// A pipeline: `cmd1 | cmd2 | cmd3`.
@@ -101,6 +138,31 @@ pub struct ForClause {
     pub body: Vec<AndOrList>,
 }
 
+/// `for (( init; condition; step )); do body; done`, each part an
+/// arithmetic expression, any of them empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArithForClause {
+    pub init: String,
+    pub condition: String,
+    pub step: String,
+    pub body: Vec<AndOrList>,
+}
+
+/// The expression of `[[ ... ]]`. Its words are expanded without field
+/// splitting or pathname expansion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CondExpr {
+    /// A word alone: true when it is not empty.
+    Word(Word),
+    /// `-f path` and the other unary tests.
+    Unary(String, Word),
+    /// `a == pattern`, `a =~ regex`, `a -lt b` and the other binary tests.
+    Binary(Word, String, Word),
+    Not(Box<Self>),
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
+}
+
 /// `while condition; do body; done`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WhileClause {
@@ -121,6 +183,18 @@ pub struct CaseClause {
 pub struct CaseArm {
     pub patterns: Vec<Word>,
     pub body: Vec<AndOrList>,
+    pub end: CaseEnd,
+}
+
+/// How a `case` arm ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseEnd {
+    /// `;;`: the `case` is done.
+    Break,
+    /// `;&`: the next arm's body runs too, without its patterns tested.
+    FallThrough,
+    /// `;;&`: the next arms' patterns are tested too.
+    Continue,
 }
 
 /// `name() { body; }`
@@ -145,10 +219,22 @@ pub enum Command {
     Pipeline(Pipeline),
     If(IfClause),
     For(ForClause),
+    /// Boxed: as large as the other clauses, it would make every command
+    /// larger by its tag.
+    ArithFor(Box<ArithForClause>),
     While(WhileClause),
     Case(CaseClause),
     FunctionDef(FunctionDef),
     Group(GroupCmd),
+    /// `coproc [name] command`: `command` runs in the background with pipes
+    /// to and from the shell, whose descriptors the array `name` holds.
+    Coproc(String, Box<Self>),
+    /// `select name in words; do body; done`: a menu.
+    Select(ForClause),
+    /// `(( expression ))`: succeeds when the expression is not zero.
+    Arith(String),
+    /// `[[ expression ]]`.
+    Cond(Box<CondExpr>),
     /// A compound command followed by redirections: `while ...; done <file`.
     Redirected(Box<Self>, Vec<Redirect>),
 }

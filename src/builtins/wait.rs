@@ -4,7 +4,7 @@ use rustix::process::Pid;
 
 use crate::errfmt::emit;
 use crate::eval::Shell;
-use crate::jobs::{ExitStatus, JobState};
+use crate::jobs::{ExitStatus, JobState, Waited};
 
 use super::Builtin;
 
@@ -25,29 +25,75 @@ fn find_job_by_pid_or_spec(shell: &Shell, spec: &str) -> Option<usize> {
         .map(|j| j.id)
 }
 
-/// Blocks until job `id` terminates (or returns immediately if it already
-/// has, per `reap_nonblocking`), removing it from the job table either way.
-fn wait_one(shell: &mut Shell, id: usize) -> Option<ExitStatus> {
-    let pending: Vec<Pid> = {
-        let job = shell.jobs.iter().find(|j| j.id == id)?;
-        job.pids
-            .iter()
-            .zip(&job.statuses)
-            .filter(|(_, s)| s.is_none())
-            .map(|(&p, _)| p)
-            .collect()
-    };
-    for pid in pending {
-        if let Ok(status) = shell.wait_for_pid(pid) {
-            shell.jobs.mark_pid_done(pid, status);
+/// How waiting for one job ended.
+enum Outcome {
+    Done(ExitStatus),
+    /// A trapped signal arrived first.
+    Trapped(i32),
+    /// The job stopped, or there was nothing left to wait for.
+    Gone,
+}
+
+/// Blocks until job `id` terminates, removing it from the job table.
+fn wait_one(shell: &mut Shell, id: usize) -> Outcome {
+    loop {
+        let Some(job) = shell.jobs.iter().find(|j| j.id == id) else {
+            return Outcome::Gone;
+        };
+        let pending = match job.state {
+            JobState::Done(status) => {
+                shell.jobs.remove(id);
+                return Outcome::Done(status);
+            }
+            JobState::Stopped => return Outcome::Gone,
+            JobState::Running => job
+                .pids
+                .iter()
+                .zip(&job.statuses)
+                .find(|(_, s)| s.is_none())
+                .map(|(&p, _)| p),
+        };
+        let Some(pid) = pending else {
+            return Outcome::Gone;
+        };
+        match shell.wait_or_trap(Some(pid)) {
+            Ok(Waited::Exited(pid, status)) => shell.jobs.mark_pid_done(pid, status),
+            Ok(Waited::Trapped(sig)) => return Outcome::Trapped(sig),
+            Ok(Waited::Stopped(_)) | Err(_) => return Outcome::Gone,
         }
     }
-    let status = match shell.jobs.iter().find(|j| j.id == id)?.state {
-        JobState::Done(s) => s,
-        JobState::Running | JobState::Stopped => return None,
-    };
-    shell.jobs.remove(id);
-    Some(status)
+}
+
+/// `wait -n`: blocks until any job in `targets` terminates.
+fn wait_next(shell: &mut Shell, targets: &[usize], pid_var: Option<&str>) -> ExitStatus {
+    loop {
+        shell.jobs.reap_nonblocking();
+        let mut any = false;
+        let mut done = None;
+        for job in shell.jobs.iter().filter(|j| targets.contains(&j.id)) {
+            any = true;
+            if let JobState::Done(status) = job.state {
+                done = Some((job.id, job.pgid, status));
+                break;
+            }
+        }
+        if let Some((id, pgid, status)) = done {
+            shell.jobs.remove(id);
+            if let Some(var) = pid_var {
+                shell.env.set(var, pgid.as_raw_nonzero().to_string());
+            }
+            return status;
+        }
+        if !any {
+            return ExitStatus(127);
+        }
+        match shell.wait_or_trap(None) {
+            Ok(Waited::Exited(pid, status)) => shell.jobs.mark_pid_done(pid, status),
+            Ok(Waited::Trapped(sig)) => return ExitStatus(128 + sig),
+            Ok(Waited::Stopped(_)) => {}
+            Err(_) => return ExitStatus(127),
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -77,12 +123,23 @@ impl Builtin for WaitBuiltin {
         shell.jobs.reap_nonblocking();
 
         let mut targets: Vec<usize> = Vec::new();
+        // The status of the last operand when its job was already reported.
+        let mut last_forgotten = None;
         if self.ids.is_empty() {
             targets.extend(shell.jobs.iter().map(|j| j.id));
         } else {
             for spec in &self.ids {
                 if let Some(id) = find_job_by_pid_or_spec(shell, spec) {
                     targets.push(id);
+                } else if let Some(status) = spec
+                    .parse()
+                    .ok()
+                    .and_then(Pid::from_raw)
+                    .and_then(|pid| shell.jobs.take_forgotten(pid))
+                {
+                    if Some(spec) == self.ids.last() {
+                        last_forgotten = Some(status);
+                    }
                 } else {
                     emit(format!("wait: pid {spec} is not a child of this shell"));
                     return Ok(ExitStatus(127));
@@ -92,41 +149,21 @@ impl Builtin for WaitBuiltin {
 
         if self.next {
             if targets.is_empty() {
-                // `-n` fails outright when there's nothing to wait for.
-                return Ok(ExitStatus::FAILURE);
+                return Ok(ExitStatus(127));
             }
-            loop {
-                shell.jobs.reap_nonblocking();
-                let Some(job) = shell.jobs.iter().find(|j| targets.contains(&j.id)) else {
-                    return Ok(ExitStatus::FAILURE);
-                };
-                if let JobState::Done(status) = job.state {
-                    let (id, pgid) = (job.id, job.pgid);
-                    shell.jobs.remove(id);
-                    if let Some(var) = &self.pid_var {
-                        shell.env.set(var, pgid.as_raw_nonzero().to_string());
-                    }
-                    return Ok(status);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
+            return Ok(wait_next(shell, &targets, self.pid_var.as_deref()));
         }
 
-        if self.ids.is_empty() {
-            // Plain `wait`: always returns 0 regardless of what any of the
-            // waited-for children actually exited with.
-            for id in targets {
-                wait_one(shell, id);
-            }
-            return Ok(ExitStatus::SUCCESS);
-        }
-
+        // A plain `wait` returns 0 whatever the jobs exited with; with
+        // operands it returns the last one's status.
         let mut status = ExitStatus::SUCCESS;
         for id in targets {
-            if let Some(s) = wait_one(shell, id) {
-                status = s;
+            match wait_one(shell, id) {
+                Outcome::Done(s) if !self.ids.is_empty() => status = s,
+                Outcome::Trapped(sig) => return Ok(ExitStatus(128 + sig)),
+                Outcome::Done(_) | Outcome::Gone => {}
             }
         }
-        Ok(status)
+        Ok(last_forgotten.unwrap_or(status))
     }
 }

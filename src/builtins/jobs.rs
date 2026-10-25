@@ -8,7 +8,7 @@
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use rustix::io::Errno;
-use rustix::process::{Pid, Signal, WaitOptions, kill_process_group, waitpgid};
+use rustix::process::{Signal, WaitOptions, kill_process_group, waitpgid};
 use rustix::termios::tcsetpgrp;
 
 use crate::eval::Shell;
@@ -59,31 +59,27 @@ pub struct JobsBuiltin {
 impl Builtin for JobsBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
         shell.jobs.reap_nonblocking();
-        let entries: Vec<(usize, Pid, String, String)> = shell
+        let lines: Vec<String> = shell
             .jobs
             .iter()
             .filter(|j| {
                 (!self.running_only || matches!(j.state, JobState::Running))
                     && (!self.stopped_only || matches!(j.state, JobState::Stopped))
+                    && !(j.notified && matches!(j.state, JobState::Done(_)))
             })
             .map(|j| {
-                let state = match &j.state {
-                    JobState::Running => "Running".into(),
-                    JobState::Stopped => "Stopped".into(),
-                    JobState::Done(s) => format!("Done({})", s.0),
-                };
-                (j.id, j.pgid, state, j.command.clone())
+                if self.pids_only {
+                    j.pgid.to_string()
+                } else {
+                    shell.jobs.describe(j, self.long)
+                }
             })
             .collect();
-        for (id, pgid, state, cmd) in entries {
-            if self.pids_only {
-                shell.outln(&pgid.to_string())?;
-            } else if self.long {
-                shell.outln(&format!("[{id}]  {pgid}  {state}\t{cmd}"))?;
-            } else {
-                shell.outln(&format!("[{id}]  {state}\t{cmd}"))?;
-            }
+        for line in lines {
+            shell.outln(&line)?;
         }
+        // POSIX: a finished job is reported once, then forgotten.
+        let _ = shell.jobs.take_finished();
         Ok(ExitStatus::SUCCESS)
     }
 }
@@ -154,6 +150,7 @@ impl Builtin for BgBuiltin {
         kill_process_group(pgid, Signal::CONT)?;
         if let Some(job) = shell.jobs.by_pgid_mut(pgid) {
             job.state = JobState::Running;
+            job.stop_announced = false;
         }
         eprintln!("[{id}]+ {pgid} &");
         Ok(ExitStatus::SUCCESS)

@@ -3,51 +3,9 @@ use clap::Parser;
 
 use crate::errfmt::emit;
 use crate::eval::Shell;
-use crate::expand::shell_quote;
 use crate::jobs::ExitStatus;
 
 use super::Builtin;
-
-#[derive(Parser)]
-#[command(
-    name = "export",
-    about = "Mark variables for export to child processes"
-)]
-pub struct ExportBuiltin {
-    /// Remove the export attribute instead of setting it
-    #[arg(short = 'n')]
-    remove: bool,
-    names: Vec<String>,
-}
-
-impl Builtin for ExportBuiltin {
-    fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
-        if self.names.is_empty() {
-            let pairs: Vec<(String, String)> = shell
-                .env
-                .exported()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect();
-            for (k, v) in pairs {
-                shell.outln(&format!("export {k}={}", shell_quote(&v)))?;
-            }
-            return Ok(ExitStatus::SUCCESS);
-        }
-        for name in &self.names {
-            if self.remove {
-                shell.env.unexport(name);
-            } else if let Some((k, v)) = name.split_once('=') {
-                if shell.env.is_readonly(k) {
-                    anyhow::bail!("export: {}", crate::env::ReadonlyError(k.to_owned()));
-                }
-                shell.env.export(k, v.to_owned());
-            } else {
-                shell.env.mark_exported(name);
-            }
-        }
-        Ok(ExitStatus::SUCCESS)
-    }
-}
 
 #[derive(Parser)]
 #[command(name = "unset", about = "Unset variables and/or functions")]
@@ -58,6 +16,9 @@ pub struct UnsetBuiltin {
     /// Treat each NAME as a function only
     #[arg(short = 'f')]
     function: bool,
+    /// Unset a reference variable itself, not the variable it refers to
+    #[arg(short = 'n')]
+    nameref: bool,
     names: Vec<String>,
 }
 
@@ -65,7 +26,19 @@ impl Builtin for UnsetBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
         let mut status = ExitStatus::SUCCESS;
         for name in &self.names {
-            if self.function {
+            if !self.function
+                && let Some((array, rest)) = name.split_once('[')
+                && let Some(index) = rest.strip_suffix(']')
+            {
+                if let Err(e) = unset_element(shell, array, index) {
+                    emit(format!("unset: {e}"));
+                    status = ExitStatus::FAILURE;
+                }
+                continue;
+            }
+            if self.nameref {
+                shell.env.unset_ref(name);
+            } else if self.function {
                 shell.env.unset_function(name);
             } else if shell.env.is_readonly(name) {
                 emit(format!(
@@ -85,6 +58,23 @@ impl Builtin for UnsetBuiltin {
             Err(super::BuiltinFailed(status).into())
         }
     }
+}
+
+/// `unset 'name[index]'`: one element, or with `@` or `*`, the whole array.
+fn unset_element(shell: &mut Shell, name: &str, index: &str) -> Result<()> {
+    if !crate::expand::is_name(name) {
+        anyhow::bail!("`{name}[{index}]': not a valid identifier");
+    }
+    if index == "@" || index == "*" {
+        if shell.env.is_readonly(name) {
+            anyhow::bail!(crate::env::ReadonlyError(name.to_owned()));
+        }
+        shell.env.unset_var(name);
+        return Ok(());
+    }
+    let key = shell.key_for(name, index)?;
+    shell.env.unset_element(name, &key)?;
+    Ok(())
 }
 
 /// Not wired into `BUILTINS` via `dispatch::<SetOperandsBuiltin>` directly
@@ -127,13 +117,14 @@ pub fn builtin_set(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
 }
 
 fn print_all_vars(shell: &mut Shell) -> Result<ExitStatus> {
-    let pairs: Vec<(String, String)> = shell
+    let lines: Vec<String> = shell
         .env
-        .all_vars()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .declared_names()
+        .into_iter()
+        .filter_map(|name| super::declare::assignment_text(shell, name))
         .collect();
-    for (k, v) in pairs {
-        shell.outln(&format!("{k}={}", shell_quote(&v)))?;
+    for line in lines {
+        shell.outln(&line)?;
     }
     Ok(ExitStatus::SUCCESS)
 }
@@ -142,9 +133,10 @@ fn print_all_vars(shell: &mut Shell) -> Result<ExitStatus> {
 /// `shell` as it's recognized, and returns whatever's left (to be treated
 /// as operands) plus whether a `--` was the thing that ended the scan.
 ///
-/// The POSIX options this shell implements are `-a`, `-C`, `-e`, `-f`,
-/// `-m`, `-n`, `-u`, `-v` and `-x`, plus their `-o`/`+o` long names (see
-/// [`OPTIONS`]). Accepting-and-ignoring the rest (`-b`, ...) would be
+/// The POSIX options this shell implements are `-a`, `-b`, `-C`, `-e`,
+/// `-f`, `-m`, `-n`, `-u`, `-v` and `-x`, and bash's `-H`, plus their
+/// `-o`/`+o` long names
+/// (see [`OPTIONS`]). Accepting-and-ignoring the rest (`-h`, ...) would be
 /// a fake flag pretending to work, so an unrecognized one is a usage error
 /// (`invalid option`, exit 2) rather than a silent no-op.
 fn apply_set_flags<'a>(shell: &mut Shell, args: &'a [&'a str]) -> Result<(&'a [&'a str], bool)> {
@@ -192,7 +184,7 @@ fn apply_set_flags<'a>(shell: &mut Shell, args: &'a [&'a str]) -> Result<(&'a [&
         for c in rest.chars() {
             if !OPTIONS.iter().any(|o| o.letter == c) {
                 anyhow::bail!(
-                    "set: {arg}: invalid option\nset: usage: set [-aCefmnuvx] [-o option] [--] [arg ...]"
+                    "set: {arg}: invalid option\nset: usage: set [-abCefHmnuvx] [-o option] [--] [arg ...]"
                 );
             }
             set_option(shell, c, enable);
@@ -218,6 +210,10 @@ const OPTIONS: &[ShellOption] = &[
         name: "errexit",
     },
     ShellOption {
+        letter: 'H',
+        name: "histexpand",
+    },
+    ShellOption {
         letter: 'm',
         name: "monitor",
     },
@@ -232,6 +228,10 @@ const OPTIONS: &[ShellOption] = &[
     ShellOption {
         letter: 'f',
         name: "noglob",
+    },
+    ShellOption {
+        letter: 'b',
+        name: "notify",
     },
     ShellOption {
         letter: 'u',
@@ -250,6 +250,8 @@ const OPTIONS: &[ShellOption] = &[
 fn set_option(shell: &mut Shell, letter: char, enable: bool) {
     match letter {
         'a' => shell.env.allexport = enable,
+        'b' => shell.notify = enable,
+        'H' => shell.histexpand = enable,
         'C' => shell.noclobber = enable,
         'e' => shell.errexit = enable,
         'f' => shell.noglob = enable,
@@ -260,6 +262,14 @@ fn set_option(shell: &mut Shell, letter: char, enable: bool) {
         'x' => shell.xtrace = enable,
         _ => {}
     }
+}
+
+/// Whether the `set -o` option named `name` is on (`test -o name`).
+pub(super) fn option_is_on(shell: &Shell, name: &str) -> bool {
+    OPTIONS
+        .iter()
+        .find(|o| o.name == name)
+        .is_some_and(|o| option_enabled(shell, o.letter))
 }
 
 fn option_enabled(shell: &Shell, letter: char) -> bool {
@@ -319,88 +329,15 @@ pub struct ShiftBuiltin {
 impl Builtin for ShiftBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
         let mut pos = shell.env.positional_args().to_vec();
-        // Silently fails here (no message) for an out-of-range count,
-        // negative included, unlike this builtin's other errors (a
-        // non-numeric count is still a real, clap-reported usage error).
-        let Ok(n) = usize::try_from(self.count.unwrap_or(1)) else {
-            return Ok(ExitStatus::FAILURE);
-        };
-        if n > pos.len() {
-            return Ok(ExitStatus::FAILURE);
-        }
+        // POSIX: a count out of range is an error, which as `shift` is a
+        // special builtin ends a non-interactive shell.
+        let count = self.count.unwrap_or(1);
+        let n = usize::try_from(count)
+            .ok()
+            .filter(|&n| n <= pos.len())
+            .ok_or_else(|| anyhow::anyhow!("shift: {count}: shift count out of range"))?;
         pos.drain(..n);
         shell.env.set_positional_args(pos);
-        Ok(ExitStatus::SUCCESS)
-    }
-}
-
-#[derive(Parser)]
-#[command(name = "readonly", about = "Mark variables as unchangeable")]
-pub struct ReadonlyBuiltin {
-    /// List readonly variables as `readonly` commands (the default with no
-    /// NAMEs)
-    #[arg(short = 'p')]
-    print: bool,
-    #[arg(value_name = "NAME[=VALUE]")]
-    names: Vec<String>,
-}
-
-impl Builtin for ReadonlyBuiltin {
-    fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
-        if self.names.is_empty() || self.print {
-            for (name, value) in shell.env.readonly_vars() {
-                match value {
-                    Some(v) => shell.outln(&format!("readonly {name}={}", shell_quote(&v)))?,
-                    None => shell.outln(&format!("readonly {name}"))?,
-                }
-            }
-            return Ok(ExitStatus::SUCCESS);
-        }
-        for name in &self.names {
-            let name = match name.split_once('=') {
-                Some((k, v)) => {
-                    shell
-                        .env
-                        .assign(k, v)
-                        .map_err(|e| anyhow::anyhow!("readonly: {e}"))?;
-                    k
-                }
-                None => name,
-            };
-            shell.env.mark_readonly(name);
-        }
-        Ok(ExitStatus::SUCCESS)
-    }
-}
-
-#[derive(Parser)]
-#[command(
-    name = "local",
-    about = "Make variables local to the current function",
-    long_about = "Make variables local to the current function. A NAME given \
-                  without a value keeps the value it had outside until assigned."
-)]
-pub struct LocalBuiltin {
-    #[arg(value_name = "NAME[=VALUE]")]
-    names: Vec<String>,
-}
-
-impl Builtin for LocalBuiltin {
-    fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
-        for arg in &self.names {
-            let (name, value) = arg
-                .split_once('=')
-                .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
-            if shell.env.is_readonly(name) {
-                anyhow::bail!("local: {}", crate::env::ReadonlyError(name.to_owned()));
-            }
-            if !shell.env.make_local(name) {
-                anyhow::bail!("local: can only be used in a function");
-            }
-            if let Some(value) = value {
-                shell.env.set(name, value);
-            }
-        }
         Ok(ExitStatus::SUCCESS)
     }
 }

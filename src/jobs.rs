@@ -41,6 +41,15 @@ pub fn decode_wait_status(status: WaitStatus) -> Option<ExitStatus> {
         .or_else(|| status.terminating_signal().map(|sig| ExitStatus(128 + sig)))
 }
 
+/// How one wait for a child ended.
+#[derive(Debug, Clone, Copy)]
+pub enum Waited {
+    Exited(Pid, ExitStatus),
+    Stopped(Pid),
+    /// A trapped signal arrived first; its trap is still pending.
+    Trapped(i32),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobState {
     Running,
@@ -56,25 +65,68 @@ pub struct Job {
     /// The exit status of each of `pids` that has finished.
     pub statuses: Vec<Option<ExitStatus>>,
     pub state: JobState,
+    /// The signal that killed the job's last process, if one did.
+    pub signal: Option<i32>,
+    /// Its completion was already announced while the shell sat at the
+    /// prompt (`set -b`).
+    pub notified: bool,
+    /// It was announced as stopped since it last stopped.
+    pub stop_announced: bool,
     pub command: String,
+}
+
+impl Job {
+    /// The job's state as `jobs` and completion notices word it.
+    #[must_use]
+    pub fn state_text(&self) -> String {
+        match self.state {
+            JobState::Running => "Running".to_owned(),
+            JobState::Stopped => "Stopped".to_owned(),
+            JobState::Done(status) => done_text(status, self.signal),
+        }
+    }
+}
+
+/// How a finished job's state reads: `Done`, `Exit 3`, or the description
+/// of the signal that killed it (`Terminated`).
+#[must_use]
+pub fn done_text(status: ExitStatus, signal: Option<i32>) -> String {
+    match signal {
+        Some(sig) => crate::sys::signal_description(sig),
+        None if status.is_success() => "Done".to_owned(),
+        None => format!("Exit {}", status.0),
+    }
+}
+
+/// A job line laid out as bash does: `[1]+  Running                    cmd`.
+#[must_use]
+pub fn job_line(id: usize, mark: char, state: &str, command: &str) -> String {
+    format!("[{id}]{mark}  {state:<27}{command}")
 }
 
 #[derive(Debug, Default)]
 pub struct JobTable {
     jobs: Vec<Job>,
-    next_id: usize,
+    /// Exit statuses of processes whose jobs were reported finished and
+    /// removed, newest last, so `wait PID` can still return them.
+    forgotten: Vec<(Pid, ExitStatus)>,
 }
+
+/// How many statuses of reported jobs `JobTable` keeps for `wait`.
+const FORGOTTEN_MAX: usize = 64;
 
 impl JobTable {
     pub fn add(&mut self, pgid: Pid, pids: Vec<Pid>, command: String) -> usize {
-        self.next_id += 1;
-        let id = self.next_id;
+        let id = self.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
         self.jobs.push(Job {
             id,
             pgid,
             statuses: vec![None; pids.len()],
             pids,
             state: JobState::Running,
+            signal: None,
+            notified: false,
+            stop_announced: false,
             command,
         });
         id
@@ -82,6 +134,114 @@ impl JobTable {
 
     pub fn remove(&mut self, id: usize) {
         self.jobs.retain(|j| j.id != id);
+    }
+
+    /// Drops a foreground job once it has been waited for, unless it was
+    /// stopped and so became a background job.
+    pub fn remove_unless_stopped(&mut self, id: usize) {
+        self.jobs
+            .retain(|j| j.id != id || j.state == JobState::Stopped);
+    }
+
+    /// `+` for the current job (the newest), `-` for the previous one, and
+    /// a space for the rest, as `jobs` marks them.
+    #[must_use]
+    pub fn mark(&self, id: usize) -> char {
+        let newer = self.jobs.iter().filter(|j| j.id > id).count();
+        match newer {
+            0 => '+',
+            1 => '-',
+            _ => ' ',
+        }
+    }
+
+    /// One `jobs` line for `job`, laid out as bash does:
+    /// `[1]+  Running                    sleep 9 &`, and with `pid`, the
+    /// process group id after the mark.
+    #[must_use]
+    pub fn describe(&self, job: &Job, pid: bool) -> String {
+        let suffix = if job.state == JobState::Running {
+            " &"
+        } else {
+            ""
+        };
+        let mark = self.mark(job.id);
+        let state = job.state_text();
+        let id = job.id;
+        if pid {
+            format!(
+                "[{id}]{mark} {} {state:<27}{}{suffix}",
+                job.pgid, job.command
+            )
+        } else {
+            job_line(id, mark, &state, &format!("{}{suffix}", job.command))
+        }
+    }
+
+    /// Removes every finished job, returning the lines that announce the
+    /// ones not announced yet.
+    pub fn take_finished(&mut self) -> Vec<String> {
+        let lines = self
+            .jobs
+            .iter()
+            .filter(|j| matches!(j.state, JobState::Done(_)) && !j.notified)
+            .map(|j| self.describe(j, false))
+            .collect();
+        let (done, live) = std::mem::take(&mut self.jobs)
+            .into_iter()
+            .partition(|j| matches!(j.state, JobState::Done(_)));
+        self.jobs = live;
+        for job in done {
+            let statuses = job.pids.iter().zip(&job.statuses);
+            self.forgotten
+                .extend(statuses.filter_map(|(&p, s)| s.map(|s| (p, s))));
+        }
+        let excess = self.forgotten.len().saturating_sub(FORGOTTEN_MAX);
+        self.forgotten.drain(..excess);
+        lines
+    }
+
+    /// The lines announcing the jobs that stopped since they were last
+    /// announced, which marks them announced.
+    pub fn take_stopped(&mut self) -> Vec<String> {
+        let ids: Vec<usize> = self
+            .jobs
+            .iter()
+            .filter(|j| j.state == JobState::Stopped && !j.stop_announced)
+            .map(|j| j.id)
+            .collect();
+        let lines = ids
+            .iter()
+            .filter_map(|id| self.jobs.iter().find(|j| j.id == *id))
+            .map(|j| self.describe(j, false))
+            .collect();
+        for job in &mut self.jobs {
+            if ids.contains(&job.id) {
+                job.stop_announced = true;
+            }
+        }
+        lines
+    }
+
+    /// Records that job `id` was announced as stopped already.
+    pub fn mark_stop_announced(&mut self, id: usize) {
+        if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+            job.stop_announced = true;
+        }
+    }
+
+    /// Records that job `id`'s completion has been announced already.
+    pub fn mark_notified(&mut self, id: usize) {
+        if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+            job.notified = true;
+        }
+    }
+
+    /// The status of `pid` if its job was already reported and removed,
+    /// handed out once.
+    pub fn take_forgotten(&mut self, pid: Pid) -> Option<ExitStatus> {
+        let i = self.forgotten.iter().position(|&(p, _)| p == pid)?;
+        Some(self.forgotten.remove(i).1)
     }
 
     pub fn by_pgid_mut(&mut self, pgid: Pid) -> Option<&mut Job> {
@@ -98,6 +258,9 @@ impl JobTable {
                 self.mark_pid_done(pid, ExitStatus(code));
             } else if let Some(sig) = status.terminating_signal() {
                 self.mark_pid_done(pid, ExitStatus(128 + sig));
+                if let Some(job) = self.jobs.iter_mut().find(|j| j.pids.last() == Some(&pid)) {
+                    job.signal = Some(sig);
+                }
             } else if status.stopped() {
                 self.mark_pid_stopped(pid);
             }
@@ -119,7 +282,13 @@ impl JobTable {
         }
     }
 
-    fn mark_pid_stopped(&mut self, pid: Pid) {
+    /// The job whose last process is `pid`.
+    pub fn by_last_pid_mut(&mut self, pid: Pid) -> Option<&mut Job> {
+        self.jobs.iter_mut().find(|j| j.pids.last() == Some(&pid))
+    }
+
+    /// Records that `pid` stopped, and so its job.
+    pub fn mark_pid_stopped(&mut self, pid: Pid) {
         for job in &mut self.jobs {
             if job.pids.contains(&pid) {
                 job.state = JobState::Stopped;

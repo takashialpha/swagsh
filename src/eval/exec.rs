@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow, bail};
 use rustix::fd::RawFd;
 use rustix::io::Errno;
-use rustix::process::{Pid, WaitOptions, getpid, setpgid, waitpid};
+use rustix::process::{Pid, WaitOptions, getpid, setpgid, wait, waitpid};
 
 use rustix::termios::tcsetpgrp;
 
@@ -13,10 +13,10 @@ use crate::builtins::limits::minutes_seconds;
 use crate::errfmt::{emit, strerror};
 use crate::fd::{
     close_if_open, close_raw, dup2_raw, open_read, open_read_write, open_write,
-    open_write_noclobber, raw_pipe, write_raw,
+    open_write_noclobber, raw_pipe, set_cloexec, write_raw,
 };
-use crate::jobs::{ExitStatus, JobState, decode_wait_status};
-use crate::signal::restore_child_signals;
+use crate::jobs::{ExitStatus, JobState, Waited, decode_wait_status};
+use crate::signal::{first_pending_trap, restore_child_signals};
 use crate::sys::{Fork, cpu_times, execve, fork};
 
 use super::{Resolved, Shell, catch_return, is_break, is_continue, is_return};
@@ -60,12 +60,17 @@ impl Shell {
 
         if n == 1 {
             let mut status = self.run_command(&pipeline.commands[0])?;
+            self.pipestatus.clear();
+            self.pipestatus.push(status.0);
             if pipeline.negated {
                 status = status.negated();
             }
             return Ok(status);
         }
 
+        if self.shopt.lastpipe && !self.monitor {
+            return self.run_pipeline_lastpipe(pipeline);
+        }
         let (pgid, pids) = self.spawn_pipeline(pipeline)?;
         if self.monitor {
             let _ = tcsetpgrp(std::io::stdin(), pgid);
@@ -74,24 +79,25 @@ impl Shell {
         let job_id = if self.monitor {
             Some(
                 self.jobs
-                    .add(pgid, pids.clone(), format!("pipeline ({n} stages)")),
+                    .add(pgid, pids.clone(), describe_pipeline(pipeline)),
             )
         } else {
             None
         };
 
         let mut last_status = ExitStatus::SUCCESS;
+        let mut statuses = Vec::with_capacity(pids.len());
         for child in &pids {
             last_status = self.wait_for_pid(*child)?;
+            statuses.push(last_status.0);
         }
+        self.pipestatus = statuses;
 
         if self.monitor {
             let _ = tcsetpgrp(std::io::stdin(), self.pgid);
             self.restore_terminal();
-            if last_status.0 != 130
-                && let Some(id) = job_id
-            {
-                self.jobs.remove(id);
+            if let Some(id) = job_id {
+                self.jobs.remove_unless_stopped(id);
             }
         }
 
@@ -119,6 +125,71 @@ impl Shell {
         Ok(ExitStatus::SUCCESS)
     }
 
+    /// `{name}>file` and the like: opens the target on a new descriptor of
+    /// 10 or more and sets `name` to its number; `{name}>&-` closes the one
+    /// `name` holds.
+    fn apply_var_redirect(&mut self, r: &Redirect, var: &str) -> Result<()> {
+        let opened = match &r.kind {
+            RedirectKind::Dup => {
+                let target = self.expand_word_to_string(&r.target)?;
+                if target == "-" {
+                    let value = self.expand_var_in(var, false)?;
+                    let fd = value
+                        .parse::<RawFd>()
+                        .map_err(|_| anyhow!("{var}: not a file descriptor"))?;
+                    close_if_open(fd);
+                    return Ok(());
+                }
+                let fd: RawFd = target
+                    .parse()
+                    .map_err(|_| anyhow!("invalid fd: {target}"))?;
+                let new = crate::fd::dup_at_least(fd, 10)
+                    .map_err(|e| anyhow!("{target}: {}", strerror(e)))?;
+                self.assign_target(var, new.to_string())?;
+                return Ok(());
+            }
+            RedirectKind::Out | RedirectKind::Clobber => {
+                self.open_target(&r.target, |p| open_write(p, false))?
+            }
+            RedirectKind::Append => self.open_target(&r.target, |p| open_write(p, true))?,
+            RedirectKind::In => self.open_target(&r.target, open_read)?,
+            RedirectKind::ReadWrite => self.open_target(&r.target, open_read_write)?,
+            _ => bail!("{var}: this redirection cannot pick its own descriptor"),
+        };
+        let new = crate::fd::dup_at_least(opened, 10);
+        close_raw(opened);
+        let new = new.map_err(|e| anyhow!("{var}: {}", strerror(e)))?;
+        self.assign_target(var, new.to_string())?;
+        Ok(())
+    }
+
+    /// `coproc name command`: starts `command` in the background, its input
+    /// and output pipes from and to the shell, and sets `name` to the
+    /// array of the shell's ends, `[0]` to read from and `[1]` to write to,
+    /// and `name_PID` to its pid.
+    pub(super) fn run_coproc(&mut self, name: &str, body: &Command) -> Result<ExitStatus> {
+        let (to_read, to_write) = raw_pipe()?;
+        let (from_read, from_write) = raw_pipe()?;
+        let pid = self.fork_command(body, Some(to_read), Some(from_write), Some(to_write), None)?;
+        close_raw(to_read);
+        close_raw(from_write);
+        // Kept for the shell's own redirections, and from no one else.
+        set_cloexec(to_write);
+        set_cloexec(from_read);
+        let mut array = crate::env::Array::new(false);
+        array.set(crate::env::Key::Index(0), from_read.to_string());
+        array.set(crate::env::Key::Index(1), to_write.to_string());
+        self.env.set_array(name, array)?;
+        self.env
+            .assign(&format!("{name}_PID"), pid.as_raw_nonzero().to_string())?;
+        self.last_bg_pid = Some(pid);
+        let job_id = self.jobs.add(pid, vec![pid], format!("coproc {name}"));
+        if self.monitor {
+            eprintln!("[{job_id}] {pid}");
+        }
+        Ok(ExitStatus::SUCCESS)
+    }
+
     /// Forks every stage of `pipeline`, wiring each stage's stdout to the
     /// next stage's stdin via a pipe, and (under job control) placing them
     /// all in one process group. Returns the first stage's pid, which is
@@ -126,12 +197,24 @@ impl Shell {
     /// in pipeline order. Shared by `run_pipeline` (waits synchronously) and
     /// `run_pipeline_async` (registers a background job and returns).
     fn spawn_pipeline(&mut self, pipeline: &Pipeline) -> Result<(Pid, Vec<Pid>)> {
+        let (pgid, pids, _) = self.spawn_stages(pipeline, pipeline.commands.len())?;
+        Ok((pgid, pids))
+    }
+
+    /// Forks the first `count` stages of `pipeline`. With fewer than all of
+    /// them, also returns the read end of the pipe the last one forked
+    /// writes to, for the caller to run the rest with.
+    fn spawn_stages(
+        &mut self,
+        pipeline: &Pipeline,
+        count: usize,
+    ) -> Result<(Pid, Vec<Pid>, Option<RawFd>)> {
         let n = pipeline.commands.len();
         let mut pgid: Option<Pid> = None;
-        let mut pids = Vec::with_capacity(n);
+        let mut pids = Vec::with_capacity(count);
         let mut prev_read: Option<RawFd> = None;
 
-        for (idx, cmd) in pipeline.commands.iter().enumerate() {
+        for (idx, cmd) in pipeline.commands.iter().enumerate().take(count) {
             let is_last = idx == n - 1;
             let (pipe_read, pipe_write) = if is_last {
                 (None, None)
@@ -160,7 +243,32 @@ impl Shell {
         let Some(pgid) = pgid else {
             bail!("internal error: spawn_pipeline called with an empty pipeline");
         };
-        Ok((pgid, pids))
+        Ok((pgid, pids, prev_read))
+    }
+
+    /// `shopt lastpipe`: the pipeline's last command runs in this shell, its
+    /// input the pipe from the stages before it, so it can set variables.
+    fn run_pipeline_lastpipe(&mut self, pipeline: &Pipeline) -> Result<ExitStatus> {
+        let n = pipeline.commands.len();
+        let (_, pids, read) = self.spawn_stages(pipeline, n - 1)?;
+        let saved = crate::fd::save_fds(&[0])?;
+        if let Some(read) = read {
+            let _ = dup2_raw(read, 0);
+            close_raw(read);
+        }
+        let result = self.run_command(&pipeline.commands[n - 1]);
+        crate::fd::restore_fds(saved)?;
+        let mut statuses = Vec::with_capacity(n);
+        for child in &pids {
+            statuses.push(self.wait_for_pid(*child)?.0);
+        }
+        let mut status = result?;
+        statuses.push(status.0);
+        self.pipestatus = statuses;
+        if pipeline.negated {
+            status = status.negated();
+        }
+        Ok(status)
     }
 
     /// Forks one pipeline stage.
@@ -341,10 +449,8 @@ impl Shell {
                 if self.monitor {
                     let _ = tcsetpgrp(std::io::stdin(), self.pgid);
                     self.restore_terminal();
-                    if status.0 != 130
-                        && let Some(id) = job_id
-                    {
-                        self.jobs.remove(id);
+                    if let Some(id) = job_id {
+                        self.jobs.remove_unless_stopped(id);
                     }
                 }
                 Ok(status)
@@ -458,28 +564,133 @@ impl Shell {
     ///
     /// Returns an error if the underlying `waitpid` syscall fails.
     pub fn wait_for_pid(&mut self, pid: Pid) -> Result<ExitStatus> {
+        if let Some(i) = self.reaped.iter().position(|w| waited_pid(*w) == Some(pid)) {
+            return Ok(match self.reaped.remove(i) {
+                Waited::Exited(_, status) => status,
+                Waited::Stopped(_) | Waited::Trapped(_) => ExitStatus(130),
+            });
+        }
+        // `set -b`: wait for any child, to announce background jobs the
+        // moment they finish rather than after this command.
+        let any = self.notify
+            && self.monitor
+            && self
+                .jobs
+                .iter()
+                .any(|j| j.state == JobState::Running && !j.pids.contains(&pid));
         loop {
-            match waitpid(Some(pid), WaitOptions::UNTRACED) {
-                Ok(Some((_, status))) => {
-                    if let Some(exit) = decode_wait_status(status) {
-                        return Ok(exit);
-                    } else if status.stopped() {
-                        if let Some(job) = self.jobs.by_pgid_mut(pid) {
-                            job.state = JobState::Stopped;
-                            eprintln!("\n[{}]+ Stopped\t{}", job.id, job.command);
-                        }
-                        return Ok(ExitStatus(130));
-                    }
-                }
-                Ok(None) => {}
-                Err(e) if e == Errno::INTR => {}
-                Err(e) => return Err(e.into()),
+            match self.wait_once(if any { None } else { Some(pid) })? {
+                Some(w) if waited_pid(w).is_some_and(|p| p != pid) => self.background_event(w),
+                Some(Waited::Exited(_, status)) => return Ok(status),
+                Some(Waited::Stopped(_)) => return Ok(ExitStatus(130)),
+                Some(Waited::Trapped(_)) | None => {}
             }
+        }
+    }
+
+    /// A child other than the one being waited for changed state: announce
+    /// it if it is a background job's, or keep it for whoever waits for it.
+    fn background_event(&mut self, waited: Waited) {
+        let Some(pid) = waited_pid(waited) else {
+            return;
+        };
+        let Some(id) = self
+            .jobs
+            .iter()
+            .find(|j| j.pids.contains(&pid))
+            .map(|j| j.id)
+        else {
+            // Bounded: a process substitution's child, say, is never
+            // waited for by pid.
+            if self.reaped.len() >= 64 {
+                self.reaped.remove(0);
+            }
+            self.reaped.push(waited);
+            return;
+        };
+        match waited {
+            Waited::Exited(_, status) => self.jobs.mark_pid_done(pid, status),
+            Waited::Stopped(_) => self.jobs.mark_pid_stopped(pid),
+            Waited::Trapped(_) => {}
+        }
+        let Some(job) = self.jobs.iter().find(|j| j.id == id) else {
+            return;
+        };
+        match job.state {
+            JobState::Done(_) => {
+                eprintln!("\n{}", self.jobs.describe(job, false));
+                self.jobs.mark_notified(id);
+            }
+            JobState::Stopped if !job.stop_announced => {
+                eprintln!("\n{}", self.jobs.describe(job, false));
+                self.jobs.mark_stop_announced(id);
+            }
+            _ => {}
+        }
+    }
+
+    /// Waits for `pid`, or with `None` for any child, the way the `wait`
+    /// builtin does: a trapped signal ends the wait early with
+    /// `Waited::Trapped`, leaving the trap pending for the caller to run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying `waitpid` syscall fails, `ECHILD`
+    /// included.
+    pub fn wait_or_trap(&mut self, pid: Option<Pid>) -> Result<Waited> {
+        loop {
+            if let Some(sig) = first_pending_trap() {
+                return Ok(Waited::Trapped(sig));
+            }
+            if let Some(waited) = self.wait_once(pid)? {
+                return Ok(waited);
+            }
+        }
+    }
+
+    /// One `waitpid` call. `None` means it was interrupted by a signal or
+    /// reported nothing, and should be retried.
+    fn wait_once(&mut self, pid: Option<Pid>) -> Result<Option<Waited>> {
+        // `waitpid(None)` would mean only this shell's own process group;
+        // `wait` is any child, background jobs' groups included.
+        let waited = pid.map_or_else(
+            || wait(WaitOptions::UNTRACED),
+            |pid| waitpid(Some(pid), WaitOptions::UNTRACED),
+        );
+        match waited {
+            Ok(Some((pid, status))) => {
+                if let Some(exit) = decode_wait_status(status) {
+                    if let Some(sig) = status.terminating_signal()
+                        && let Some(job) = self.jobs.by_last_pid_mut(pid)
+                    {
+                        job.signal = Some(sig);
+                    }
+                    return Ok(Some(Waited::Exited(pid, exit)));
+                }
+                if status.stopped() {
+                    if let Some(job) = self.jobs.by_pgid_mut(pid) {
+                        job.state = JobState::Stopped;
+                        job.stop_announced = true;
+                    }
+                    if let Some(job) = self.jobs.iter().find(|j| j.pgid == pid) {
+                        eprintln!("\n{}", self.jobs.describe(job, false));
+                    }
+                    return Ok(Some(Waited::Stopped(pid)));
+                }
+                Ok(None)
+            }
+            Ok(None) => Ok(None),
+            Err(e) if e == Errno::INTR => Ok(None),
+            Err(e) => Err(e.into()),
         }
     }
 
     pub(super) fn apply_redirects(&mut self, redirects: &[Redirect]) -> Result<()> {
         for r in redirects {
+            if let Some(var) = &r.fd_var {
+                self.apply_var_redirect(r, var)?;
+                continue;
+            }
             match &r.kind {
                 RedirectKind::Out if self.noclobber => {
                     let fd = self.open_target(&r.target, open_write_noclobber)?;
@@ -631,6 +842,15 @@ fn describe_pipeline(pipeline: &Pipeline) -> String {
     }
 }
 
+/// A simple command as `BASH_COMMAND` shows it.
+pub(super) fn describe_simple(sc: &SimpleCmd) -> String {
+    sc.words
+        .iter()
+        .map(describe_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn describe_command(cmd: &Command) -> String {
     match cmd {
         Command::Simple(sc) => sc
@@ -641,7 +861,11 @@ fn describe_command(cmd: &Command) -> String {
             .join(" "),
         Command::Pipeline(p) => describe_pipeline(p),
         Command::If(_) => "if ...".to_owned(),
-        Command::For(_) => "for ...".to_owned(),
+        Command::For(_) | Command::ArithFor(_) => "for ...".to_owned(),
+        Command::Select(_) => "select ...".to_owned(),
+        Command::Coproc(name, _) => format!("coproc {name}"),
+        Command::Arith(expr) => format!("(({expr}))"),
+        Command::Cond(_) => "[[ ... ]]".to_owned(),
         Command::While(_) => "while ...".to_owned(),
         Command::Case(_) => "case ...".to_owned(),
         Command::Group(gc) if gc.subshell => "(...)".to_owned(),
@@ -657,8 +881,10 @@ fn describe_word(word: &Word) -> String {
         Word::Var(name) => format!("${name}"),
         Word::Arith(expr) => format!("$(({expr}))"),
         Word::CmdSub(_) => "$(...)".to_owned(),
+        Word::ProcSub { output, .. } => if *output { ">(...)" } else { "<(...)" }.to_owned(),
         Word::Compound(parts) => parts.iter().map(describe_word).collect(),
         Word::Quoted(inner) => describe_word(inner),
+        Word::Assign(assign) => format!("{}=...", assign.name),
     }
 }
 
@@ -788,4 +1014,12 @@ fn move_fd(fd: RawFd, target: RawFd) -> Result<()> {
     dup2_raw(fd, target)?;
     close_raw(fd);
     Ok(())
+}
+
+/// The child a [`Waited`] is about, unless it is a trap.
+const fn waited_pid(waited: Waited) -> Option<Pid> {
+    match waited {
+        Waited::Exited(pid, _) | Waited::Stopped(pid) => Some(pid),
+        Waited::Trapped(_) => None,
+    }
 }

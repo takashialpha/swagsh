@@ -13,8 +13,11 @@ use crate::errfmt::emit;
 use crate::eval::{Shell, is_interrupted};
 use crate::jobs::ExitStatus;
 use crate::parser::{Aliases, ParseError};
-use crate::prompt::{build_prompt, history_file};
+use crate::prompt::{build_prompt, continuation_prompt, history_file};
 use crate::signal::take_interrupted;
+
+mod histexpand;
+mod notify;
 
 /// # Errors
 ///
@@ -45,19 +48,26 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
 
     let mut exit_code = None;
     loop {
-        let prompt = build_prompt(&shell);
-
-        match rl.readline(&prompt) {
+        announce_jobs(&mut shell);
+        let input = read_line(&mut shell, &mut rl);
+        match input {
             Ok(line) => {
-                let line = line.trim();
+                let line = line.trim().to_owned();
                 if line.is_empty() {
                     continue;
                 }
+                let Some(line) = expand_history(&mut shell, &mut rl, line, cli.private) else {
+                    continue;
+                };
+                let line = line.as_str();
 
                 take_interrupted();
-                let (full_text, program_result) = read_program(line, &mut rl, &shell.env.aliases());
+                shell.command_number += 1;
+                let ps2 = continuation_prompt(&mut shell);
+                let (full_text, program_result) =
+                    read_program(line, &mut rl, &shell.env.aliases(), &ps2);
                 if shell.verbose {
-                    eprintln!("{full_text}");
+                    eprint!("{full_text}");
                 }
                 // Recorded once the whole (possibly multi-line) command has
                 // been read, as one entry holding every line, rather than
@@ -95,7 +105,6 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
                         let _ = rl.add_history_entry(entry.as_str());
                     }
                 }
-                shell.jobs.reap_nonblocking();
                 // `print!`/`echo -n`/`printf` never end in `\n`, so Rust's
                 // line-buffered stdout can leave their output sitting
                 // unflushed until something *else* happens to write a
@@ -128,14 +137,83 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
         }
     }
 
+    let save = |rl: &mut DefaultEditor, p: &std::path::Path| {
+        if shell.shopt.histappend {
+            rl.append_history(p)
+        } else {
+            rl.save_history(p)
+        }
+    };
     if !cli.private
         && let Some(ref p) = history_path
-        && let Err(e) = rl.save_history(p)
+        && let Err(e) = save(&mut rl, p)
     {
         emit(format!("history: could not save to {}: {e}", p.display()));
     }
     let code = exit_code.unwrap_or(shell.last_status.0);
     shell.exit(code)
+}
+
+/// Reports the jobs that stopped or finished, before a prompt.
+fn announce_jobs(shell: &mut Shell) {
+    shell.jobs.reap_nonblocking();
+    if shell.monitor {
+        for line in shell.jobs.take_stopped() {
+            eprintln!("{line}");
+        }
+        for line in shell.jobs.take_finished() {
+            eprintln!("{line}");
+        }
+    }
+}
+
+/// Shows the prompt and reads a line, announcing jobs meanwhile under
+/// `set -b`.
+fn read_line(shell: &mut Shell, rl: &mut DefaultEditor) -> rustyline::Result<String> {
+    let prompt = build_prompt(shell);
+    let watcher = notify::Watcher::start(shell, rl);
+    let input = rl.readline(&prompt);
+    if let Some(watcher) = watcher {
+        let announced = watcher.finish();
+        for id in announced.done {
+            shell.jobs.mark_notified(id);
+        }
+        for id in announced.stopped {
+            shell.jobs.mark_stop_announced(id);
+        }
+    }
+    input
+}
+
+/// `line` after history expansion (`set -H`), shown when it changed.
+/// `None` when there is nothing to run: an expansion failed, or `:p` only
+/// asked to see it.
+fn expand_history(
+    shell: &mut Shell,
+    rl: &mut DefaultEditor,
+    line: String,
+    private: bool,
+) -> Option<String> {
+    if !shell.histexpand {
+        return Some(line);
+    }
+    match histexpand::expand(&line, &shell.history) {
+        Ok(None) => Some(line),
+        Ok(Some(expanded)) => {
+            println!("{}", expanded.line);
+            if expanded.print_only {
+                if !private && rl.add_history_entry(&expanded.line).unwrap_or(false) {
+                    shell.history.push(expanded.line);
+                }
+                return None;
+            }
+            Some(expanded.line)
+        }
+        Err(msg) => {
+            emit(msg);
+            None
+        }
+    }
 }
 
 /// Sources the profile (login), then `$ENV` and the rc file (interactive).
@@ -191,42 +269,39 @@ fn source_if_exists(shell: &mut Shell, path: &std::path::Path) {
 }
 
 /// Reads `first_line` plus as many further lines as needed for it to parse
-/// as a complete `Program`, printing rustyline's `> ` prompt for each one.
-/// Generalizes what heredoc collection already did for `<<`/`<<-` bodies
-/// specifically: try to parse, and if the only problem is that the parser
-/// ran out of input mid-construct (`ParseError::incomplete`, an unclosed
-/// `if`/`while`/`for`/`case`/`{`/`(`, or an unterminated quote), read one
-/// more line and retry instead of reporting a hard error immediately.
-/// Heredoc bodies are still special-cased per line via
-/// `collect_heredoc_input`, since their content is raw text that isn't
-/// meant to be parsed as shell syntax itself. A trailing `\` is also
-/// special-cased via `join_backslash_continuations`: unlike the other
-/// three, it's a *lexical* join of two physical lines into one; by the
-/// time it reaches the parser as `Token::Eof`-vs-real-token, `readline()`
-/// has already stripped the newline it needed to see, so there's no
-/// `incomplete` signal to react to, and it has to be resolved before
-/// parsing is even attempted.
-/// Returns the full raw text read (every physical line, joined by `\n`)
-/// alongside the parse result, so the caller can record the *whole* command
-/// as a single history entry regardless of how many lines it took.
+/// as a complete `Program`, printing the continuation prompt (`$PS2`) for each one.
+///
+/// Whenever the only problem is that the input ran out mid-construct
+/// (`ParseError::incomplete`: an unclosed `if`/`while`/`for`/`case`/`{`/`(`,
+/// an unterminated quote, or a here-document still waiting for its
+/// delimiter, whether its `<<` was typed or came from an alias), one more
+/// line is read and the whole text parsed again. A line inside a
+/// here-document is taken as it stands; any other line first has its
+/// trailing `\` continuations joined (see `join_backslash_continuations`).
+///
+/// Returns the full text read, every physical line joined by `\n`, so the
+/// caller can record the whole command as a single history entry.
 fn read_program(
     first_line: &str,
     rl: &mut DefaultEditor,
     aliases: &Rc<Aliases>,
+    ps2: &str,
 ) -> (String, Result<Program, ParseError>) {
-    let mut buf = collect_heredoc_input(&join_backslash_continuations(first_line, rl), rl);
+    let mut buf = join_backslash_continuations(first_line, rl, ps2);
+    buf.push('\n');
     loop {
         match crate::parser::parse_with_aliases(&buf, Rc::clone(aliases)) {
             Ok(program) => return (buf, Ok(program)),
             Err(e) if e.incomplete => {
-                let Ok(next_line) = rl.readline("> ") else {
+                let Ok(next_line) = rl.readline(ps2) else {
                     return (buf, Err(e));
                 };
-                let next_line = join_backslash_continuations(&next_line, rl);
-                if !buf.ends_with('\n') {
-                    buf.push('\n');
+                if e.in_heredoc {
+                    buf.push_str(&next_line);
+                } else {
+                    buf.push_str(&join_backslash_continuations(&next_line, rl, ps2));
                 }
-                buf.push_str(&collect_heredoc_input(&next_line, rl));
+                buf.push('\n');
             }
             Err(e) => return (buf, Err(e)),
         }
@@ -241,83 +316,12 @@ fn read_program(
 /// number means they're literal escaped backslashes and the line really
 /// does end there, the same rule the lexer itself would apply if this
 /// were one contiguous buffer instead of one `readline()` call per line.
-fn join_backslash_continuations(line: &str, rl: &mut DefaultEditor) -> String {
+fn join_backslash_continuations(line: &str, rl: &mut DefaultEditor, ps2: &str) -> String {
     let mut line = line.to_owned();
     while line.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1 {
         line.pop();
-        let Ok(next) = rl.readline("> ") else { break };
+        let Ok(next) = rl.readline(ps2) else { break };
         line.push_str(&next);
     }
     line
-}
-
-fn collect_heredoc_input(line: &str, rl: &mut DefaultEditor) -> String {
-    let delimiters = extract_heredoc_delimiters(line);
-    if delimiters.is_empty() {
-        return line.to_owned();
-    }
-
-    let mut buf = line.to_owned();
-    buf.push('\n');
-
-    for (delim, strip_tabs) in delimiters {
-        while let Ok(body_line) = rl.readline("> ") {
-            buf.push_str(&body_line);
-            buf.push('\n');
-            let check = body_line.trim_end_matches('\r');
-            let check = if strip_tabs {
-                check.trim_start_matches('\t')
-            } else {
-                check
-            };
-            if check == delim {
-                break;
-            }
-        }
-    }
-    buf
-}
-
-/// Returns each here-doc's delimiter, with quoting removed, and whether it
-/// came from `<<-`.
-fn extract_heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
-    let mut delims = Vec::new();
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '#' {
-            break;
-        }
-        if c == '<' && chars.peek() == Some(&'<') {
-            chars.next();
-            let strip_tabs = chars.next_if_eq(&'-').is_some();
-            // skip <<< (herestring, not heredoc)
-            if chars.peek() == Some(&'<') {
-                chars.next();
-                continue;
-            }
-            while matches!(chars.peek(), Some(' ' | '\t')) {
-                chars.next();
-            }
-            let mut delim = String::new();
-            let mut quote = None;
-            while let Some(ch) = chars.next() {
-                match (quote, ch) {
-                    (None, '\'' | '"') => quote = Some(ch),
-                    (Some(q), _) if ch == q => quote = None,
-                    (None, '\\') => delim.extend(chars.next()),
-                    (None, _)
-                        if ch.is_whitespace()
-                            || matches!(ch, ';' | '|' | '&' | '<' | '>' | '(' | ')') =>
-                    {
-                        break;
-                    }
-                    _ => delim.push(ch),
-                }
-            }
-            if !delim.is_empty() {
-                delims.push((delim, strip_tabs));
-            }
-        }
-    }
-    delims
 }
