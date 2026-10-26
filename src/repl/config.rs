@@ -12,7 +12,10 @@ use crate::env::Env;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub banner: Banner,
+    pub prompt: Prompt,
     pub editor: Editor,
+    pub completion: Completion,
+    pub suggestions: Suggestions,
     pub highlight: Highlight,
     pub history: History,
 }
@@ -44,26 +47,144 @@ pub enum Keys {
     Vi,
 }
 
-/// Editing the line being typed.
+/// The prompt, and how the line typed at it is edited.
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct Editor {
+pub struct Prompt {
     /// `set -o vi` and `set -o emacs` change it from the shell.
     pub keys: Keys,
-    /// The editor program Ctrl-X Ctrl-E (`v` with vi keys) and `fc` open,
-    /// with arguments if it needs them; empty for `$VISUAL`, then
-    /// `$EDITOR`, then `vi`.
-    pub command: String,
-    /// Suggest the rest of a line from history, in grey, as it is typed.
-    pub suggestions: bool,
+    /// The prompt, written as `$PS1` is, with `\g` for git and `\c` for
+    /// how long the last command took; empty for swagsh's own. `$PS1`
+    /// comes first when it is set.
+    pub format: String,
+    /// Whether swagsh's own prompt puts its symbol on a line of its own,
+    /// under the directory and the rest.
+    pub newline: bool,
+    /// What swagsh's own prompt ends in.
+    pub symbol: String,
+    pub directory: String,
+    /// The symbol after a command that worked.
+    pub success: String,
+    /// The symbol after a command that failed.
+    pub failure: String,
+    pub git: Git,
+    pub duration: Duration,
 }
 
-impl Default for Editor {
+impl Default for Prompt {
     fn default() -> Self {
         Self {
             keys: Keys::Emacs,
-            command: String::new(),
-            suggestions: true,
+            format: String::new(),
+            newline: true,
+            symbol: "❯".to_owned(),
+            directory: "bold cyan".to_owned(),
+            success: "bold green".to_owned(),
+            failure: "bold red".to_owned(),
+            git: Git::default(),
+            duration: Duration::default(),
+        }
+    }
+}
+
+/// The editor program a line can be opened in.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Editor {
+    /// The program Ctrl-X Ctrl-E (`v` with vi keys) and `fc` open, with
+    /// arguments if it needs them; empty for `$VISUAL`, then `$EDITOR`,
+    /// then `vi`.
+    pub command: String,
+}
+
+/// Whether completion tells capitals from small letters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Case {
+    /// Not unless the word typed has a capital.
+    #[default]
+    Smart,
+    Sensitive,
+    Insensitive,
+}
+
+/// How long the last command took, shown when it took long.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Duration {
+    pub enabled: bool,
+    /// The fewest seconds worth showing.
+    pub min: f64,
+    pub color: String,
+}
+
+impl Default for Duration {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min: 2.0,
+            color: "yellow".to_owned(),
+        }
+    }
+}
+
+/// Tab completion.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Completion {
+    pub case: Case,
+    /// Complete the options of other programs, read from their man pages.
+    pub man: bool,
+}
+
+impl Default for Completion {
+    fn default() -> Self {
+        Self {
+            case: Case::Smart,
+            man: true,
+        }
+    }
+}
+
+/// The rest of the line, suggested in grey as it is typed.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Suggestions {
+    pub enabled: bool,
+    /// From the commands typed before, leaving out those naming a command
+    /// or file that is no longer there.
+    pub history: bool,
+    /// Else the rest of a word that has one completion.
+    pub completions: bool,
+}
+
+impl Default for Suggestions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            history: true,
+            completions: true,
+        }
+    }
+}
+
+/// What the prompt shows of the git repository it is in.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Git {
+    /// Show the branch, read from `.git` without running git.
+    pub enabled: bool,
+    /// Also show its state, from `git status`, which runs at each prompt.
+    pub status: bool,
+    pub color: String,
+}
+
+impl Default for Git {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            status: true,
+            color: "magenta".to_owned(),
         }
     }
 }
@@ -156,12 +277,43 @@ pub const TEMPLATE: &str = r#"# swagsh's settings for interactive use. Scripts n
 enabled = true       # the logo and version at startup
 tips = true          # and a tip next to them
 
+[prompt]
+keys = "emacs"       # how the line is edited: "emacs" or "vi"; `set -o vi`
+                     # and `set -o emacs` switch too
+format = ""          # the prompt, written as $PS1 is, with \g for git and \c
+                     # for how long the last command took; empty for
+                     # swagsh's own. $PS1 comes first when it is set
+newline = true       # swagsh's own prompt: the symbol on a line of its own
+symbol = "❯"         # what swagsh's own prompt ends in
+directory = "bold cyan"
+success = "bold green"  # the symbol after a command that worked
+failure = "bold red"    # and after one that failed
+
+[prompt.git]
+enabled = true       # the branch, inside a repository
+status = true        # and its state: * changed, + staged, ? untracked,
+                     # ↑ ahead, ↓ behind; this runs `git status` each prompt
+color = "magenta"
+
+[prompt.duration]
+enabled = true       # how long the last command took
+min = 2.0            # if it took at least this many seconds
+color = "yellow"
+
 [editor]
-keys = "emacs"       # or "vi"; `set -o vi` and `set -o emacs` switch too
-command = ""         # the editor for Ctrl-X Ctrl-E (`v` with vi keys) and fc,
-                     # such as "nvim" or "code --wait"; empty for $VISUAL,
-                     # then $EDITOR, then vi
-suggestions = true   # the rest of a line from history, in grey; Right takes it
+command = ""         # the program Ctrl-X Ctrl-E (`v` with vi keys) and fc
+                     # open, such as "nvim" or "code --wait"; empty for
+                     # $VISUAL, then $EDITOR, then vi
+
+[completion]
+case = "smart"       # ignore case unless the word has a capital; or
+                     # "sensitive", or "insensitive"
+man = true           # complete other programs' options from their man pages
+
+[suggestions]        # the rest of the line, in grey, as you type; Right takes it
+enabled = true
+history = true       # from commands typed before, if what they name still exists
+completions = true   # else the rest of a word with only one completion
 
 [highlight]
 enabled = true
@@ -242,9 +394,27 @@ pub fn load(env: &Env) -> (Config, Option<String>) {
             );
         }
     };
-    match config.highlight.check() {
+    match config.check() {
         Ok(()) => (config, None),
         Err(e) => (Config::default(), Some(format!("{}: {e}", path.display()))),
+    }
+}
+
+impl Config {
+    /// An error naming the first color that is not a style.
+    fn check(&self) -> Result<(), String> {
+        let p = &self.prompt;
+        let others = [
+            ("prompt.directory", &p.directory),
+            ("prompt.success", &p.success),
+            ("prompt.failure", &p.failure),
+            ("prompt.git.color", &p.git.color),
+            ("prompt.duration.color", &p.duration.color),
+        ];
+        for (key, value) in others {
+            ansi(value).map_err(|e| format!("{key}: {e}"))?;
+        }
+        self.highlight.check()
     }
 }
 

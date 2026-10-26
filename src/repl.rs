@@ -23,9 +23,11 @@ use crate::signal::take_interrupted;
 
 pub mod banner;
 pub mod config;
+pub mod git;
 mod helper;
 pub mod highlight;
 pub mod histexpand;
+mod manpage;
 mod notify;
 mod pager;
 
@@ -47,10 +49,12 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
     }
 
     let mut exit_code = None;
+    // How long the last command ran, for the prompt.
+    let mut took = None;
     loop {
         announce_jobs(&mut shell);
         rl.set_edit_mode(edit_mode(&shell));
-        let prompt = build_prompt(&mut shell);
+        let prompt = build_prompt(&mut shell, &settings.prompt, took.take());
         let input = read_line(&mut shell, &mut rl, &prompt, true);
         match input {
             Ok(line) => {
@@ -87,9 +91,10 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
                 match program_result {
                     Err(e) => emit(e),
                     Ok(program) => {
-                        if !cli.no_execute
-                            && let Err(e) = shell.run_program(&program)
-                        {
+                        let started = std::time::Instant::now();
+                        let result = (!cli.no_execute).then(|| shell.run_program(&program));
+                        took = Some(started.elapsed());
+                        if let Some(Err(e)) = result {
                             if let Some(ExitRequest(code)) = e.downcast_ref() {
                                 exit_code = Some(*code);
                                 break;
@@ -167,7 +172,7 @@ fn start(shell: &mut Shell) -> Result<(config::Config, LineEditor)> {
     }
     shell.vi = shell
         .vi
-        .or_else(|| Some(settings.editor.keys == config::Keys::Vi));
+        .or_else(|| Some(settings.prompt.keys == config::Keys::Vi));
     shell.editor = Some(settings.editor.command.trim().to_owned()).filter(|c| !c.is_empty());
     let rl = line_editor(shell, &settings)?;
     let color = std::io::stdout().is_terminal() && shell.env.get("NO_COLOR").is_none();

@@ -1,5 +1,5 @@
 //! What the line editor asks of the shell while a line is typed: Tab
-//! completion, syntax highlighting, and suggestions from history.
+//! completion, syntax highlighting, and suggestions as it is typed.
 //!
 //! The editor holds this helper while the shell waits for input, so the
 //! helper keeps its own copy of what it needs from the shell (functions,
@@ -11,6 +11,8 @@
 //! the line again.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -18,15 +20,17 @@ use std::time::SystemTime;
 
 use rustyline::completion::{Completer, Pair, longest_common_prefix};
 use rustyline::highlight::{CmdKind, Highlighter};
-use rustyline::hint::{Hinter, HistoryHinter};
+use rustyline::hint::Hinter;
+use rustyline::history::SearchDirection;
 use rustyline::validate::Validator;
 use rustyline::{
     Cmd, ConditionalEventHandler, Context, EditMode, Event, EventContext, Helper, InputMode,
     RepeatCount,
 };
 
-use super::config::{Config, ansi};
-use super::highlight::{self, KEYWORDS, Lookup, Styles};
+use super::config::{Case, Config, Suggestions, ansi};
+use super::highlight::{self, KEYWORDS, Kind, Lookup, Styles};
+use super::manpage::{self, Page};
 use crate::eval::Shell;
 
 /// The names the shell knows, as of the last prompt.
@@ -45,6 +49,12 @@ struct Names {
     programs_from: (String, Vec<Option<SystemTime>>),
     /// At a continuation prompt, the lines already read of the command.
     context: String,
+    case: Case,
+    /// Whether to read other programs' options from their man pages.
+    man: bool,
+    manpath: Option<String>,
+    /// The man pages read so far, by name; `None` for one there is not.
+    man_pages: RefCell<HashMap<String, Option<Arc<Page>>>>,
 }
 
 impl Names {
@@ -158,8 +168,7 @@ pub struct ShellHelper {
     request: Shared<Option<Request>>,
     /// `None` with highlighting off.
     styles: Option<Styles>,
-    suggestions: bool,
-    hinter: HistoryHinter,
+    suggestions: Suggestions,
 }
 
 impl ShellHelper {
@@ -184,11 +193,18 @@ impl ShellHelper {
             suggestion: style(&h.suggestion),
         });
         Self {
-            names: Shared::default(),
+            names: Arc::new(Mutex::new(Names {
+                case: config.completion.case,
+                man: config.completion.man,
+                ..Names::default()
+            })),
             request: Shared::default(),
             styles,
-            suggestions: config.editor.suggestions,
-            hinter: HistoryHinter::new(),
+            suggestions: Suggestions {
+                enabled: config.suggestions.enabled,
+                history: config.suggestions.history,
+                completions: config.suggestions.completions,
+            },
         }
     }
 
@@ -217,6 +233,7 @@ impl ShellHelper {
         names.variables.dedup_by(|a, b| a.0 == b.0);
         names.home = env.get("HOME").filter(|h| !h.is_empty());
         names.autocd = shell.shopt.autocd;
+        names.manpath = env.get("MANPATH");
         names.refresh_programs(&env.get_or_empty("PATH"));
     }
 
@@ -297,23 +314,35 @@ impl ConditionalEventHandler for EditKey {
     }
 }
 
-/// The items whose names `word` completes: those starting with it; else,
-/// ignoring case, those starting with it; else those containing it.
-fn matching<T>(mut items: Vec<T>, word: &str, name: impl Fn(&T) -> &str) -> Vec<T> {
-    if items.iter().any(|t| name(t).starts_with(word)) {
-        items.retain(|t| name(t).starts_with(word));
-        return items;
+/// The items whose names `word` completes: those starting with it, or
+/// failing that, those containing it. `case` says whether a capital matches
+/// a small letter; a word with a capital matching nothing also tries
+/// ignoring case under [`Case::Smart`].
+fn matching<T>(mut items: Vec<T>, word: &str, case: Case, name: impl Fn(&T) -> &str) -> Vec<T> {
+    let capital = word.chars().any(char::is_uppercase);
+    // Each way of matching, tried in turn: (ignoring case, anywhere in the name).
+    let tiers: &[(bool, bool)] = match case {
+        Case::Sensitive => &[(false, false), (false, true)],
+        Case::Smart if capital => &[(false, false), (true, false), (true, true)],
+        Case::Smart | Case::Insensitive => &[(true, false), (true, true)],
+    };
+    let lower = word.to_lowercase();
+    for &(fold, anywhere) in tiers {
+        let matches = |t: &T| {
+            let name = name(t);
+            match (fold, anywhere) {
+                (false, false) => name.starts_with(word),
+                (false, true) => name.contains(word),
+                (true, false) => name.to_lowercase().starts_with(&lower),
+                (true, true) => name.to_lowercase().contains(&lower),
+            }
+        };
+        if items.iter().any(matches) {
+            items.retain(matches);
+            return items;
+        }
     }
-    let word = word.to_lowercase();
-    if items
-        .iter()
-        .any(|t| name(t).to_lowercase().starts_with(&word))
-    {
-        items.retain(|t| name(t).to_lowercase().starts_with(&word));
-    } else {
-        items.retain(|t| name(t).to_lowercase().contains(&word));
-    }
-    items
+    Vec::new()
 }
 
 /// The characters a completed word escapes with a backslash.
@@ -357,7 +386,7 @@ impl Names {
             .collect();
         found.sort_unstable();
         found.dedup();
-        matching(found, prefix, |name| name)
+        matching(found, prefix, self.case, |name| name)
             .into_iter()
             .map(|name| Pair {
                 display: name.to_owned(),
@@ -372,7 +401,7 @@ impl Names {
             .iter()
             .map(|(name, _)| name.as_str())
             .collect();
-        matching(names, prefix, |name| name)
+        matching(names, prefix, self.case, |name| name)
             .into_iter()
             .map(|name| Pair {
                 display: name.to_owned(),
@@ -381,33 +410,177 @@ impl Names {
             .collect()
     }
 
-    fn options(command: &str, prefix: &str) -> Vec<Pair> {
-        let Some(&(_, _, page)) = crate::builtins::BUILTINS
-            .iter()
-            .find(|(name, ..)| *name == command)
-        else {
+    /// The options of `command` starting with `prefix`: a builtin's from
+    /// its help page, another program's from its man page. For a command
+    /// with subcommands, such as `git commit`, `sub` is the subcommand,
+    /// whose page is `git-commit`.
+    fn options(&self, command: &str, sub: Option<&str>, prefix: &str) -> Vec<Pair> {
+        let entries: Vec<(String, String, String)> = if let Some(&(_, _, page)) =
+            crate::builtins::BUILTINS
+                .iter()
+                .find(|(name, ..)| *name == command)
+        {
+            page()
+                .options
+                .into_iter()
+                .filter_map(|(flag, what)| {
+                    Some((flag.split_whitespace().next()?.to_owned(), flag, what))
+                })
+                .collect()
+        } else if let Some(page) = self.man_page_for(command, sub) {
+            page.options
+                .iter()
+                .flat_map(|o| {
+                    o.words
+                        .iter()
+                        .map(|w| (w.clone(), o.tag.clone(), o.what.clone()))
+                })
+                .collect()
+        } else {
             return Vec::new();
         };
-        let page = page();
-        let width = page.options.iter().map(|(f, _)| f.len()).max().unwrap_or(0);
-        let options: Vec<(&str, &str, &str)> = page
-            .options
+        let mut found = matching(entries, prefix, self.case, |(word, ..)| word);
+        // An option spelled two ways is listed once.
+        let mut seen = std::collections::HashSet::new();
+        found.retain(|(_, tag, _)| seen.insert(tag.clone()));
+        let width = found
             .iter()
-            .filter_map(|(flag, what)| {
-                Some((
-                    flag.split_whitespace().next()?,
-                    flag.as_str(),
-                    what.as_str(),
-                ))
-            })
-            .collect();
-        matching(options, prefix, |&(word, ..)| word)
+            .map(|(_, tag, _)| tag.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(30);
+        found
             .into_iter()
-            .map(|(word, flag, what)| Pair {
-                display: format!("{flag:<width$}  {what}"),
+            .map(|(word, tag, what)| Pair {
+                display: format!("{tag:<width$}  {what}"),
                 replacement: format!("{word} "),
             })
             .collect()
+    }
+
+    /// The man page `name`, read once.
+    fn man_page(&self, name: &str) -> Option<Arc<Page>> {
+        if let Some(page) = self.man_pages.borrow().get(name) {
+            return page.clone();
+        }
+        let page =
+            manpage::page(name, &self.programs_from.0, self.manpath.as_deref()).map(Arc::new);
+        self.man_pages
+            .borrow_mut()
+            .insert(name.to_owned(), page.clone());
+        page
+    }
+
+    /// The man page of `command`, or of its subcommand `sub` when that has
+    /// one (`git-commit`); `None` with man pages turned off.
+    fn man_page_for(&self, command: &str, sub: Option<&str>) -> Option<Arc<Page>> {
+        if !self.man {
+            return None;
+        }
+        let command = command.rsplit('/').next().unwrap_or(command);
+        sub.and_then(|sub| self.man_page(&format!("{command}-{sub}")))
+            .or_else(|| self.man_page(command))
+    }
+
+    /// Whether `command` (with subcommand `sub`) takes operands besides
+    /// its options, as its usage or man page says; `None` when neither
+    /// says.
+    fn takes_operands(&self, command: &str, sub: Option<&str>) -> Option<bool> {
+        if let Some(&(_, _, page)) = crate::builtins::BUILTINS
+            .iter()
+            .find(|(name, ..)| *name == command)
+        {
+            return Some(manpage::takes_operands(&page().usage, command));
+        }
+        self.man_page_for(command, sub).map(|page| page.operands)
+    }
+
+    /// Whether history entry `entry` could still run as it did: every
+    /// command it names exists, and so does every path it names.
+    fn still_valid(&self, entry: &str) -> bool {
+        let scan = highlight::scan(entry, self);
+        if scan.spans.iter().any(|span| span.kind == Kind::Unknown) {
+            return false;
+        }
+        let mut after_cd = false;
+        for &(start, end, command) in &scan.words {
+            let word = unescape(&entry[start..end]);
+            if command {
+                after_cd = matches!(word.as_str(), "cd" | "pushd");
+                continue;
+            }
+            let expands = word.contains(['$', '`', '*', '?', '[', '{', '\'', '"']);
+            if expands || word.starts_with('-') || word.contains("://") {
+                after_cd = false;
+                continue;
+            }
+            let path = match (word.strip_prefix("~/"), &self.home) {
+                (Some(rest), Some(home)) => Path::new(home).join(rest),
+                _ => PathBuf::from(&word),
+            };
+            if after_cd && !path.is_dir() || word.contains('/') && !path.exists() {
+                return false;
+            }
+            after_cd = false;
+        }
+        true
+    }
+
+    /// The rest of a command from history that starts with `line`, the
+    /// newest one that is still valid.
+    fn history_hint(&self, line: &str, ctx: &Context<'_>) -> Option<String> {
+        let history = ctx.history();
+        let mut start = if ctx.history_index() == history.len() {
+            history.len().checked_sub(1)?
+        } else {
+            ctx.history_index()
+        };
+        // Enough to look past a few stale entries, without slowing typing.
+        for _ in 0..200 {
+            let found = history
+                .starts_with(line, start, SearchDirection::Reverse)
+                .ok()??;
+            if found.entry.len() > line.len() && self.still_valid(&found.entry) {
+                return Some(found.entry[line.len()..].to_owned());
+            }
+            start = found.idx.checked_sub(1)?;
+        }
+        None
+    }
+
+    /// The rest of the word before `pos`, when it has one completion. Not
+    /// for a word not yet started, or a command's name, which are left to
+    /// history.
+    fn completion_hint(&self, line: &str, pos: usize) -> Option<String> {
+        let start = word_start(line, pos);
+        if start == pos || self.is_command_word(line, start) {
+            return None;
+        }
+        let (start, candidates) = self.complete(line, pos);
+        let [only] = candidates.as_slice() else {
+            return None;
+        };
+        let typed = &line[start..pos];
+        let rest = only.replacement.trim_end_matches(' ').strip_prefix(typed)?;
+        (!rest.is_empty()).then(|| rest.to_owned())
+    }
+
+    /// The scan of the command up to the word starting at `start` of
+    /// `line`, with a word standing in for that one, and where that word is
+    /// in it.
+    fn probe(&self, line: &str, start: usize) -> (String, usize, highlight::Scan) {
+        let probe = format!("{}{}x", self.context, &line[..start]);
+        let at = self.context.len() + start;
+        let scan = highlight::scan(&probe, self);
+        (probe, at, scan)
+    }
+
+    /// Whether the word starting at `start` of `line` is a command's name.
+    fn is_command_word(&self, line: &str, start: usize) -> bool {
+        let (_, at, scan) = self.probe(line, start);
+        scan.words
+            .last()
+            .is_some_and(|&(s, _, command)| s == at && command)
     }
 
     /// The files whose names complete `word`, a path as typed; only
@@ -437,7 +610,7 @@ impl Names {
             })
             .collect();
         found.sort_unstable();
-        matching(found, &prefix, |(name, _)| name)
+        matching(found, &prefix, self.case, |(name, _)| name)
             .into_iter()
             .map(|(name, is_dir)| Pair {
                 display: if is_dir {
@@ -517,9 +690,7 @@ impl Names {
         }
         // The scan of what comes before, with a word standing in for this
         // one, tells whether it is a command and which command it is for.
-        let probe = format!("{}{}x", self.context, &line[..start]);
-        let at = self.context.len() + start;
-        let scan = highlight::scan(&probe, self);
+        let (probe, at, scan) = self.probe(line, start);
         let is_command = scan
             .words
             .last()
@@ -527,14 +698,21 @@ impl Names {
         if is_command && !word.contains('/') {
             return (start, self.commands(word));
         }
-        let command = scan
+        let command_at = scan
             .words
             .iter()
-            .rev()
-            .find(|&&(s, _, command)| command && s < at)
-            .map_or("", |&(s, e, _)| &probe[s..e]);
+            .rposition(|&(s, _, command)| command && s < at);
+        let command = command_at.map_or("", |i| &probe[scan.words[i].0..scan.words[i].1]);
+        // The first word after the command that is not an option.
+        let sub = command_at.and_then(|i| {
+            scan.words[i + 1..]
+                .iter()
+                .filter(|&&(s, ..)| s < at)
+                .map(|&(s, e, _)| &probe[s..e])
+                .find(|w| !w.starts_with('-'))
+        });
         if word.starts_with('-') {
-            let options = Self::options(command, word);
+            let options = self.options(command, sub, word);
             if !options.is_empty() {
                 return (start, options);
             }
@@ -547,6 +725,16 @@ impl Names {
             }
             if matches!(command, "type" | "which" | "man" | "hash") {
                 return (start, self.commands(word));
+            }
+        }
+        // A command that takes nothing but options offers them at once.
+        if word.is_empty()
+            && !command.is_empty()
+            && self.takes_operands(command, sub) == Some(false)
+        {
+            let options = self.options(command, sub, "");
+            if !options.is_empty() {
+                return (start, options);
             }
         }
         if TAKES_VARIABLES.contains(&command) && !word.contains('/') {
@@ -573,11 +761,25 @@ impl Hinter for ShellHelper {
     type Hint = String;
 
     fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<String> {
-        if self.suggestions && lock(&self.names).context.is_empty() {
-            self.hinter.hint(line, pos, ctx)
-        } else {
-            None
+        let s = &self.suggestions;
+        if !s.enabled || line.is_empty() || pos < line.len() {
+            return None;
         }
+        let names = lock(&self.names);
+        if !names.context.is_empty() {
+            return None;
+        }
+        let hint = s
+            .history
+            .then(|| names.history_hint(line, ctx))
+            .flatten()
+            .or_else(|| {
+                s.completions
+                    .then(|| names.completion_hint(line, pos))
+                    .flatten()
+            });
+        drop(names);
+        hint
     }
 }
 

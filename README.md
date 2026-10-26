@@ -73,7 +73,7 @@ Background jobs, `fg`/`bg`, signals and completion notices.
 
 💬 **Interactive**
 
-Syntax highlighting, Tab completion that falls back to ignoring case, suggestions from history, vi or emacs keys, Ctrl-X Ctrl-E to edit the line in your editor, a custom `$PS1`, and persistent history.
+Syntax highlighting, Tab completion (other programs' options too, from their man pages), suggestions from history and completions, vi or emacs keys, Ctrl-X Ctrl-E to edit the line in your editor, a custom `$PS1`, and persistent history.
 
 </td>
 </tr>
@@ -232,12 +232,43 @@ instead. Scripts never read it.
 enabled = true       # the logo and version at startup
 tips = true          # and a tip under them
 
+[prompt]
+keys = "emacs"       # how the line is edited: "emacs" or "vi"; `set -o vi`
+                     # and `set -o emacs` switch too
+format = ""          # the prompt, written as $PS1 is, with \g for git and \c
+                     # for how long the last command took; empty for
+                     # swagsh's own. $PS1 comes first when it is set
+newline = true       # swagsh's own prompt: the symbol on a line of its own
+symbol = "❯"         # what swagsh's own prompt ends in
+directory = "bold cyan"
+success = "bold green"  # the symbol after a command that worked
+failure = "bold red"    # and after one that failed
+
+[prompt.git]
+enabled = true       # the branch, inside a repository
+status = true        # and its state: * changed, + staged, ? untracked,
+                     # ↑ ahead, ↓ behind; this runs `git status` each prompt
+color = "magenta"
+
+[prompt.duration]
+enabled = true       # how long the last command took
+min = 2.0            # if it took at least this many seconds
+color = "yellow"
+
 [editor]
-keys = "emacs"       # or "vi"; `set -o vi` and `set -o emacs` switch too
-command = ""         # the editor for Ctrl-X Ctrl-E (`v` with vi keys) and fc,
-                     # such as "nvim" or "code --wait"; empty for $VISUAL,
-                     # then $EDITOR, then vi
-suggestions = true   # the rest of a line from history, in grey; → takes it
+command = ""         # the program Ctrl-X Ctrl-E (`v` with vi keys) and fc
+                     # open, such as "nvim" or "code --wait"; empty for
+                     # $VISUAL, then $EDITOR, then vi
+
+[completion]
+case = "smart"       # ignore case unless the word has a capital; or
+                     # "sensitive", or "insensitive"
+man = true           # complete other programs' options from their man pages
+
+[suggestions]        # the rest of the line, in grey, as you type; → takes it
+enabled = true
+history = true       # from commands typed before, if what they name still exists
+completions = true   # else the rest of a word with only one completion
 
 [highlight]
 enabled = true
@@ -263,6 +294,33 @@ ignore_space = true  # a command starting with a space is not kept
 A color is any mix of names (`red`, `bright-blue`), attributes (`bold`,
 `dim`, `italic`, `underline`, `reverse`), a 256-color number, and
 `#rrggbb`, separated by spaces.
+
+The prompt is the first of these that is set:
+
+1. `$PS1`. swagsh never sets it, so it is only set when you set it, in
+   `~/.swagshrc` for example, or when it comes from the environment.
+   `unset PS1` goes back to the next one.
+2. `prompt.format` in this file.
+3. swagsh's own: the directory, the git branch and its state, and how long
+   the last command took when that was long; then, on the line under them,
+   `❯` in green, or in red after a command that failed. The `[prompt]`
+   keys and sections style it.
+
+   ```
+   ~/code/swagsh on main *?↑2 took 1m27s
+   ❯
+   ```
+
+`$PS1` and `prompt.format` take the same escapes as bash's `$PS1` (`\w`,
+`\u`, `\h`, `\$`, ...), plus two of swagsh's own. Each of the two has a
+space before it, and is empty when there is nothing to show:
+
+- `\g`: the git branch and its state, as `[prompt.git]` says.
+- `\c`: how long the last command took, as `[prompt.duration]` says.
+
+So `format = "\\w\\g\\c \\$ "` gives `~/code/swagsh main * 3.2s $` (TOML
+doubles the backslashes). The branch is read from `.git` directly, so
+`status = false` keeps the prompt instant in a very large repository.
 
 Startup files are still sourced as before: `~/.swagsh_profile` for a login
 shell, then `$ENV` and `~/.swagshrc` for an interactive one.
