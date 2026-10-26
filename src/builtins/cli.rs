@@ -5,9 +5,8 @@
 //! defaults down to that shape: no `--version`, `argv[0]` omitted (builtins
 //! are already matched by name before their handler runs), and errors
 //! reformatted to a single line on the builtin's own name instead of
-//! clap's multi-paragraph "Usage: ..." block. Color is untouched (`clap`
-//! already defaults to `ColorChoice::Auto`, matching the rest of swagsh's
-//! output: real color on a terminal, plain text piped/`NO_COLOR`).
+//! clap's multi-paragraph "Usage: ..." block. `-h` and `--help` show the
+//! builtin's help page, the one `help NAME` shows.
 use anyhow::Result;
 use clap::{Command, Parser, error::ErrorKind};
 
@@ -16,8 +15,9 @@ use crate::errfmt::emit;
 use crate::eval::Shell;
 use crate::jobs::ExitStatus;
 
-/// Outcome of parsing a builtin's arguments: the parsed struct, `-h`
-/// already having printed help, or a bad-flag usage error already printed.
+/// Outcome of parsing a builtin's arguments: the parsed struct, a request
+/// for its help page (`-h`, `--help`), or a bad-flag usage error already
+/// printed.
 ///
 /// Kept distinct from a builtin's own runtime errors (a bad directory, a
 /// missing file, ...) so [`dispatch`] can give usage mistakes the
@@ -42,13 +42,20 @@ pub enum ParsedArgs<T> {
 pub fn dispatch<B: Builtin>(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     match parse_args::<B>(args)? {
         ParsedArgs::Ok(b) => b.run(shell),
-        ParsedArgs::Help => Ok(ExitStatus::SUCCESS),
+        ParsedArgs::Help => {
+            let color = super::help::color(shell);
+            shell.out(&<B as super::help::Help>::help().render(color))?;
+            Ok(ExitStatus::SUCCESS)
+        }
         ParsedArgs::UsageError => Err(super::BuiltinFailed(ExitStatus(2)).into()),
     }
 }
 
 pub(super) fn command_for<T: Parser>() -> Command {
-    T::command().no_binary_name(true).disable_version_flag(true)
+    T::command()
+        .no_binary_name(true)
+        .disable_version_flag(true)
+        .styles(super::help::STYLES)
 }
 
 /// Parses `args` as `T`, using `T`'s own command name for error text.
@@ -73,9 +80,6 @@ pub fn parse_args<T: Parser>(args: &[&str]) -> Result<ParsedArgs<T>> {
                 ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
             ) =>
         {
-            // `Error::print` (not `Display`) is what actually applies the
-            // configured `ColorChoice` against the real output stream.
-            let _ = e.print();
             Ok(ParsedArgs::Help)
         }
         Err(e) => {

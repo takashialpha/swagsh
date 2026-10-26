@@ -59,6 +59,7 @@ pub struct JobsBuiltin {
 impl Builtin for JobsBuiltin {
     fn run(self, shell: &mut Shell) -> Result<ExitStatus> {
         shell.jobs.reap_nonblocking();
+        let color = crate::paint::stdout(shell);
         let lines: Vec<String> = shell
             .jobs
             .iter()
@@ -71,7 +72,7 @@ impl Builtin for JobsBuiltin {
                 if self.pids_only {
                     j.pgid.to_string()
                 } else {
-                    shell.jobs.describe(j, self.long)
+                    shell.jobs.describe(j, self.long, color)
                 }
             })
             .collect();

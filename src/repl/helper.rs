@@ -33,6 +33,9 @@ use super::highlight::{self, KEYWORDS, Kind, Lookup, Styles};
 use super::manpage::{self, Page};
 use crate::eval::Shell;
 
+/// A command's subcommands, each with what it does.
+type Subcommands = Arc<[(String, String)]>;
+
 /// The names the shell knows, as of the last prompt.
 #[derive(Default)]
 struct Names {
@@ -55,6 +58,8 @@ struct Names {
     manpath: Option<String>,
     /// The man pages read so far, by name; `None` for one there is not.
     man_pages: RefCell<HashMap<String, Option<Arc<Page>>>>,
+    /// The subcommands found so far for each command, with what each does.
+    subcommands: RefCell<HashMap<String, Subcommands>>,
 }
 
 impl Names {
@@ -359,19 +364,28 @@ fn escape(name: &str) -> String {
     out
 }
 
-/// Where the word ending at `pos` starts.
-fn word_start(line: &str, pos: usize) -> usize {
-    let bytes = line.as_bytes();
-    let mut start = pos;
-    while start > 0 {
-        let c = bytes[start - 1];
-        let escaped = start >= 2 && bytes[start - 2] == b'\\';
-        if b" \t|&;<>()".contains(&c) && !escaped {
-            break;
+/// Where the word ending at `pos` starts, and the quote still open at
+/// `pos`, if any: in `ls "my d`, the word is `"my d`, open in `"`.
+fn word_at(line: &str, pos: usize) -> (usize, Option<char>) {
+    let mut start = 0;
+    let mut quote = None;
+    let mut chars = line[..pos].char_indices();
+    while let Some((i, c)) = chars.next() {
+        match (quote, c) {
+            (None | Some('"'), '\\') => {
+                chars.next();
+            }
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, c) if " \t|&;<>()".contains(c) => start = i + c.len_utf8(),
+            _ => {}
         }
-        start -= 1;
     }
-    start
+    (start, quote)
+}
+
+fn word_start(line: &str, pos: usize) -> usize {
+    word_at(line, pos).0
 }
 
 impl Names {
@@ -469,6 +483,30 @@ impl Names {
             .borrow_mut()
             .insert(name.to_owned(), page.clone());
         page
+    }
+
+    /// The subcommands of `command`, such as git's `commit`: the ones with
+    /// a man page of their own (`git-commit`) that is not a program's (as
+    /// `ssh-keygen` is). Looked for once; none for a builtin.
+    fn subcommands(&self, command: &str) -> Subcommands {
+        if !self.man || command.is_empty() || crate::builtins::lookup_builtin(command).is_some() {
+            return Arc::new([]);
+        }
+        if let Some(found) = self.subcommands.borrow().get(command) {
+            return Arc::clone(found);
+        }
+        let found: Subcommands =
+            manpage::subcommands(command, &self.programs_from.0, self.manpath.as_deref())
+                .into_iter()
+                .filter(|(sub, _)| {
+                    let program = format!("{command}-{sub}");
+                    self.programs.binary_search(&program).is_err()
+                })
+                .collect();
+        self.subcommands
+            .borrow_mut()
+            .insert(command.to_owned(), Arc::clone(&found));
+        found
     }
 
     /// The man page of `command`, or of its subcommand `sub` when that has
@@ -586,16 +624,67 @@ impl Names {
     /// The files whose names complete `word`, a path as typed; only
     /// directories with `dirs_only`.
     fn files(&self, word: &str, dirs_only: bool) -> Vec<Pair> {
-        let (dir_part, prefix) = word
-            .rfind('/')
-            .map_or(("", word), |i| (&word[..=i], &word[i + 1..]));
-        let dir = self.expand_dir(dir_part);
-        let prefix = unescape(prefix);
-        let Ok(entries) = std::fs::read_dir(if dir.as_os_str().is_empty() {
+        // A bare `~` is the home directory, to go into.
+        if word == "~" && self.home.is_some() {
+            return vec![Pair {
+                display: "~/".to_owned(),
+                replacement: "~/".to_owned(),
+            }];
+        }
+        let (dir_part, prefix) = split_dir(word);
+        self.entries(&self.expand_dir(dir_part), &unescape(prefix), dirs_only)
+            .into_iter()
+            .map(|(name, is_dir)| Pair {
+                replacement: format!(
+                    "{dir_part}{}{}",
+                    escape(&name),
+                    if is_dir { "/" } else { " " }
+                ),
+                display: if is_dir { format!("{name}/") } else { name },
+            })
+            .collect()
+    }
+
+    /// The files completing `inner`, a path typed after an opening
+    /// `quote`, which the completions keep: open after a directory, closed
+    /// after a file.
+    fn quoted_files(&self, quote: char, inner: &str, dirs_only: bool) -> Vec<Pair> {
+        let (dir_part, prefix) = split_dir(inner);
+        self.entries(Path::new(dir_part), prefix, dirs_only)
+            .into_iter()
+            .map(|(name, is_dir)| {
+                let quoted = if quote == '"' {
+                    name.chars().fold(String::new(), |mut out, c| {
+                        if "\"$`\\".contains(c) {
+                            out.push('\\');
+                        }
+                        out.push(c);
+                        out
+                    })
+                } else {
+                    name.replace('\'', "'\\''")
+                };
+                Pair {
+                    replacement: if is_dir {
+                        format!("{quote}{dir_part}{quoted}/")
+                    } else {
+                        format!("{quote}{dir_part}{quoted}{quote} ")
+                    },
+                    display: if is_dir { format!("{name}/") } else { name },
+                }
+            })
+            .collect()
+    }
+
+    /// The names in `dir` that `prefix` completes, and whether each is a
+    /// directory; only directories with `dirs_only`.
+    fn entries(&self, dir: &Path, prefix: &str, dirs_only: bool) -> Vec<(String, bool)> {
+        let dir = if dir.as_os_str().is_empty() {
             Path::new(".")
         } else {
-            &dir
-        }) else {
+            dir
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
             return Vec::new();
         };
         let mut found: Vec<(String, bool)> = entries
@@ -609,22 +698,20 @@ impl Names {
                 (is_dir || !dirs_only).then_some((name, is_dir))
             })
             .collect();
+        // `.` and `..` are never listed by the directory, but are there to
+        // go into.
+        if prefix.starts_with('.') {
+            found.extend([".", ".."].map(|d| (d.to_owned(), true)));
+        }
         found.sort_unstable();
-        matching(found, &prefix, self.case, |(name, _)| name)
-            .into_iter()
-            .map(|(name, is_dir)| Pair {
-                display: if is_dir {
-                    format!("{name}/")
-                } else {
-                    name.clone()
-                },
-                replacement: format!(
-                    "{dir_part}{}{}",
-                    escape(&name),
-                    if is_dir { "/" } else { " " }
-                ),
-            })
-            .collect()
+        let mut found = matching(found, prefix, self.case, |(name, _)| name);
+        // A word starting with `.` means a hidden name: it is not a part of
+        // `a.rs` to look for.
+        if prefix.starts_with('.') {
+            let lower = prefix.to_lowercase();
+            found.retain(|(name, _)| name.to_lowercase().starts_with(&lower));
+        }
+        found
     }
 
     /// The directory a typed path's directory part names: with a leading `~`
@@ -656,6 +743,13 @@ impl Names {
     }
 }
 
+/// `word` split after its last `/`: the directory part, and the name
+/// being typed in it.
+fn split_dir(word: &str) -> (&str, &str) {
+    word.rfind('/')
+        .map_or(("", word), |i| (&word[..=i], &word[i + 1..]))
+}
+
 fn unescape(word: &str) -> String {
     let mut out = String::with_capacity(word.len());
     let mut chars = word.chars();
@@ -675,7 +769,7 @@ const TAKES_VARIABLES: &[&str] = &["declare", "export", "local", "readonly", "ty
 impl Names {
     /// Where the word before `pos` starts, and its completions.
     fn complete(&self, line: &str, pos: usize) -> (usize, Vec<Pair>) {
-        let start = word_start(line, pos);
+        let (start, quote) = word_at(line, pos);
         let word = &line[start..pos];
         if let Some(rest) = word.strip_prefix("${") {
             return (start, self.variables(rest, "${", "}"));
@@ -685,7 +779,16 @@ impl Names {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_')
         {
-            let pairs = self.variables(&word[i + 1..], "$", "");
+            let mut pairs = self.variables(&word[i + 1..], "$", "");
+            // `$HOME` complete as it is goes on into the directory it names.
+            if let [only] = pairs.as_mut_slice()
+                && only.display == word[i + 1..]
+                && self
+                    .variable(&only.display)
+                    .is_some_and(|value| !value.is_empty() && Path::new(value).is_dir())
+            {
+                only.replacement.push('/');
+            }
             return (start + i, pairs);
         }
         // The scan of what comes before, with a word standing in for this
@@ -717,6 +820,23 @@ impl Names {
                 return (start, options);
             }
         }
+        if sub.is_none() && !word.starts_with('-') && !word.contains('/') {
+            let subcommands = self.subcommands(command);
+            let found = matching(subcommands.to_vec(), word, self.case, |(name, _)| name);
+            if !found.is_empty() {
+                let width = found.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+                return (
+                    start,
+                    found
+                        .into_iter()
+                        .map(|(name, what)| Pair {
+                            display: format!("{name:<width$}  {what}").trim_end().to_owned(),
+                            replacement: format!("{name} "),
+                        })
+                        .collect(),
+                );
+            }
+        }
         if !word.contains('/') {
             if matches!(command, "help" | "builtin" | "enable") {
                 let mut pairs = self.commands(word);
@@ -740,7 +860,13 @@ impl Names {
         if TAKES_VARIABLES.contains(&command) && !word.contains('/') {
             return (start, self.variables(word, "", ""));
         }
-        (start, self.files(word, matches!(command, "cd" | "pushd")))
+        let dirs_only = matches!(command, "cd" | "pushd");
+        if let Some(q) = quote
+            && let Some(inner) = word.strip_prefix(q)
+        {
+            return (start, self.quoted_files(q, inner, dirs_only));
+        }
+        (start, self.files(word, dirs_only))
     }
 }
 

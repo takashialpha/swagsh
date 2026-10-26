@@ -24,6 +24,7 @@ use super::LineEditor;
 
 use crate::eval::Shell;
 use crate::jobs::{ExitStatus, JobState, done_text, job_line};
+use crate::paint;
 use crate::signal::notify_sigchld;
 
 /// A job being watched.
@@ -172,7 +173,7 @@ fn watch(
             while rustix::io::read(chld, &mut buf).is_ok_and(|n| n > 0) {}
             for job in jobs.iter_mut().filter(|j| !j.stopped) {
                 if job.pids.iter().any(|&pid| is_stopped(pid)) {
-                    let line = job_line(job.id, job.mark, "Stopped", &job.command);
+                    let line = job_line(job.id, job.mark, "Stopped", &job.command, paint::stderr());
                     if printer.print(line).is_ok() {
                         job.stopped = true;
                         announced.stopped.push(job.id);
@@ -197,7 +198,13 @@ fn watch(
                 return true;
             }
             let (status, signal) = job.status.unwrap_or((ExitStatus::SUCCESS, None));
-            let line = job_line(job.id, job.mark, &done_text(status, signal), &job.command);
+            let line = job_line(
+                job.id,
+                job.mark,
+                &done_text(status, signal),
+                &job.command,
+                paint::stderr(),
+            );
             if printer.print(line).is_ok() {
                 announced.done.push(job.id);
             }

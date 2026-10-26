@@ -41,5 +41,6 @@ pub fn strerror(err: impl std::fmt::Display) -> String {
 /// of a bare `eprintln!("swagsh: {e}")` means that's handled once, instead
 /// of relying on every call site to remember `strerror()`.
 pub fn emit(err: impl std::fmt::Display) {
-    eprintln!("swagsh: {}", strerror(err));
+    let name = crate::paint::paint("swagsh:", crate::paint::ERROR, crate::paint::stderr());
+    eprintln!("{name} {}", strerror(err));
 }

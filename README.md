@@ -23,21 +23,27 @@
 
 ```sh
 $ swagsh
-~ ❯ greet() { echo "hello, ${1:-world}"; }
-~ ❯ greet takashi
+~/code/swagsh on main
+❯ greet() { echo "hello, ${1:-world}"; }; greet takashi
 hello, takashi
-~ ❯ count=$((1 + 2 + 3)); echo $count
-6
-~ ❯ for f in /etc/os-release /etc/hostname; do
->   [ -f "$f" ] && echo "$f: $(head -1 $f)"
-> done
-/etc/os-release: NAME="Arch Linux"
-/etc/hostname: mymachine
-~ ❯ sleep 5 &
+~/code/swagsh on main
+❯ files=(src/*.rs); echo "${#files[@]} files, the first is ${files[0]}"
+23 files, the first is src/ast.rs
+~/code/swagsh on main
+❯ [[ $PWD == */swagsh ]] && echo "counting to $(( 2 ** 3 ))"
+counting to 8
+~/code/swagsh on main
+❯ cargo build --release
+    Finished `release` profile [optimized] target(s) in 24.31s
+~/code/swagsh on main took 24s
+❯ sleep 30 &
 [1] 9182
-~ ❯ jobs
-[1]+  Running                    sleep 5 &
-~ ❯
+~/code/swagsh on main
+❯ jobs
+[1]+  Running                    sleep 30 &
+~/code/swagsh on main
+❯ help -d cd
+cd - Change the shell working directory
 ```
 
 ---
@@ -73,7 +79,7 @@ Background jobs, `fg`/`bg`, signals and completion notices.
 
 💬 **Interactive**
 
-Syntax highlighting, Tab completion (other programs' options too, from their man pages), suggestions from history and completions, vi or emacs keys, Ctrl-X Ctrl-E to edit the line in your editor, a custom `$PS1`, and persistent history.
+Syntax highlighting, Tab completion (other programs' options too, from their man pages), suggestions from history and completions, vi or emacs keys, Ctrl-X Ctrl-E to edit the line in your editor, a prompt with git and timing (or your own `$PS1`), and persistent history; all set in one [config file](#configuration).
 
 </td>
 </tr>
@@ -82,7 +88,7 @@ Syntax highlighting, Tab completion (other programs' options too, from their man
 
 📖 **Built-in help**
 
-`help` lists every builtin; `help NAME` (or `NAME --help`) shows its options, with examples.
+`help` lists every builtin; `help NAME` (or `NAME --help`) shows its options, with examples, in color on a terminal.
 
 </td>
 </tr>
@@ -347,9 +353,12 @@ just clean        # target/, and the corpus/artifacts cargo does not own
 Highlighting, completion, the banner and the configuration file must never
 change how a script runs, or how fast. They live in `src/repl/` and
 `src/prompt.rs`, which only an interactive shell reaches (apart from
-sourcing the startup files), and the only ANSI escapes outside them are
-`echo -e`'s and `printf`'s own. Nothing enforces this at the type level,
-so keep it in mind when touching those modules.
+sourcing the startup files). Outside them, swagsh's own output (errors, job
+states, `set -o` and `shopt` listings, help pages) is colored only through
+`src/paint.rs` and the help page styles, and only when it goes to a
+terminal with `$NO_COLOR` unset, so what a script pipes or captures stays
+plain text. Nothing enforces this at the type level, so keep it in mind
+when touching those modules.
 
 ### Two modules own the unsafe
 

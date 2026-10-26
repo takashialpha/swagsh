@@ -46,8 +46,11 @@ impl Builtin for HistoryBuiltin {
             .enumerate()
             .skip(skip)
             .collect();
+        let color = crate::paint::stdout(shell);
         for (i, entry) in entries {
-            shell.outln(&format!("{:5}  {entry}", i + 1))?;
+            let number = format!("{:5}", i + 1);
+            let number = crate::paint::paint(&number, crate::paint::DIM, color);
+            shell.outln(&format!("{number}  {entry}"))?;
         }
         Ok(ExitStatus::SUCCESS)
     }

@@ -1,5 +1,7 @@
 //! `shopt`: the shell options beyond `set`'s.
 
+use std::fmt::Write as _;
+
 use anyhow::Result;
 
 use super::BuiltinFailed;
@@ -132,9 +134,8 @@ impl Help for ShoptCmd {
             }],
             &["With no OPTNAME, prints every option and whether it is on."],
         );
-        page.body.push('\n');
-        page.body
-            .push_str(&super::help::section("Option names", OPTIONS));
+        let names = super::help::section("Option names", OPTIONS);
+        let _ = write!(page.body, "\n{}", names.ansi());
         page
     }
 }
@@ -221,7 +222,8 @@ fn builtin_shopt(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
         if print {
             shell.outln(&format!("shopt {} {name}", if value { "-s" } else { "-u" }))?;
         } else {
-            shell.outln(&format!("{name:<20}\t{}", if value { "on" } else { "off" }))?;
+            let state = super::env::on_off(value, crate::paint::stdout(shell));
+            shell.outln(&format!("{name:<20}\t{state}"))?;
         }
     }
     // Listing every option is not a question about any one of them.

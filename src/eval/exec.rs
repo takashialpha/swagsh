@@ -533,7 +533,13 @@ impl Shell {
 
         let parsed = match parse_args::<ExecBuiltin>(args)? {
             ParsedArgs::Ok(a) => a,
-            ParsedArgs::Help => return Ok(ExitStatus::SUCCESS),
+            ParsedArgs::Help => {
+                use crate::builtins::help::Help as _;
+                let color = crate::builtins::help::color(self);
+                let page = crate::builtins::script::Exec::help().render(color);
+                self.out(&page)?;
+                return Ok(ExitStatus::SUCCESS);
+            }
             ParsedArgs::UsageError => return Ok(ExitStatus(2)),
         };
 
@@ -633,11 +639,17 @@ impl Shell {
         };
         match job.state {
             JobState::Done(_) => {
-                eprintln!("\n{}", self.jobs.describe(job, false));
+                eprintln!(
+                    "\n{}",
+                    self.jobs.describe(job, false, crate::paint::stderr())
+                );
                 self.jobs.mark_notified(id);
             }
             JobState::Stopped if !job.stop_announced => {
-                eprintln!("\n{}", self.jobs.describe(job, false));
+                eprintln!(
+                    "\n{}",
+                    self.jobs.describe(job, false, crate::paint::stderr())
+                );
                 self.jobs.mark_stop_announced(id);
             }
             _ => {}
@@ -688,7 +700,10 @@ impl Shell {
                         job.stop_announced = true;
                     }
                     if let Some(job) = self.jobs.iter().find(|j| j.pgid == pid) {
-                        eprintln!("\n{}", self.jobs.describe(job, false));
+                        eprintln!(
+                            "\n{}",
+                            self.jobs.describe(job, false, crate::paint::stderr())
+                        );
                     }
                     return Ok(Some(Waited::Stopped(pid)));
                 }

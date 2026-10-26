@@ -43,6 +43,74 @@ pub fn page(name: &str, path: &str, manpath: Option<&str>) -> Option<Page> {
     })
 }
 
+/// The subcommands program `name` has man pages for (`git-commit` gives
+/// `commit`), sorted, each with the one line on what it does that the
+/// `whatis` database holds, if it can be asked.
+#[must_use]
+pub fn subcommands(name: &str, path: &str, manpath: Option<&str>) -> Vec<(String, String)> {
+    if name.is_empty() || name.contains('/') {
+        return Vec::new();
+    }
+    let prefix = format!("{name}-");
+    let mut found = std::collections::BTreeMap::new();
+    for dir in man_dirs(path, manpath) {
+        let Ok(entries) = std::fs::read_dir(dir.join("man1")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file = entry.file_name().to_string_lossy().into_owned();
+            let page = EXTENSIONS
+                .iter()
+                .rev()
+                .find_map(|ext| file.strip_suffix(ext).filter(|_| !ext.is_empty()))
+                .unwrap_or(&file);
+            if let Some(sub) = page
+                .strip_suffix(".1")
+                .and_then(|p| p.strip_prefix(&prefix))
+                .filter(|s| !s.is_empty())
+            {
+                found.insert(sub.to_owned(), String::new());
+            }
+        }
+    }
+    if !found.is_empty() {
+        describe(&prefix, path, &mut found);
+    }
+    found.into_iter().collect()
+}
+
+/// Fills in what each of `found` does from `whatis`, found on `path`.
+fn describe(prefix: &str, path: &str, found: &mut std::collections::BTreeMap<String, String>) {
+    let Some(whatis) = path
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .map(|d| Path::new(d).join("whatis"))
+        .find(|p| p.is_file())
+    else {
+        return;
+    };
+    let Ok(output) = Command::new(whatis)
+        .args(["-w", "-s", "1", &format!("{prefix}*")])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some((page, what)) = line.split_once(" - ") else {
+            continue;
+        };
+        let sub = page
+            .split_whitespace()
+            .next()
+            .and_then(|p| p.strip_prefix(prefix));
+        if let Some(slot) = sub.and_then(|sub| found.get_mut(sub)) {
+            what.trim().clone_into(slot);
+        }
+    }
+}
+
 /// The text of the SYNOPSIS section, with mdoc's optional parts in
 /// brackets as man pages write them.
 fn synopsis(text: &str) -> String {

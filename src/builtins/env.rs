@@ -386,17 +386,24 @@ fn option_enabled(shell: &Shell, option: &ShellOption) -> bool {
     }
 }
 
+/// `on` or `off`, in green or dim with `color`.
+pub(super) fn on_off(on: bool, color: bool) -> std::borrow::Cow<'static, str> {
+    use crate::paint::{DIM, GOOD, paint};
+    if on {
+        paint("on", GOOD, color)
+    } else {
+        paint("off", DIM, color)
+    }
+}
+
 /// `set -o` lists every option and whether it is on; `set +o` prints the
 /// `set` commands that would restore the current settings.
 fn print_set_o_status(shell: &mut Shell, human: bool) -> Result<()> {
+    let color = crate::paint::stdout(shell);
     for option in OPTIONS {
         let on = option_enabled(shell, option);
         if human {
-            shell.outln(&format!(
-                "{:<15}\t{}",
-                option.name,
-                if on { "on" } else { "off" }
-            ))?;
+            shell.outln(&format!("{:<15}\t{}", option.name, on_off(on, color)))?;
         } else {
             shell.outln(&format!(
                 "set {}o {}",

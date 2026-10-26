@@ -24,6 +24,7 @@ pub mod expand;
 pub(crate) mod fd;
 pub(crate) mod jobs;
 pub(crate) mod lexer;
+pub mod paint;
 pub mod parser;
 pub(crate) mod pattern;
 pub(crate) mod prompt;

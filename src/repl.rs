@@ -246,6 +246,7 @@ fn read_line(
     first: bool,
 ) -> rustyline::Result<String> {
     if first && let Some(helper) = rl.helper() {
+        crate::paint::set_no_color(shell.env.get("NO_COLOR").is_some());
         helper.refresh(shell);
         helper.set_context("");
     }

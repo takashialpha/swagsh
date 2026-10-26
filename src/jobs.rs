@@ -98,10 +98,25 @@ pub fn done_text(status: ExitStatus, signal: Option<i32>) -> String {
     }
 }
 
-/// A job line laid out as bash does: `[1]+  Running                    cmd`.
+/// A job line laid out as bash does: `[1]+  Running                    cmd`;
+/// with `color`, its state colored by what it is.
 #[must_use]
-pub fn job_line(id: usize, mark: char, state: &str, command: &str) -> String {
-    format!("[{id}]{mark}  {state:<27}{command}")
+pub fn job_line(id: usize, mark: char, state: &str, command: &str, color: bool) -> String {
+    format!("[{id}]{mark}  {}{command}", state_column(state, color))
+}
+
+/// `state` padded to its column, colored: running green, stopped yellow,
+/// done dim, and failed or killed red.
+fn state_column(state: &str, color: bool) -> String {
+    use crate::paint::{DIM, ERROR, GOOD, WARN, paint};
+    let sgr = match state {
+        "Running" => GOOD,
+        "Stopped" => WARN,
+        "Done" => DIM,
+        _ => ERROR,
+    };
+    let pad = 27usize.saturating_sub(state.chars().count());
+    format!("{}{:pad$}", paint(state, sgr, color), "")
 }
 
 #[derive(Debug, Default)]
@@ -157,9 +172,9 @@ impl JobTable {
 
     /// One `jobs` line for `job`, laid out as bash does:
     /// `[1]+  Running                    sleep 9 &`, and with `pid`, the
-    /// process group id after the mark.
+    /// process group id after the mark. With `color`, the state is colored.
     #[must_use]
-    pub fn describe(&self, job: &Job, pid: bool) -> String {
+    pub fn describe(&self, job: &Job, pid: bool, color: bool) -> String {
         let suffix = if job.state == JobState::Running {
             " &"
         } else {
@@ -170,11 +185,13 @@ impl JobTable {
         let id = job.id;
         if pid {
             format!(
-                "[{id}]{mark} {} {state:<27}{}{suffix}",
-                job.pgid, job.command
+                "[{id}]{mark} {} {}{}{suffix}",
+                job.pgid,
+                state_column(&state, color),
+                job.command
             )
         } else {
-            job_line(id, mark, &state, &format!("{}{suffix}", job.command))
+            job_line(id, mark, &state, &format!("{}{suffix}", job.command), color)
         }
     }
 
@@ -185,7 +202,7 @@ impl JobTable {
             .jobs
             .iter()
             .filter(|j| matches!(j.state, JobState::Done(_)) && !j.notified)
-            .map(|j| self.describe(j, false))
+            .map(|j| self.describe(j, false, crate::paint::stderr()))
             .collect();
         let (done, live) = std::mem::take(&mut self.jobs)
             .into_iter()
@@ -213,7 +230,7 @@ impl JobTable {
         let lines = ids
             .iter()
             .filter_map(|id| self.jobs.iter().find(|j| j.id == *id))
-            .map(|j| self.describe(j, false))
+            .map(|j| self.describe(j, false, crate::paint::stderr()))
             .collect();
         for job in &mut self.jobs {
             if ids.contains(&job.id) {
