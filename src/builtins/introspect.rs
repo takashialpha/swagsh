@@ -54,6 +54,7 @@ pub struct TypeBuiltin {
     /// List every match for NAME, not just the first
     #[arg(short = 'a')]
     all: bool,
+    /// The names to look up
     names: Vec<String>,
 }
 
@@ -124,10 +125,11 @@ pub struct CommandBuiltin {
     /// Print a fuller description of what would invoke COMMAND
     #[arg(short = 'V')]
     print_verbose: bool,
-    /// COMMAND followed by its own argv, kept as one trailing field (like
-    /// `exec`'s `command_and_args`) so a flag-shaped argument to COMMAND
-    /// itself (`command grep -v x`) isn't misparsed as belonging to
-    /// `command`.
+    // COMMAND followed by its own argv, kept as one trailing field (like
+    // `exec`'s `command_and_args`) so a flag-shaped argument to COMMAND
+    // itself (`command grep -v x`) isn't misparsed as belonging to
+    // `command`.
+    /// The command to run or describe, and its arguments
     #[arg(allow_hyphen_values = true, value_name = "COMMAND")]
     command_and_args: Vec<String>,
 }
@@ -214,6 +216,7 @@ pub struct HashBuiltin {
     /// Forget every remembered location
     #[arg(short = 'r')]
     reset: bool,
+    /// The commands to look up and remember
     names: Vec<String>,
 }
 

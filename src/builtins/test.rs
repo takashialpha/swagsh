@@ -21,16 +21,106 @@ use crate::eval::Shell;
 use crate::fd::fd_is_tty;
 use crate::jobs::ExitStatus;
 
-pub fn builtin_bracket(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
-    if args.last() != Some(&"]") {
-        bail!("[: missing closing ]");
-    }
-    Ok(eval_test(shell, &args[..args.len() - 1]))
+use super::help::{Example, HandParsed, Help, HelpPage};
+
+/// The operators of `test`, for its help page.
+const OPERATORS: &[(&str, &str)] = &[
+    ("-e FILE", "FILE exists"),
+    ("-f FILE", "FILE is a regular file"),
+    ("-d FILE", "FILE is a directory"),
+    ("-L FILE", "FILE is a symbolic link (also -h)"),
+    ("-r/-w/-x FILE", "FILE is readable/writable/executable"),
+    ("-s FILE", "FILE is not empty"),
+    (
+        "-b/-c/-p/-S FILE",
+        "FILE is a block or character device, a FIFO, a socket",
+    ),
+    (
+        "-g/-u/-k FILE",
+        "FILE has its set-group-ID, set-user-ID, sticky bit",
+    ),
+    ("-O/-G FILE", "FILE is owned by you, by your group"),
+    ("-N FILE", "FILE was modified since it was last read"),
+    ("A -nt/-ot B", "File A is newer/older than B"),
+    ("A -ef B", "A and B are the same file"),
+    ("-t FD", "Descriptor FD is a terminal"),
+    ("-z STRING", "STRING is empty"),
+    ("-n STRING", "STRING is not empty (also: STRING alone)"),
+    ("A = B", "The strings are equal (also ==)"),
+    ("A != B", "The strings differ"),
+    ("A < B", "A sorts before B (quote the <)"),
+    (
+        "A -eq B",
+        "The numbers are equal; also -ne, -lt, -le, -gt, -ge",
+    ),
+    ("-v NAME", "Variable NAME is set"),
+    ("! EXPR", "EXPR is false"),
+    ("A -a B", "Both are true"),
+    ("A -o B", "Either is true"),
+    ("( EXPR )", "Grouping (quote the parentheses)"),
+];
+
+const TEST_EXAMPLES: &[Example] = &[
+    Example {
+        command: "test -f ~/.swagshrc && echo found",
+        meaning: "Print found if the file exists",
+    },
+    Example {
+        command: "[ \"$n\" -gt 0 ]",
+        meaning: "Succeed if n is a positive number",
+    },
+];
+
+const TEST_NOTES: &[&str] = &[
+    "Quote expansions in tests: an empty unquoted $x vanishes.",
+    "`[[ ]]` is the shell's own form, without word splitting.",
+];
+
+fn test_page(usage: &str) -> HelpPage {
+    let mut page = HelpPage::manual(
+        "Evaluate a conditional expression",
+        usage,
+        &[],
+        TEST_EXAMPLES,
+        TEST_NOTES,
+    );
+    page.body = super::help::section("Expressions", OPERATORS);
+    page
 }
 
-#[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
-pub fn builtin_test(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
-    Ok(eval_test(shell, args))
+pub struct Test;
+
+impl Help for Test {
+    fn help() -> HelpPage {
+        test_page("test EXPRESSION")
+    }
+}
+
+impl HandParsed for Test {
+    const HELP_FLAG: bool = false;
+
+    fn run(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+        Ok(eval_test(shell, args))
+    }
+}
+
+pub struct Bracket;
+
+impl Help for Bracket {
+    fn help() -> HelpPage {
+        test_page("[ EXPRESSION ]")
+    }
+}
+
+impl HandParsed for Bracket {
+    const HELP_FLAG: bool = false;
+
+    fn run(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+        if args.last() != Some(&"]") {
+            bail!("[: missing closing ]");
+        }
+        Ok(eval_test(shell, &args[..args.len() - 1]))
+    }
 }
 
 fn eval_test(shell: &mut Shell, args: &[&str]) -> ExitStatus {

@@ -6,8 +6,8 @@ use anyhow::{Result, anyhow};
 use crate::env::{Array, Key, double_quote, quote_for_input};
 use crate::errfmt::emit;
 use crate::expand::{
-    Param, ParamOp, ansi_c_unescape, change_case, eval_arith_with, find_unnested, is_name,
-    parse_param_op, replace_matches, slice_range, strip_prefix, strip_suffix, substring,
+    CaseChange, Param, ParamOp, ansi_c_unescape, change_case, eval_arith_with, find_unnested,
+    is_name, parse_param_op, replace_matches, slice_range, strip_prefix, strip_suffix, substring,
 };
 use crate::parser::parse_word;
 
@@ -181,15 +181,10 @@ impl Shell {
                 value.map(|s| replace_matches(s, &pat, anchor, |matched| pieces.join(matched)))
             }
             ParamOp::Transform { var, op } => self.transform(&var, op)?,
-            ParamOp::Case {
-                var,
-                upper,
-                all,
-                pat,
-            } => {
+            ParamOp::Case { var, to, all, pat } => {
                 let value = self.value_checked(&var)?;
                 let pat = self.expand_param_pattern(pat, in_quotes)?;
-                value.map(|s| change_case(s, upper, all, &pat))
+                value.map(|s| change_case(s, to, all, &pat))
             }
         })
     }
@@ -265,7 +260,7 @@ impl Shell {
             'E' => ansi_c_unescape(s),
             'U' => s.to_uppercase(),
             'L' => s.to_lowercase(),
-            'u' => change_case(s, true, false, ""),
+            'u' => change_case(s, CaseChange::Upper, false, ""),
             _ => s.to_owned(),
         }))
     }
@@ -492,6 +487,8 @@ impl Shell {
                 .map(Expansion::One),
             (name, Some(index @ ("@" | "*"))) => {
                 let items = match self.env.array(name) {
+                    // An array with no elements counts as unset, as in bash.
+                    Some(array) if array.is_empty() => None,
                     Some(array) => Some(array.values().map(str::to_owned).collect()),
                     None => self.env.get_ref(name).map_or_else(
                         || {

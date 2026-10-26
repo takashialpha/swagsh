@@ -201,7 +201,9 @@ pub enum CaseEnd {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionDef {
     pub name: String,
-    pub body: Box<Command>,
+    /// Shared with the function table once defined, rather than copied
+    /// there each time the definition runs.
+    pub body: std::rc::Rc<Command>,
 }
 
 /// `{ list; }` or `( list )`
@@ -217,8 +219,10 @@ pub struct GroupCmd {
 pub enum Command {
     Simple(SimpleCmd),
     Pipeline(Pipeline),
-    If(IfClause),
-    For(ForClause),
+    // The larger clauses are boxed, so that a command, most often a simple
+    // one, is no larger than a simple command.
+    If(Box<IfClause>),
+    For(Box<ForClause>),
     /// Boxed: as large as the other clauses, it would make every command
     /// larger by its tag.
     ArithFor(Box<ArithForClause>),
@@ -230,7 +234,7 @@ pub enum Command {
     /// to and from the shell, whose descriptors the array `name` holds.
     Coproc(String, Box<Self>),
     /// `select name in words; do body; done`: a menu.
-    Select(ForClause),
+    Select(Box<ForClause>),
     /// `(( expression ))`: succeeds when the expression is not zero.
     Arith(String),
     /// `[[ expression ]]`.

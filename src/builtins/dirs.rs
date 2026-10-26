@@ -51,6 +51,7 @@ pub struct CdBuiltin {
     /// Accepted for compatibility; extended-attribute directories aren't a Linux concept
     #[arg(short = '@')]
     xattr: bool,
+    /// The directory to go to: $HOME when left out, the previous one for `-`
     dir: Option<String>,
 }
 

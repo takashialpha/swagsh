@@ -3,11 +3,16 @@ use std::rc::Rc;
 
 use anyhow::Result;
 use rustix::process::{getegid, geteuid, getgid, getuid};
+use rustyline::config::Configurer;
 use rustyline::error::ReadlineError;
-use rustyline::{Config, DefaultEditor};
+use rustyline::history::DefaultHistory;
+use rustyline::{
+    CompletionType, Config, EditMode, Editor, Event, EventHandler, KeyCode, KeyEvent, Modifiers,
+};
 
 use crate::ast::Program;
 use crate::builtins::flow::ExitRequest;
+use crate::builtins::history::{default_editor, edit_in};
 use crate::cli::Cli;
 use crate::errfmt::emit;
 use crate::eval::{Shell, is_interrupted};
@@ -16,27 +21,22 @@ use crate::parser::{Aliases, ParseError};
 use crate::prompt::{build_prompt, continuation_prompt, history_file};
 use crate::signal::take_interrupted;
 
-mod histexpand;
+pub mod banner;
+pub mod config;
+mod helper;
+pub mod highlight;
+pub mod histexpand;
 mod notify;
+mod pager;
+
+/// The line editor, with the shell's completion and highlighting.
+type LineEditor = Editor<helper::ShellHelper, DefaultHistory>;
 
 /// # Errors
 ///
 /// Returns an error if the line editor fails to initialize.
 pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
-    let histsize: usize = shell
-        .env
-        .get("HISTSIZE")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1000)
-        .max(1);
-
-    let config = Config::builder()
-        .max_history_size(histsize)?
-        .history_ignore_space(true)
-        .history_ignore_dups(true)?
-        .build();
-
-    let mut rl = DefaultEditor::with_config(config)?;
+    let (settings, mut rl) = start(&mut shell)?;
 
     let history_path = history_file(&shell.env);
     if !cli.private
@@ -49,11 +49,14 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
     let mut exit_code = None;
     loop {
         announce_jobs(&mut shell);
-        let input = read_line(&mut shell, &mut rl);
+        rl.set_edit_mode(edit_mode(&shell));
+        let prompt = build_prompt(&mut shell);
+        let input = read_line(&mut shell, &mut rl, &prompt, true);
         match input {
             Ok(line) => {
-                let line = line.trim().to_owned();
-                if line.is_empty() {
+                // Leading blanks stay, for `history.ignore_space`.
+                let line = line.trim_end().to_owned();
+                if line.trim_start().is_empty() {
                     continue;
                 }
                 let Some(line) = expand_history(&mut shell, &mut rl, line, cli.private) else {
@@ -64,20 +67,21 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
                 take_interrupted();
                 shell.command_number += 1;
                 let ps2 = continuation_prompt(&mut shell);
-                let (full_text, program_result) =
-                    read_program(line, &mut rl, &shell.env.aliases(), &ps2);
+                let (full_text, program_result) = read_program(&mut shell, line, &mut rl, &ps2);
                 if shell.verbose {
                     eprint!("{full_text}");
                 }
                 // Recorded once the whole (possibly multi-line) command has
-                // been read, as one entry holding every line, rather than
-                // just `line` alone: adding only the first line here (before
-                // `read_program`) is what a plain `for ...; do` loop entered
-                // over several `> `-continued lines used to do, silently
-                // losing every line after the first from history instead of
-                // recalling the whole command on one Up-arrow press.
-                if !cli.private && rl.add_history_entry(full_text.trim()).unwrap_or(false) {
-                    shell.history.push(full_text.trim().to_owned());
+                // been read, as one entry holding every line, so one Up-arrow
+                // press recalls a `for ...; do` loop typed over several
+                // continuation lines whole.
+                let entry = if settings.history.ignore_space {
+                    full_text.trim_end()
+                } else {
+                    full_text.trim()
+                };
+                if !cli.private && rl.add_history_entry(entry).unwrap_or(false) {
+                    shell.history.push(entry.to_owned());
                 }
 
                 match program_result {
@@ -137,7 +141,7 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
         }
     }
 
-    let save = |rl: &mut DefaultEditor, p: &std::path::Path| {
+    let save = |rl: &mut LineEditor, p: &std::path::Path| {
         if shell.shopt.histappend {
             rl.append_history(p)
         } else {
@@ -154,6 +158,66 @@ pub fn run_interactive(mut shell: Shell, cli: &Cli) -> Result<()> {
     shell.exit(code)
 }
 
+/// Reads the config file, applies it, and greets: the settings, and the
+/// line editor set up as they say.
+fn start(shell: &mut Shell) -> Result<(config::Config, LineEditor)> {
+    let (settings, note) = config::load(&shell.env);
+    if let Some(note) = note {
+        emit(format!("config: {note}"));
+    }
+    shell.vi = shell
+        .vi
+        .or_else(|| Some(settings.editor.keys == config::Keys::Vi));
+    shell.editor = Some(settings.editor.command.trim().to_owned()).filter(|c| !c.is_empty());
+    let rl = line_editor(shell, &settings)?;
+    let color = std::io::stdout().is_terminal() && shell.env.get("NO_COLOR").is_none();
+    print!("{}", banner::render(&settings.banner, color));
+    Ok((settings, rl))
+}
+
+/// The line editor, set up as `settings` say.
+fn line_editor(shell: &Shell, settings: &config::Config) -> Result<LineEditor> {
+    let histsize: usize = shell
+        .env
+        .get("HISTSIZE")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(settings.history.size)
+        .max(1);
+    let editor_config = Config::builder()
+        .max_history_size(histsize)?
+        .history_ignore_space(settings.history.ignore_space)
+        .history_ignore_dups(settings.history.ignore_dups)?
+        .completion_type(CompletionType::List)
+        .completion_show_all_if_ambiguous(true)
+        .edit_mode(edit_mode(shell))
+        .build();
+    let mut rl = LineEditor::with_config(editor_config)?;
+    let helper = helper::ShellHelper::new(settings);
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Tab, Modifiers::NONE),
+        EventHandler::Conditional(Box::new(helper.tab_key())),
+    );
+    rl.bind_sequence(
+        Event::KeySeq(vec![KeyEvent::ctrl('X'), KeyEvent::ctrl('E')]),
+        EventHandler::Conditional(Box::new(helper.edit_key(false))),
+    );
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Char('v'), Modifiers::NONE),
+        EventHandler::Conditional(Box::new(helper.edit_key(true))),
+    );
+    rl.set_helper(Some(helper));
+    Ok(rl)
+}
+
+/// The key bindings `set -o vi` or `set -o emacs` chose.
+fn edit_mode(shell: &Shell) -> EditMode {
+    if shell.vi == Some(true) {
+        EditMode::Vi
+    } else {
+        EditMode::Emacs
+    }
+}
+
 /// Reports the jobs that stopped or finished, before a prompt.
 fn announce_jobs(shell: &mut Shell) {
     shell.jobs.reap_nonblocking();
@@ -167,22 +231,90 @@ fn announce_jobs(shell: &mut Shell) {
     }
 }
 
-/// Shows the prompt and reads a line, announcing jobs meanwhile under
-/// `set -b`.
-fn read_line(shell: &mut Shell, rl: &mut DefaultEditor) -> rustyline::Result<String> {
-    let prompt = build_prompt(shell);
-    let watcher = notify::Watcher::start(shell, rl);
-    let input = rl.readline(&prompt);
-    if let Some(watcher) = watcher {
-        let announced = watcher.finish();
-        for id in announced.done {
-            shell.jobs.mark_notified(id);
-        }
-        for id in announced.stopped {
-            shell.jobs.mark_stop_announced(id);
-        }
+/// Shows `prompt` and reads a line, carrying out what a key asked for on
+/// the way (see [`helper::Request`]). At the first prompt (`first`), jobs
+/// are announced meanwhile under `set -b`.
+fn read_line(
+    shell: &mut Shell,
+    rl: &mut LineEditor,
+    prompt: &str,
+    first: bool,
+) -> rustyline::Result<String> {
+    if first && let Some(helper) = rl.helper() {
+        helper.refresh(shell);
+        helper.set_context("");
     }
-    input
+    let mut initial: Option<(String, usize)> = None;
+    loop {
+        let watcher = if first {
+            notify::Watcher::start(shell, rl)
+        } else {
+            None
+        };
+        let input = match &initial {
+            Some((line, pos)) => rl.readline_with_initial(prompt, line.split_at(*pos)),
+            None => rl.readline(prompt),
+        };
+        if let Some(watcher) = watcher {
+            let announced = watcher.finish();
+            for id in announced.done {
+                shell.jobs.mark_notified(id);
+            }
+            for id in announced.stopped {
+                shell.jobs.mark_stop_announced(id);
+            }
+        }
+        let request = rl.helper().and_then(helper::ShellHelper::take_request);
+        let (Ok(_), Some(request)) = (&input, request) else {
+            return input;
+        };
+        initial = Some(match request {
+            helper::Request::List {
+                line,
+                pos,
+                start,
+                candidates,
+            } => {
+                match pager::show(&candidates) {
+                    Ok(true) => {}
+                    Ok(false) => return Err(ReadlineError::Interrupted),
+                    Err(e) => return Err(e.into()),
+                }
+                helper::Request::completed(&line, pos, start, &candidates)
+            }
+            helper::Request::Edit { line } => {
+                let editor = default_editor(shell);
+                match edit_in(shell, "edit", &editor, &format!("{line}\n")) {
+                    Ok(edited) => {
+                        let edited = edited.trim_end();
+                        if !edited.is_empty() {
+                            println!("{edited}");
+                        }
+                        return Ok(edited.to_owned());
+                    }
+                    Err(e) => {
+                        emit(e);
+                        let pos = line.len();
+                        (line, pos)
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Reads a continuation line, `text` being the lines of the command read
+/// so far.
+fn read_more(
+    shell: &mut Shell,
+    rl: &mut LineEditor,
+    text: &str,
+    ps2: &str,
+) -> rustyline::Result<String> {
+    if let Some(helper) = rl.helper() {
+        helper.set_context(text);
+    }
+    read_line(shell, rl, ps2, false)
 }
 
 /// `line` after history expansion (`set -H`), shown when it changed.
@@ -190,7 +322,7 @@ fn read_line(shell: &mut Shell, rl: &mut DefaultEditor) -> rustyline::Result<Str
 /// asked to see it.
 fn expand_history(
     shell: &mut Shell,
-    rl: &mut DefaultEditor,
+    rl: &mut LineEditor,
     line: String,
     private: bool,
 ) -> Option<String> {
@@ -282,24 +414,26 @@ fn source_if_exists(shell: &mut Shell, path: &std::path::Path) {
 /// Returns the full text read, every physical line joined by `\n`, so the
 /// caller can record the whole command as a single history entry.
 fn read_program(
+    shell: &mut Shell,
     first_line: &str,
-    rl: &mut DefaultEditor,
-    aliases: &Rc<Aliases>,
+    rl: &mut LineEditor,
     ps2: &str,
 ) -> (String, Result<Program, ParseError>) {
-    let mut buf = join_backslash_continuations(first_line, rl, ps2);
+    let aliases: Rc<Aliases> = shell.env.aliases();
+    let mut buf = join_backslash_continuations(shell, "", first_line, rl, ps2);
     buf.push('\n');
     loop {
-        match crate::parser::parse_with_aliases(&buf, Rc::clone(aliases)) {
+        match crate::parser::parse_with_aliases(&buf, Rc::clone(&aliases)) {
             Ok(program) => return (buf, Ok(program)),
             Err(e) if e.incomplete => {
-                let Ok(next_line) = rl.readline(ps2) else {
+                let Ok(next_line) = read_more(shell, rl, &buf, ps2) else {
                     return (buf, Err(e));
                 };
                 if e.in_heredoc {
                     buf.push_str(&next_line);
                 } else {
-                    buf.push_str(&join_backslash_continuations(&next_line, rl, ps2));
+                    let joined = join_backslash_continuations(shell, &buf, &next_line, rl, ps2);
+                    buf.push_str(&joined);
                 }
                 buf.push('\n');
             }
@@ -316,11 +450,20 @@ fn read_program(
 /// number means they're literal escaped backslashes and the line really
 /// does end there, the same rule the lexer itself would apply if this
 /// were one contiguous buffer instead of one `readline()` call per line.
-fn join_backslash_continuations(line: &str, rl: &mut DefaultEditor, ps2: &str) -> String {
+/// `before` is the lines of the command read before this one.
+fn join_backslash_continuations(
+    shell: &mut Shell,
+    before: &str,
+    line: &str,
+    rl: &mut LineEditor,
+    ps2: &str,
+) -> String {
     let mut line = line.to_owned();
     while line.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1 {
         line.pop();
-        let Ok(next) = rl.readline(ps2) else { break };
+        let Ok(next) = read_more(shell, rl, &format!("{before}{line}"), ps2) else {
+            break;
+        };
         line.push_str(&next);
     }
     line

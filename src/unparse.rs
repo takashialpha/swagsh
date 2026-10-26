@@ -32,12 +32,22 @@ struct Printer {
 }
 
 impl Printer {
-    fn finish(mut self) -> String {
-        self.flush_heredocs();
+    fn finish(self) -> String {
+        self.finish_with_heredoc_end().0
+    }
+
+    /// The text, and whether it ends with a here-document's delimiter line,
+    /// after which a newline must come.
+    fn finish_with_heredoc_end(mut self) -> (String, bool) {
+        let heredoc_end = !self.pending.is_empty();
+        if heredoc_end {
+            self.out.push('\n');
+            self.flush_heredocs();
+        }
         while self.out.ends_with([' ', '\n']) {
             self.out.pop();
         }
-        self.out
+        (self.out, heredoc_end)
     }
 
     fn newline(&mut self) {
@@ -173,6 +183,12 @@ impl Printer {
                 self.out.push_str(expr);
                 self.out.push_str("))");
             }
+            // Only a compound command can follow a name: before a simple
+            // one, the name would be read as the command.
+            Command::Coproc(_, body) if matches!(**body, Command::Simple(_)) => {
+                self.out.push_str("coproc ");
+                self.command(body);
+            }
             Command::Coproc(name, body) => {
                 let _ = write!(self.out, "coproc {name} ");
                 self.command(body);
@@ -226,7 +242,13 @@ impl Printer {
     }
 
     fn simple(&mut self, sc: &SimpleCmd) {
-        let words: Vec<String> = sc.words.iter().map(word).collect();
+        let mut words: Vec<String> = sc.words.iter().map(word).collect();
+        // A command named like a reserved word was quoted to be one.
+        if let Some(first) = words.first_mut()
+            && RESERVED.contains(&first.as_str())
+        {
+            *first = shell_quote_always(first);
+        }
         self.out.push_str(&words.join(" "));
         self.redirects(&sc.redirects);
     }
@@ -263,6 +285,12 @@ impl Printer {
     }
 }
 
+/// The words that are reserved at the start of a command.
+const RESERVED: [&str; 22] = [
+    "!", "[[", "]]", "{", "}", "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for",
+    "function", "if", "in", "select", "then", "time", "until", "while",
+];
+
 /// `fd` before a redirection operator, left out when it is the default.
 fn fd_prefix(fd: i32, default: i32) -> String {
     if fd == default {
@@ -283,20 +311,73 @@ fn heredoc_delimiter(body: &str) -> String {
 
 /// A word as source text.
 fn word(w: &Word) -> String {
-    match w {
-        Word::Literal(s) => {
-            if s.is_empty() {
-                "''".to_owned()
-            } else if s.contains(|c: char| " \t\n;&|<>()'\"\\$`".contains(c)) {
-                shell_quote_always(s)
-            } else {
-                s.clone()
-            }
+    let mut out = WordPrinter::default();
+    out.word(w);
+    out.flush();
+    out.out
+}
+
+/// Prints a word, putting its neighbouring single-quoted parts in one pair
+/// of quotes.
+#[derive(Default)]
+struct WordPrinter {
+    out: String,
+    /// Text waiting to be written in single quotes.
+    quoted: Option<String>,
+}
+
+impl WordPrinter {
+    fn word(&mut self, w: &Word) {
+        if let Some(text) = single_quoted(w) {
+            self.quoted.get_or_insert_default().push_str(&text);
+            return;
         }
-        Word::Quoted(inner) if !expands(inner) => shell_quote_always(&literal_text(inner)),
-        Word::Quoted(inner) => format!("\"{}\"", in_double_quotes(inner)),
-        Word::Compound(parts) => parts.iter().map(word).collect(),
-        other => expansion(other),
+        match w {
+            // A `{` is quoted so that the text around it cannot make a
+            // brace expansion that the word did not have.
+            Word::Literal(s) => {
+                for (i, piece) in s.split('{').enumerate() {
+                    if i > 0 {
+                        self.quoted.get_or_insert_default().push('{');
+                    }
+                    if !piece.is_empty() {
+                        self.bare(piece);
+                    }
+                }
+            }
+            Word::Quoted(inner) => self.bare(&format!("\"{}\"", in_double_quotes(inner))),
+            Word::Compound(parts) => {
+                for part in parts {
+                    self.word(part);
+                }
+            }
+            other => self.bare(&expansion(other)),
+        }
+    }
+
+    fn bare(&mut self, text: &str) {
+        self.flush();
+        self.out.push_str(text);
+    }
+
+    fn flush(&mut self) {
+        if let Some(text) = self.quoted.take() {
+            self.out.push_str(&shell_quote_always(&text));
+        }
+    }
+}
+
+/// The text of `w`, when it is printed in single quotes.
+fn single_quoted(w: &Word) -> Option<String> {
+    match w {
+        Word::Literal(s)
+            if s.is_empty()
+                || s.contains(|c: char| " \t\r\n;&|<>()'\"\\$`\x01\x02\x03".contains(c)) =>
+        {
+            Some(s.clone())
+        }
+        Word::Quoted(inner) if !expands(inner) => Some(literal_text(inner)),
+        _ => None,
     }
 }
 
@@ -305,15 +386,9 @@ fn expansion(w: &Word) -> String {
     match w {
         Word::Var(name) => format!("${{{name}}}"),
         Word::Arith(expr) => format!("$(({expr}))"),
-        Word::CmdSub(cmd) => {
-            let mut p = Printer::default();
-            p.command(cmd);
-            format!("$({})", p.finish())
-        }
+        Word::CmdSub(cmd) => format!("$({})", substitution(cmd)),
         Word::ProcSub { cmd, output } => {
-            let mut p = Printer::default();
-            p.command(cmd);
-            format!("{}({})", if *output { '>' } else { '<' }, p.finish())
+            format!("{}({})", if *output { '>' } else { '<' }, substitution(cmd))
         }
         Word::Assign(assign) => {
             let mut out = assign.name.clone();
@@ -351,6 +426,21 @@ fn expansion(w: &Word) -> String {
         }
         other => word(other),
     }
+}
+
+/// The inside of a `$(...)`, `<(...)` or `>(...)`: a subshell is set off
+/// by a space, so that `$( (...))` does not read as arithmetic.
+fn substitution(cmd: &Command) -> String {
+    let mut p = Printer::default();
+    p.command(cmd);
+    let (mut body, heredoc_end) = p.finish_with_heredoc_end();
+    if heredoc_end {
+        body.push('\n');
+    }
+    if body.starts_with('(') {
+        body.insert(0, ' ');
+    }
+    body
 }
 
 fn expands(w: &Word) -> bool {

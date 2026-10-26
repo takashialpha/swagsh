@@ -7,7 +7,8 @@ const UTF8_CONT_START: u8 = 0x80; // first continuation byte
 const UTF8_CONT_END: u8 = 0xBF; // last continuation byte
 
 // Sentinels used to communicate single-quote boundaries to decompose_word.
-// These control characters (SOH/STX) cannot appear in valid shell source.
+// The same characters in the source are written backslash-escaped (see
+// `is_marker`), so they never read as markers.
 pub const QUOTE_START: char = '\x01';
 pub const QUOTE_END: char = '\x02';
 /// Marks a process substitution in a lexed word: followed by `<` or `>`,
@@ -15,6 +16,12 @@ pub const QUOTE_END: char = '\x02';
 pub const PROC_SUB: char = '\x03';
 pub const QUOTE_START_BYTE: u8 = QUOTE_START as u8;
 pub const QUOTE_END_BYTE: u8 = QUOTE_END as u8;
+
+/// Whether source byte `b` is one of the characters a lexed word uses as a
+/// marker, and so has to be escaped to stand for itself.
+const fn is_marker(b: u8) -> bool {
+    matches!(b, 0x01..=0x03)
+}
 
 // ---------------------------------------------------------------------------
 // Token types
@@ -27,6 +34,8 @@ pub enum Token {
     Word(String),
     // Operators
     Pipe,
+    /// `|&`: a pipe that takes standard error too.
+    PipeAnd,
     OrOr,
     Ampersand,
     AndAnd,
@@ -126,6 +135,7 @@ impl fmt::Display for Token {
         match self {
             Self::Word(w) => write!(f, "Word({w:?})"),
             Self::Pipe => f.write_str("|"),
+            Self::PipeAnd => f.write_str("|&"),
             Self::OrOr => f.write_str("||"),
             Self::Ampersand => f.write_str("&"),
             Self::AndAnd => f.write_str("&&"),
@@ -376,6 +386,7 @@ impl<'src> Lexer<'src> {
     // Quoted regions
     // ------------------------------------------------------------------
 
+    /// The rest of a `'...'` string, after its opening quote, as it stands.
     fn lex_single_quoted(&mut self, buf: &mut String) -> Result<(), LexError> {
         loop {
             match self.advance() {
@@ -388,7 +399,20 @@ impl<'src> Lexer<'src> {
         Ok(())
     }
 
-    fn lex_double_quoted(&mut self, buf: &mut String) -> Result<(), LexError> {
+    /// The rest of a `'...'` string in a word, between quote markers.
+    fn lex_single_quoted_word(&mut self, buf: &mut String) -> Result<(), LexError> {
+        let start = buf.len();
+        buf.push(QUOTE_START);
+        self.lex_single_quoted(buf)?;
+        buf.push(QUOTE_END);
+        escape_markers(buf, start + 1, buf.len() - 1);
+        Ok(())
+    }
+
+    /// The rest of a `"..."` string, after its opening quote. In a word
+    /// (`marked`), a source character that is also a marker is written
+    /// backslash-escaped.
+    fn lex_double_quoted(&mut self, buf: &mut String, marked: bool) -> Result<(), LexError> {
         buf.push('"');
         loop {
             match self.advance() {
@@ -405,6 +429,9 @@ impl<'src> Lexer<'src> {
                             buf.push(b as char);
                         }
                     }
+                    // A backslash before a marker is a literal one, so it is
+                    // written escaped, ahead of the escaped marker.
+                    Some(b) if marked && is_marker(b) => buf.push_str("\\\\"),
                     _ => {
                         buf.push('\\');
                     }
@@ -422,50 +449,13 @@ impl<'src> Lexer<'src> {
                     }
                     Some(b'{') => {
                         self.advance();
-                        self.lex_param_expand(buf)?;
+                        self.lex_param_expand(buf, true)?;
                     }
                     _ => buf.push('$'),
                 },
-                Some(b) if b < UTF8_CONT_START => buf.push(b as char),
-                Some(_) => self.push_utf8(buf, self.pos - 1),
-            }
-        }
-        Ok(())
-    }
-
-    fn lex_cmd_sub(&mut self, buf: &mut String) -> Result<(), LexError> {
-        buf.push_str("$(");
-        let mut depth: usize = 1;
-        loop {
-            match self.advance() {
-                None => return Err(self.err_incomplete("unterminated command substitution")),
-                Some(b'(') => {
-                    depth += 1;
-                    buf.push('(');
-                }
-                Some(b')') => {
-                    depth -= 1;
-                    if depth == 0 {
-                        buf.push(')');
-                        break;
-                    }
-                    buf.push(')');
-                }
-                Some(b'\'') => {
-                    buf.push('\'');
-                    self.lex_single_quoted(buf)?;
-                    buf.push('\'');
-                }
-                Some(b'"') => self.lex_double_quoted(buf)?,
-                Some(b'\\') => {
+                Some(b) if marked && is_marker(b) => {
                     buf.push('\\');
-                    if let Some(n) = self.advance() {
-                        if n < UTF8_CONT_START {
-                            buf.push(n as char);
-                        } else {
-                            self.push_utf8(buf, self.pos - 1);
-                        }
-                    }
+                    buf.push(b as char);
                 }
                 Some(b) if b < UTF8_CONT_START => buf.push(b as char),
                 Some(_) => self.push_utf8(buf, self.pos - 1),
@@ -474,27 +464,38 @@ impl<'src> Lexer<'src> {
         Ok(())
     }
 
-    fn lex_param_expand(&mut self, buf: &mut String) -> Result<(), LexError> {
-        buf.push_str("${");
-        let mut depth: usize = 1;
-        loop {
-            match self.advance() {
-                None => return Err(self.err_incomplete("unterminated parameter expansion")),
-                Some(b'{') => {
-                    depth += 1;
-                    buf.push('{');
-                }
-                Some(b'}') => {
-                    depth -= 1;
-                    buf.push('}');
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                Some(b) if b < UTF8_CONT_START => buf.push(b as char),
-                Some(_) => self.push_utf8(buf, self.pos - 1),
-            }
+    /// The rest of a `$(...)`, after its `(`.
+    fn lex_cmd_sub(&mut self, buf: &mut String) -> Result<(), LexError> {
+        let Some(len) = cmd_sub_len(&self.src[self.pos..]) else {
+            while self.advance().is_some() {}
+            return Err(self.err_incomplete("unterminated command substitution"));
+        };
+        let start = self.pos;
+        for _ in 0..=len {
+            self.advance();
         }
+        buf.push_str("$(");
+        // SAFETY: `self.src` is from a valid `&str`, and the slice starts
+        // just past an ASCII `(` and ends just past an ASCII `)`, so on
+        // character boundaries.
+        buf.push_str(unsafe { std::str::from_utf8_unchecked(&self.src[start..self.pos]) });
+        Ok(())
+    }
+
+    /// The rest of a `${...}`, after its `{`, `in_dquotes` or not.
+    fn lex_param_expand(&mut self, buf: &mut String, in_dquotes: bool) -> Result<(), LexError> {
+        let Some(len) = param_len(&self.src[self.pos..], in_dquotes) else {
+            while self.advance().is_some() {}
+            return Err(self.err_incomplete("unterminated parameter expansion"));
+        };
+        let start = self.pos;
+        for _ in 0..=len {
+            self.advance();
+        }
+        buf.push_str("${");
+        // SAFETY: as in `lex_cmd_sub`, the slice runs from just past an
+        // ASCII `{` to just past an ASCII `}`.
+        buf.push_str(unsafe { std::str::from_utf8_unchecked(&self.src[start..self.pos]) });
         Ok(())
     }
 
@@ -551,7 +552,7 @@ impl<'src> Lexer<'src> {
                 Some(b'"') => {
                     self.advance();
                     let start = delim.len();
-                    self.lex_double_quoted(&mut delim)?;
+                    self.lex_double_quoted(&mut delim, false)?;
                     delim.remove(start);
                     if delim.ends_with('"') {
                         delim.pop();
@@ -643,11 +644,10 @@ impl<'src> Lexer<'src> {
             }
             // Input ran out before the delimiter line ever appeared. Every
             // other shell warns and uses the body it managed to collect, so
-            // do the same rather than failing the parse outright. The
-            // non-empty check matters: a heredoc whose last line carries no
-            // trailing newline still has content here and used to be dropped
-            // on the floor, while a body that ended cleanly on a newline
-            // leaves `check` empty and must not gain a stray blank line.
+            // do the same rather than failing the parse outright. A last
+            // line with no trailing newline still has content in `check` and
+            // belongs to the body; a body that ended cleanly on a newline
+            // leaves `check` empty, and must not gain a stray blank line.
             if at_eof {
                 if !check.is_empty() {
                     body.push_str(check);
@@ -809,13 +809,11 @@ impl<'src> Lexer<'src> {
                 }
                 Some(b'\'') => {
                     self.advance();
-                    buf.push(QUOTE_START);
-                    self.lex_single_quoted(buf)?;
-                    buf.push(QUOTE_END);
+                    self.lex_single_quoted_word(buf)?;
                 }
                 Some(b'"') => {
                     self.advance();
-                    self.lex_double_quoted(buf)?;
+                    self.lex_double_quoted(buf, true)?;
                 }
                 Some(b'$') => {
                     self.advance();
@@ -826,6 +824,9 @@ impl<'src> Lexer<'src> {
                     self.lex_backtick(buf)?;
                 }
                 Some(b) if b < UTF8_CONT_START => {
+                    if is_marker(b) {
+                        buf.push('\\');
+                    }
                     buf.push(b as char);
                     self.advance();
                 }
@@ -837,6 +838,13 @@ impl<'src> Lexer<'src> {
             }
         }
         Ok(None)
+    }
+
+    /// The lexer, counting lines from `line` rather than 1.
+    #[must_use]
+    pub const fn starting_at_line(mut self, line: usize) -> Self {
+        self.line = line;
+        self
     }
 
     /// Moves back to byte `offset`, at `line` and `col`, to lex what follows
@@ -917,14 +925,12 @@ impl<'src> Lexer<'src> {
                 b')' => depth -= 1,
                 b'\'' => {
                     self.advance();
-                    buf.push(QUOTE_START);
-                    self.lex_single_quoted(&mut buf)?;
-                    buf.push(QUOTE_END);
+                    self.lex_single_quoted_word(&mut buf)?;
                     continue;
                 }
                 b'"' => {
                     self.advance();
-                    self.lex_double_quoted(&mut buf)?;
+                    self.lex_double_quoted(&mut buf, true)?;
                     continue;
                 }
                 b'$' if self.peek2() != Some(b')')
@@ -953,6 +959,9 @@ impl<'src> Lexer<'src> {
             let start = self.pos;
             self.advance();
             if b < UTF8_CONT_START {
+                if is_marker(b) {
+                    buf.push('\\');
+                }
                 buf.push(b as char);
             } else {
                 self.push_utf8(&mut buf, start);
@@ -976,10 +985,28 @@ impl<'src> Lexer<'src> {
             }
         }
         let raw = String::from_utf8_lossy(&self.src[start..self.pos - 1]);
+        let from = buf.len() + 1;
         buf.push(QUOTE_START);
         buf.push_str(&crate::expand::ansi_c_unescape(&raw));
         buf.push(QUOTE_END);
+        escape_markers(buf, from, buf.len() - 1);
         Ok(())
+    }
+
+    /// `|`, `||` or `|&`, from the first `|`.
+    fn lex_pipe(&mut self) -> Token {
+        self.advance();
+        match self.peek() {
+            Some(b'|') => {
+                self.advance();
+                Token::OrOr
+            }
+            Some(b'&') => {
+                self.advance();
+                Token::PipeAnd
+            }
+            _ => Token::Pipe,
+        }
     }
 
     /// `;`, `;;`, `;&` or `;;&`, from the first `;`.
@@ -1033,7 +1060,7 @@ impl<'src> Lexer<'src> {
             }
             Some(b'{') => {
                 self.advance();
-                self.lex_param_expand(buf)?;
+                self.lex_param_expand(buf, false)?;
             }
             _ => {
                 buf.push('$');
@@ -1086,14 +1113,12 @@ impl<'src> Lexer<'src> {
                 b']' => depth -= 1,
                 b'\'' => {
                     self.advance();
-                    buf.push(QUOTE_START);
-                    self.lex_single_quoted(buf)?;
-                    buf.push(QUOTE_END);
+                    self.lex_single_quoted_word(buf)?;
                     continue;
                 }
                 b'"' => {
                     self.advance();
-                    self.lex_double_quoted(buf)?;
+                    self.lex_double_quoted(buf, true)?;
                     continue;
                 }
                 b'$' => {
@@ -1112,6 +1137,9 @@ impl<'src> Lexer<'src> {
             let start = self.pos;
             self.advance();
             if b < UTF8_CONT_START {
+                if is_marker(b) {
+                    buf.push('\\');
+                }
                 buf.push(b as char);
             } else {
                 self.push_utf8(buf, start);
@@ -1134,14 +1162,12 @@ impl<'src> Lexer<'src> {
                 b')' => depth -= 1,
                 b'\'' => {
                     self.advance();
-                    buf.push(QUOTE_START);
-                    self.lex_single_quoted(buf)?;
-                    buf.push(QUOTE_END);
+                    self.lex_single_quoted_word(buf)?;
                     continue;
                 }
                 b'"' => {
                     self.advance();
-                    self.lex_double_quoted(buf)?;
+                    self.lex_double_quoted(buf, true)?;
                     continue;
                 }
                 b'$' => {
@@ -1160,6 +1186,9 @@ impl<'src> Lexer<'src> {
             let start = self.pos;
             self.advance();
             if b < UTF8_CONT_START {
+                if is_marker(b) {
+                    buf.push('\\');
+                }
                 buf.push(b as char);
             } else {
                 self.push_utf8(buf, start);
@@ -1281,15 +1310,7 @@ impl<'src> Lexer<'src> {
                 self.skip_comment();
                 return self.next_token();
             }
-            Some(b'|') => {
-                self.advance();
-                return Ok(if self.peek() == Some(b'|') {
-                    self.advance();
-                    Token::OrOr
-                } else {
-                    Token::Pipe
-                });
-            }
+            Some(b'|') => return Ok(self.lex_pipe()),
             Some(b'&') => {
                 if self.peek2() == Some(b'>') {
                     return self.lex_redir(None);
@@ -1323,9 +1344,8 @@ impl<'src> Lexer<'src> {
             // `{`/`}` are reserved words only where a command can start
             // and only as a word of their own (`{ list; }`). Glued to other
             // text they are ordinary characters, so `echo a{b}c` is a single
-            // literal word: emitting `LBrace`/`RBrace` unconditionally split
-            // it into three commands and ran `b` and `c`. Falling through
-            // hands them to `lex_word_into`, which no longer breaks on them.
+            // word: falling through hands them to `lex_word`, which does not
+            // break on them.
             Some(b'{') if self.brace_is_own_word() => {
                 self.advance();
                 return Ok(Token::LBrace);
@@ -1344,7 +1364,8 @@ impl<'src> Lexer<'src> {
             _ => {}
         }
 
-        let mut buf = String::new();
+        // Room for most words up front, rather than growing it a few times.
+        let mut buf = String::with_capacity(16);
         if let Some(items) = self.lex_word(&mut buf, true)? {
             return Ok(Token::ArrayAssign(Box::new(ArrayLiteral {
                 head: buf,
@@ -1356,9 +1377,9 @@ impl<'src> Lexer<'src> {
         // fits a file descriptor. `9999999999>file` is not fd 9999999999:
         // bash treats an out-of-range run as an ordinary command word (and
         // then reports "command not found"), which is exactly what falling
-        // through to `keyword_or_word` below does. Saturating to `u32::MAX`
-        // instead, as this used to, reached the parser as fd -1 once signed,
-        // and `OwnedFd::from_raw_fd(-1)` panicked, aborting the shell.
+        // through to `keyword_or_word` below does. A saturated value would
+        // reach the parser as fd -1 once signed, which no descriptor call
+        // accepts.
         if !buf.is_empty()
             && buf.chars().all(|c| c.is_ascii_digit())
             && matches!(self.peek(), Some(b'<' | b'>'))
@@ -1424,4 +1445,407 @@ const fn ends_word(b: u8) -> bool {
 fn is_extglob_open(buf: &str) -> bool {
     let mut rev = buf.chars().rev();
     matches!(rev.next(), Some('?' | '*' | '+' | '@' | '!')) && rev.next() != Some('$')
+}
+
+/// Rewrites each marker character in `buf[from..to]`, inside quote markers,
+/// as a backslash-escaped character between them.
+fn escape_markers(buf: &mut String, from: usize, to: usize) {
+    if !buf.as_bytes()[from..to].iter().any(|&b| is_marker(b)) {
+        return;
+    }
+    let mut escaped = String::with_capacity(buf.len() - from + 8);
+    for c in buf[from..to].chars() {
+        if u8::try_from(c).is_ok_and(is_marker) {
+            escaped.push(QUOTE_END);
+            escaped.push('\\');
+            escaped.push(c);
+            escaped.push(QUOTE_START);
+        } else {
+            escaped.push(c);
+        }
+    }
+    buf.replace_range(from..to, &escaped);
+}
+
+/// Where a `case` inside a command substitution is, for [`cmd_sub_len`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaseState {
+    /// Between `case` and `in`.
+    Subject,
+    /// In a pattern list, with this many `(` of an extended pattern open.
+    Pattern(usize),
+    /// In the commands of a case item.
+    Body,
+}
+
+/// The reserved words that `case` statements in a command substitution
+/// are told apart by, so that the `)` ending a pattern is not taken for
+/// the substitution's own.
+#[derive(Default)]
+struct CaseTracker {
+    cases: Vec<CaseState>,
+    /// At the start of a command, where `case` and `esac` are reserved.
+    command_start: bool,
+    /// At the start of a pattern, where `(` is optional and `esac` can end
+    /// the `case`.
+    pattern_start: bool,
+}
+
+impl CaseTracker {
+    fn in_pattern(&self) -> bool {
+        matches!(self.cases.last(), Some(CaseState::Pattern(_)))
+    }
+
+    /// A newline, `&` or `|`.
+    fn separator(&mut self) {
+        self.command_start = true;
+        self.pattern_start = self.in_pattern();
+    }
+
+    /// A `;`, or with `ends_item` a `;;`, `;&` or `;;&`.
+    fn semicolon(&mut self, ends_item: bool) {
+        if ends_item && self.cases.last() == Some(&CaseState::Body) {
+            self.cases.pop();
+            self.cases.push(CaseState::Pattern(0));
+            self.pattern_start = true;
+        }
+        self.command_start = true;
+    }
+
+    /// A `(`. False when it belongs to a pattern rather than nesting.
+    fn open_paren(&mut self) -> bool {
+        let start = std::mem::take(&mut self.pattern_start);
+        self.command_start = true;
+        match self.cases.last_mut() {
+            Some(CaseState::Pattern(open)) => {
+                if !start {
+                    *open += 1;
+                }
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// A `)`. False when it belongs to a pattern rather than nesting.
+    fn close_paren(&mut self) -> bool {
+        self.command_start = true;
+        match self.cases.last_mut() {
+            Some(CaseState::Pattern(open)) if *open > 0 => *open -= 1,
+            Some(state @ CaseState::Pattern(_)) => *state = CaseState::Body,
+            _ => return true,
+        }
+        false
+    }
+
+    /// An unquoted word, or the start of one.
+    fn word(&mut self, word: &[u8]) {
+        let pattern_start = std::mem::take(&mut self.pattern_start);
+        match self.cases.last() {
+            _ if self.command_start && word == b"case" => self.cases.push(CaseState::Subject),
+            Some(CaseState::Subject) if word == b"in" => {
+                self.cases.pop();
+                self.cases.push(CaseState::Pattern(0));
+                self.pattern_start = true;
+                self.command_start = false;
+                return;
+            }
+            Some(CaseState::Pattern(0)) if pattern_start && word == b"esac" => {
+                self.cases.pop();
+            }
+            Some(CaseState::Body) if self.command_start && word == b"esac" => {
+                self.cases.pop();
+            }
+            _ => {}
+        }
+        self.command_start = matches!(
+            word,
+            b"do"
+                | b"done"
+                | b"then"
+                | b"else"
+                | b"elif"
+                | b"fi"
+                | b"if"
+                | b"while"
+                | b"until"
+                | b"{"
+                | b"}"
+                | b"!"
+                | b"time"
+                | b"esac"
+        );
+    }
+
+    /// Anything else.
+    const fn other(&mut self) {
+        self.command_start = false;
+        self.pattern_start = false;
+    }
+}
+
+/// The length of the inside of a `$(...)` whose text after the `$(` is
+/// `s`: the offset of the `)` that closes it, or `None` if none does.
+///
+/// Quoted text, escapes, comments and nested expansions are skipped, and
+/// the `)` ending a `case` pattern does not close it.
+#[must_use]
+pub fn cmd_sub_len(s: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    let mut depth = 0usize;
+    let mut cases = CaseTracker {
+        command_start: true,
+        ..CaseTracker::default()
+    };
+    // Between words, where a `#` starts a comment.
+    let mut word_start = true;
+    // Here-documents whose bodies start after the next newline.
+    let mut heredocs: Vec<(Vec<u8>, bool)> = Vec::new();
+    while let Some(&b) = s.get(i) {
+        match b {
+            b' ' | b'\t' => {}
+            b'\n' => {
+                for (delim, strip_tabs) in std::mem::take(&mut heredocs) {
+                    i = heredoc_body_end(s, i + 1, &delim, strip_tabs)? - 1;
+                }
+                cases.separator();
+            }
+            b'<' if s[i..].starts_with(b"<<<") => {
+                cases.other();
+                i += 3;
+                continue;
+            }
+            b'<' if s.get(i + 1) == Some(&b'<') => {
+                let (delim, strip_tabs, end) = heredoc_delimiter(s, i + 2);
+                heredocs.push((delim, strip_tabs));
+                cases.other();
+                i = end;
+                continue;
+            }
+            b'&' | b'|' => cases.separator(),
+            b';' => {
+                let ends_item = matches!(s.get(i + 1), Some(b';' | b'&'));
+                if ends_item {
+                    i += 1;
+                    if s.get(i + 1) == Some(&b'&') {
+                        i += 1;
+                    }
+                }
+                cases.semicolon(ends_item);
+            }
+            b'(' if cases.command_start && s.get(i + 1) == Some(&b'(') => {
+                if let Some(end) = arith_end(s, i + 2) {
+                    cases.other();
+                    i = end;
+                    word_start = false;
+                    continue;
+                }
+                cases.open_paren();
+                depth += 1;
+            }
+            b'(' => {
+                if cases.open_paren() {
+                    depth += 1;
+                }
+            }
+            b')' => {
+                if cases.close_paren() {
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                    depth -= 1;
+                }
+            }
+            b'#' if word_start => {
+                while s.get(i + 1).is_some_and(|&c| c != b'\n') {
+                    i += 1;
+                }
+            }
+            b'<' | b'>' => cases.other(),
+            b'\\' | b'\'' | b'"' | b'`' | b'$' => {
+                cases.other();
+                i = skip_quoted(s, i, false)?;
+                word_start = false;
+                continue;
+            }
+            _ => {
+                let len = s[i..]
+                    .iter()
+                    .position(|c| b" \t\n;&|()<>'\"`\\$".contains(c))
+                    .unwrap_or(s.len() - i);
+                cases.word(&s[i..i + len]);
+                i += len;
+                word_start = false;
+                continue;
+            }
+        }
+        word_start = true;
+        i += 1;
+    }
+    None
+}
+
+/// The length of the inside of a `${...}` whose text after the `${` is
+/// `s`: the offset of the `}` that closes it, or `None` if none does.
+/// Inside double quotes (`in_dquotes`), a `'` in it is an ordinary
+/// character.
+#[must_use]
+pub fn param_len(s: &[u8], in_dquotes: bool) -> Option<usize> {
+    skip_braces(s, 0, in_dquotes).map(|end| end - 1)
+}
+
+/// The offset just past the quoted string or expansion that starts at
+/// `s[i]` in unquoted text, or `None` if nothing ends it.
+#[must_use]
+pub fn quoted_end(s: &[u8], i: usize) -> Option<usize> {
+    skip_quoted(s, i, false)
+}
+
+/// The offset just past the escape, quoted string or expansion starting at
+/// `s[i]` (a `\\`, quote, backquote or `$`), inside double quotes or not.
+fn skip_quoted(s: &[u8], i: usize, in_dquotes: bool) -> Option<usize> {
+    match s[i] {
+        b'\\' => Some(i + 2),
+        b'\'' if !in_dquotes => skip_past(s, i + 1, b'\''),
+        b'"' => skip_double_quoted(s, i + 1),
+        b'`' => skip_backtick(s, i + 1),
+        b'$' if s.get(i + 1) == Some(&b'(') => {
+            if s.get(i + 2) == Some(&b'(')
+                && let Some(end) = arith_end(s, i + 3)
+            {
+                return Some(end);
+            }
+            Some(i + 2 + cmd_sub_len(&s[i + 2..])? + 1)
+        }
+        b'$' if s.get(i + 1) == Some(&b'{') => skip_braces(s, i + 2, in_dquotes),
+        _ => Some(i + 1),
+    }
+}
+
+/// The delimiter of the here-document whose operator `<<` ends just before
+/// `s[i]`, with its quotes removed; whether it is `<<-`; and the offset
+/// just past it.
+fn heredoc_delimiter(s: &[u8], mut i: usize) -> (Vec<u8>, bool, usize) {
+    let strip_tabs = s.get(i) == Some(&b'-');
+    if strip_tabs {
+        i += 1;
+    }
+    while matches!(s.get(i), Some(b' ' | b'\t')) {
+        i += 1;
+    }
+    let mut delim = Vec::new();
+    let mut quote = None;
+    while let Some(&b) = s.get(i) {
+        match (quote, b) {
+            (None, b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>') => break,
+            (None, b'\'' | b'"') => quote = Some(b),
+            (Some(q), _) if q == b => quote = None,
+            (None, b'\\') => {
+                i += 1;
+                delim.extend(s.get(i));
+            }
+            _ => delim.push(b),
+        }
+        i += 1;
+    }
+    (delim, strip_tabs, i)
+}
+
+/// The offset just past the line that ends a here-document body starting
+/// at `s[i]`, or `None` if no line does.
+fn heredoc_body_end(s: &[u8], mut i: usize, delim: &[u8], strip_tabs: bool) -> Option<usize> {
+    while i < s.len() {
+        let end = s[i..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(s.len(), |n| i + n);
+        let mut line = &s[i..end];
+        if strip_tabs {
+            while let [b'\t', rest @ ..] = line {
+                line = rest;
+            }
+        }
+        if line == delim {
+            return Some((end + 1).min(s.len()));
+        }
+        i = end + 1;
+    }
+    None
+}
+
+/// Whether `s`, the text after a `$((`, is an arithmetic expression that
+/// its last `))` closes, rather than a command substitution.
+#[must_use]
+pub fn is_arith(s: &[u8]) -> bool {
+    arith_end(s, 0) == Some(s.len())
+}
+
+/// The offset just past the `))` closing an arithmetic expression whose
+/// inside starts at `i`, read as the lexer reads one: counting parentheses
+/// only. `None` when the parentheses do not end in `))`, as in `$((a) )`,
+/// which is a command substitution instead.
+fn arith_end(s: &[u8], mut i: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    loop {
+        match *s.get(i)? {
+            b'(' => depth += 1,
+            b')' if depth > 0 => depth -= 1,
+            b')' => return (s.get(i + 1) == Some(&b')')).then_some(i + 2),
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// The offset just past the next `close` in `s` from `i`.
+fn skip_past(s: &[u8], i: usize, close: u8) -> Option<usize> {
+    s.get(i..)?
+        .iter()
+        .position(|&c| c == close)
+        .map(|n| i + n + 1)
+}
+
+/// The offset just past the `"` closing a double-quoted string whose
+/// inside starts at `i`.
+fn skip_double_quoted(s: &[u8], mut i: usize) -> Option<usize> {
+    loop {
+        match *s.get(i)? {
+            b'"' => return Some(i + 1),
+            b'\\' | b'`' | b'$' => i = skip_quoted(s, i, true)?,
+            _ => i += 1,
+        }
+    }
+}
+
+/// The offset just past the backquote closing a command substitution whose
+/// inside starts at `i`.
+fn skip_backtick(s: &[u8], mut i: usize) -> Option<usize> {
+    loop {
+        match *s.get(i)? {
+            b'`' => return Some(i + 1),
+            b'\\' => i += 2,
+            _ => i += 1,
+        }
+    }
+}
+
+/// The offset just past the `}` closing a `${...}` whose inside starts at
+/// `i`.
+fn skip_braces(s: &[u8], mut i: usize, in_dquotes: bool) -> Option<usize> {
+    let mut depth = 0usize;
+    loop {
+        match *s.get(i)? {
+            b'}' if depth == 0 => return Some(i + 1),
+            b'}' => {
+                depth -= 1;
+                i += 1;
+            }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'\\' | b'\'' | b'"' | b'`' | b'$' => i = skip_quoted(s, i, in_dquotes)?,
+            _ => i += 1,
+        }
+    }
 }

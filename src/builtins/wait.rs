@@ -114,6 +114,7 @@ pub struct WaitBuiltin {
     /// together with -n)
     #[arg(short = 'p')]
     pid_var: Option<String>,
+    /// The pids or jobs to wait for; every child when none
     ids: Vec<String>,
 }
 

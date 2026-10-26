@@ -18,12 +18,26 @@ categories = ["command-line-utilities", "os::linux-apis"]
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 rustyline = "19"
+# How wide completions are, to list them a page at a time.
+unicode-width = "0"
+# The interactive configuration file, ~/.config/swagsh/config.toml.
+serde = { version = "1", features = ["derive"] }
+toml = { version = "1", default-features = false, features = [
+  "parse",
+  "serde",
+] }
 rustc-hash = "2"
-rustix = { version = "1", features = ["event", "fs", "pipe", "termios", "process"] }
+rustix = { version = "1", features = [
+  "event",
+  "fs",
+  "pipe",
+  "termios",
+  "process",
+] }
 # Only for the C library services rustix does not expose publicly (fork,
 # execve, sigaction and the like); see src/sys.rs. Already in the graph via
 # rustyline, so it costs nothing to compile.
-libc = "0.2"
+libc = "0"
 
 [profile.release]
 strip = true

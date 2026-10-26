@@ -15,6 +15,7 @@ use crate::eval::Shell;
 use crate::jobs::ExitStatus;
 
 use super::Builtin;
+use super::help::{Example, Help, HelpPage};
 
 /// `eval` has no real flags of its own (just `eval [arg ...]`), but still
 /// goes through clap for the same reasons every other flagless-but-variadic
@@ -30,9 +31,11 @@ use super::Builtin;
 #[command(
     name = "eval",
     about = "Execute arguments as a shell command",
+    long_about = None,
     trailing_var_arg = true
 )]
 pub struct EvalBuiltin {
+    /// Words joined with spaces and run as commands
     #[arg(allow_hyphen_values = true)]
     words: Vec<String>,
 }
@@ -59,6 +62,7 @@ impl Builtin for EvalBuiltin {
 #[command(
     name = "exec",
     about = "Replace the shell with the given command",
+    long_about = None,
     trailing_var_arg = true
 )]
 pub struct ExecBuiltin {
@@ -71,14 +75,36 @@ pub struct ExecBuiltin {
     /// Place a dash in the zeroth argument to COMMAND
     #[arg(short = 'l')]
     pub login: bool,
-    /// COMMAND followed by *its* argv, kept as one trailing field (rather
-    /// than a separate `command: Option<String>` + `arguments: Vec<String>`)
-    /// so `trailing_var_arg` actually disables flag-parsing for all of it:
-    /// split across two positional fields, clap kept recognizing e.g. the
-    /// `-c` in `exec -a x sh -c "..."` as exec's own `-c` instead of
-    /// COMMAND's argument, even with `allow_hyphen_values` on both.
+    // COMMAND followed by *its* argv, kept as one trailing field (rather
+    // than a separate `command: Option<String>` + `arguments: Vec<String>`)
+    // so `trailing_var_arg` actually disables flag-parsing for all of it:
+    // split across two positional fields, clap kept recognizing e.g. the
+    // `-c` in `exec -a x sh -c "..."` as exec's own `-c` instead of
+    // COMMAND's argument, even with `allow_hyphen_values` on both.
+    /// The command to replace the shell with, and its arguments
     #[arg(allow_hyphen_values = true, value_name = "COMMAND")]
     pub command_and_args: Vec<String>,
+}
+
+/// `exec`'s help page, taken from [`ExecBuiltin`].
+pub struct Exec;
+
+impl Help for Exec {
+    fn help() -> HelpPage {
+        super::help::clap_page::<ExecBuiltin>(
+            &[
+                Example {
+                    command: "exec >log.txt 2>&1",
+                    meaning: "Send the rest of the script's output to log.txt",
+                },
+                Example {
+                    command: "exec zsh",
+                    meaning: "Replace this shell with zsh",
+                },
+            ],
+            &["With only redirections, they apply to the shell from then on."],
+        )
+    }
 }
 
 /// Placeholder for the `BUILTINS` table.
@@ -104,7 +130,9 @@ pub struct SourceBuiltin {
     /// Search PATH (colon-separated) for FILENAME instead of $PATH
     #[arg(short = 'p')]
     path: Option<String>,
+    /// The file to read commands from
     filename: String,
+    /// Positional parameters for the file, while it runs
     arguments: Vec<String>,
 }
 

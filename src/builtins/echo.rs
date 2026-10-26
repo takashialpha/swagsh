@@ -14,6 +14,8 @@ use crate::eval::Shell;
 use crate::expand::unescape;
 use crate::jobs::ExitStatus;
 
+use super::help::{Example, HandParsed, Help, HelpPage};
+
 /// `echo` treats a word as an option cluster only if it starts with
 /// `-` and every character after that is `n`/`e`/`E` (so `-ne`, `-en`, and
 /// repeats like `-nnee` all count, but `-x` or `-en3` don't): the first
@@ -23,8 +25,42 @@ fn is_echo_option(arg: &str) -> bool {
     arg.len() > 1 && arg.starts_with('-') && arg[1..].chars().all(|c| matches!(c, 'n' | 'e' | 'E'))
 }
 
-#[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
-pub fn builtin_echo(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+pub struct Echo;
+
+impl Help for Echo {
+    fn help() -> HelpPage {
+        HelpPage::manual(
+            "Write the arguments to standard output",
+            "echo [-neE] [ARG...]",
+            &[
+                ("-n", "Don't end with a newline"),
+                (
+                    "-e",
+                    "Expand backslash escapes (\\n, \\t, \\\\, \\0NNN, \\xHH, ...)",
+                ),
+                ("-E", "Don't expand them (the default)"),
+            ],
+            &[Example {
+                command: "echo -e 'a\\tb'",
+                meaning: "Print a and b with a tab between",
+            }],
+            &[
+                "With -e, `\\c` ends the output there, without the newline.",
+                "For anything portable, or starting with `-`, use printf.",
+            ],
+        )
+    }
+}
+
+impl HandParsed for Echo {
+    const HELP_FLAG: bool = false;
+
+    fn run(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+        echo(shell, args)
+    }
+}
+
+fn echo(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     let mut interpret_escapes = shell.shopt.xpg_echo;
     let mut no_newline = false;
     let mut start = 0;

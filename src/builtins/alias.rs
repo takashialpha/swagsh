@@ -54,6 +54,7 @@ pub struct UnaliasBuiltin {
     /// Remove every alias
     #[arg(short = 'a')]
     all: bool,
+    /// The aliases to remove
     names: Vec<String>,
 }
 

@@ -7,6 +7,7 @@ use rustix::fs::Mode;
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 
 use super::Builtin;
+use super::help::{Example, HandParsed, Help, HelpPage};
 use crate::eval::Shell;
 use crate::jobs::ExitStatus;
 use crate::sys::cpu_times;
@@ -220,11 +221,53 @@ const LIMITS: &[Limit] = &[
 /// Hand-parsed: resource letters combine freely (`-Hn`), and which one a
 /// LIMIT applies to is whichever came last, which clap cannot express.
 ///
-/// # Errors
-///
-/// Returns an error for an unknown flag, a malformed LIMIT, or a limit the
-/// kernel refuses.
-pub fn builtin_ulimit(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+pub struct Ulimit;
+
+impl Help for Ulimit {
+    fn help() -> HelpPage {
+        let mut options = vec![
+            ("-H".to_owned(), "Show or set the hard limit".to_owned()),
+            (
+                "-S".to_owned(),
+                "Show or set the soft limit (both, when setting)".to_owned(),
+            ),
+            ("-a".to_owned(), "Show every limit".to_owned()),
+        ];
+        options.extend(
+            LIMITS
+                .iter()
+                .map(|l| (format!("-{}", l.flag), l.what.to_owned())),
+        );
+        let options: Vec<(&str, &str)> = options
+            .iter()
+            .map(|(f, w)| (f.as_str(), w.as_str()))
+            .collect();
+        HelpPage::manual(
+            "Show or set limits on the resources of the shell and its commands",
+            "ulimit [-H|-S] [-a | -RESOURCE...] [LIMIT]",
+            &options,
+            &[
+                Example {
+                    command: "ulimit -n",
+                    meaning: "Show how many files a command may open",
+                },
+                Example {
+                    command: "ulimit -c unlimited",
+                    meaning: "Allow core dumps of any size",
+                },
+            ],
+            &["With no RESOURCE, -f (file size). LIMIT can be `unlimited`."],
+        )
+    }
+}
+
+impl HandParsed for Ulimit {
+    fn run(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+        builtin_ulimit(shell, args)
+    }
+}
+
+fn builtin_ulimit(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     let (mut hard, mut soft, mut all) = (false, false, false);
     let mut chosen: Vec<&Limit> = Vec::new();
     let mut value = None;

@@ -30,11 +30,22 @@ impl Shell {
         let mut i = 0;
         while i < items.len() {
             let is_last = i == last_index;
-            status = if aol.is_async && is_last {
-                self.run_pipeline_async(&items[i].command)?
+            // POSIX: `set -e` is off for every command of an and-or list
+            // but the last, and for a `!` pipeline, down through any
+            // function they call.
+            let tested = !is_last || items[i].command.negated;
+            if tested {
+                self.condition_depth += 1;
+            }
+            let result = if aol.is_async && is_last {
+                self.run_pipeline_async(&items[i].command)
             } else {
-                self.run_pipeline(&items[i].command)?
+                self.run_pipeline(&items[i].command)
             };
+            if tested {
+                self.condition_depth -= 1;
+            }
+            status = result?;
             last_negated = items[i].command.negated;
             last_executed = i;
             match items[i].op {
@@ -111,9 +122,8 @@ impl Shell {
     pub(super) fn run_for(&mut self, fc: &ForClause) -> Result<ExitStatus> {
         // `expand_words`, not a flatten of per-word `expand_word`: a `for`
         // list is a word list exactly like a command's arguments, so an
-        // unquoted `$v` or `$(...)` in it undergoes IFS field splitting.
-        // Only `expand_words` does that step, so `for w in $v` used to
-        // iterate once over the whole value instead of once per field.
+        // unquoted `$v` or `$(...)` in it undergoes IFS field splitting,
+        // which only `expand_words` does.
         let items = self.expand_words(&fc.items)?;
 
         self.loop_depth += 1;

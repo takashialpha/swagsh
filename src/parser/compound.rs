@@ -3,7 +3,7 @@ use crate::ast::{
     GroupCmd, IfClause, WhileClause, Word,
 };
 use crate::expand::find_unnested;
-use crate::lexer::{CondToken, Token};
+use crate::lexer::{CondToken, PROC_SUB, QUOTE_END, QUOTE_START, Token};
 
 use super::{ParseResult, Parser, Spanned, keyword_text};
 
@@ -37,12 +37,12 @@ impl Parser<'_> {
 
         self.expect(&Token::Fi)?;
 
-        Ok(Command::If(IfClause {
+        Ok(Command::If(Box::new(IfClause {
             condition,
             then_body,
             elif_clauses,
             else_body,
-        }))
+        })))
     }
 
     pub(super) fn parse_for(&mut self) -> ParseResult<Command> {
@@ -53,7 +53,7 @@ impl Parser<'_> {
             return self.parse_arith_for(&text);
         }
 
-        let var = match self.advance().clone() {
+        let var = match self.take() {
             Token::Word(name) => name,
             ref other if let Some(text) = keyword_text(other) => text.to_owned(),
             other => {
@@ -62,7 +62,7 @@ impl Parser<'_> {
         };
 
         let (items, body) = self.parse_for_rest()?;
-        Ok(Command::For(ForClause { var, items, body }))
+        Ok(Command::For(Box::new(ForClause { var, items, body })))
     }
 
     /// What follows a `for` or `select` loop's name: `in words` if there,
@@ -72,9 +72,8 @@ impl Parser<'_> {
 
         let items = if self.eat(&Token::In) {
             let mut words = Vec::new();
-            while let Token::Word(w) = self.peek().clone() {
+            while let Some(w) = self.take_word() {
                 self.push_words(w, &mut words)?;
-                self.advance();
             }
             words
         } else {
@@ -179,7 +178,7 @@ impl Parser<'_> {
                 )
             );
         let name = if named {
-            let Token::Word(name) = self.advance().clone() else {
+            let Token::Word(name) = self.take() else {
                 return Err(self.err("expected a name after `coproc`"));
             };
             name
@@ -202,11 +201,11 @@ impl Parser<'_> {
     #[inline(never)]
     pub(super) fn parse_select(&mut self) -> ParseResult<Command> {
         self.advance();
-        let Token::Word(var) = self.advance().clone() else {
+        let Token::Word(var) = self.take() else {
             return Err(self.err("expected a name after `select`"));
         };
         let (items, body) = self.parse_for_rest()?;
-        Ok(Command::Select(ForClause { var, items, body }))
+        Ok(Command::Select(Box::new(ForClause { var, items, body })))
     }
 
     pub(super) fn parse_while(&mut self, until: bool) -> ParseResult<Command> {
@@ -226,7 +225,7 @@ impl Parser<'_> {
     pub(super) fn parse_case(&mut self) -> ParseResult<Command> {
         self.expect(&Token::Case)?;
 
-        let word_raw = match self.advance().clone() {
+        let word_raw = match self.take() {
             Token::Word(w) => w,
             ref other if let Some(text) = keyword_text(other) => text.to_owned(),
             other => return Err(self.err(format!("expected word after `case`, got `{other}`"))),
@@ -248,7 +247,7 @@ impl Parser<'_> {
 
             let mut patterns = Vec::new();
             loop {
-                match self.advance().clone() {
+                match self.take() {
                     Token::Word(p) => patterns.push(self.parse_word_str(p)?),
                     // A case pattern is always plain text, never a
                     // reserved word, regardless of what precedes it
@@ -318,7 +317,17 @@ impl Parser<'_> {
     pub(super) fn parse_function_def(&mut self) -> ParseResult<Command> {
         let has_keyword = self.eat(&Token::Function);
 
-        let name = match self.advance().clone() {
+        let name = match self.take() {
+            // A name is the word as written: quoting or an expansion in it
+            // could never be called by.
+            Token::Word(n)
+                if n.contains(['\'', '"', '\\', '$', '`', QUOTE_START, QUOTE_END, PROC_SUB]) =>
+            {
+                return Err(self.err(format!(
+                    "bad function name `{}`",
+                    n.replace([QUOTE_START, QUOTE_END], "'")
+                )));
+            }
             Token::Word(n) => n,
             other => return Err(self.err(format!("expected function name, got `{other}`"))),
         };
@@ -336,7 +345,7 @@ impl Parser<'_> {
 
         Ok(Command::FunctionDef(FunctionDef {
             name,
-            body: Box::new(body),
+            body: std::rc::Rc::new(body),
         }))
     }
 }

@@ -914,9 +914,9 @@ impl Env {
 
     /// Defines function `name`, read from file `source` (for
     /// `BASH_SOURCE`; empty when it was not read from a file).
-    pub fn define_function(&mut self, name: String, body: Command, source: Rc<str>) {
+    pub fn define_function(&mut self, name: String, body: Rc<Command>, source: Rc<str>) {
         self.function_sources.insert(name.clone(), source);
-        self.functions.insert(name, Rc::new(body));
+        self.functions.insert(name, body);
     }
 
     /// The file function `name` was defined in.

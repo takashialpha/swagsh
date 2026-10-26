@@ -58,6 +58,9 @@ done
 | `eval_arith` | Arithmetic expansion, `$(( ))` | No fallback value, so any panic is unambiguously a bug |
 | `unescape` | Escape-sequence expansion (`echo -e`/`printf`) | Hand-walks bounded digit runs, the kind of manual indexing that panics on an off-by-one |
 | `param_expand` | Glob/pattern matching and `${var...}` operators | Bundled into one target since none is individually large enough for its own corpus |
+| `unparse` | Printing a function back (`declare -f`), then parsing that | Checks a property, not just "no panic": what is printed must parse, and print the same again |
+| `brace` | Brace expansion (`{a,b}`, `{1..9..2}`) | Splits ranges and nested lists by hand, and has size limits that must hold |
+| `histexpand` | History expansion at the prompt (`!!`, `!$`, `:s/a/b/`) | Hand-written parser indexing into the words of a fuzzed history |
 
 ## On a crash or a slow-unit report
 

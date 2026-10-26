@@ -6,6 +6,7 @@ use crate::eval::Shell;
 use crate::jobs::ExitStatus;
 
 use super::Builtin;
+use super::help::{Example, HandParsed, Help, HelpPage};
 
 #[derive(Parser)]
 #[command(name = "unset", about = "Unset variables and/or functions")]
@@ -19,6 +20,7 @@ pub struct UnsetBuiltin {
     /// Unset a reference variable itself, not the variable it refers to
     #[arg(short = 'n')]
     nameref: bool,
+    /// The variables or functions to remove
     names: Vec<String>,
 }
 
@@ -97,8 +99,57 @@ fn unset_element(shell: &mut Shell, name: &str, index: &str) -> Result<()> {
 /// after) does not touch them at all: both reduce to "nothing left" after
 /// flag-scanning, so `apply_set_flags` reports whether it actually saw a
 /// `--` to tell the two apart.
-#[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
-pub fn builtin_set(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+pub struct Set;
+
+impl Help for Set {
+    fn help() -> HelpPage {
+        let mut options = vec![(
+            "-o OPTION".to_owned(),
+            "Turn on OPTION, by its long name".to_owned(),
+        )];
+        for o in OPTIONS {
+            options.push(o.letter.map_or_else(
+                || (format!("-o {}", o.name), o.what.to_owned()),
+                |l| (format!("-{l}"), format!("{} ({})", o.what, o.name)),
+            ));
+        }
+        let options: Vec<(&str, &str)> = options
+            .iter()
+            .map(|(f, w)| (f.as_str(), w.as_str()))
+            .collect();
+        HelpPage::manual(
+            "Set shell options and the positional parameters",
+            "set [-abCefHmnuvx] [-o OPTION] [--] [ARG...]",
+            &options,
+            &[
+                Example {
+                    command: "set -eu",
+                    meaning: "Exit on a failed command or an unset variable",
+                },
+                Example {
+                    command: "set -- a b",
+                    meaning: "Make $1 a and $2 b",
+                },
+                Example {
+                    command: "set +o",
+                    meaning: "Print the commands that restore the current options",
+                },
+            ],
+            &[
+                "`+` instead of `-` turns an option off.",
+                "With no arguments, prints every variable. `set --` clears $1, $2, ...",
+            ],
+        )
+    }
+}
+
+impl HandParsed for Set {
+    fn run(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+        builtin_set(shell, args)
+    }
+}
+
+fn builtin_set(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     if args.is_empty() {
         return print_all_vars(shell);
     }
@@ -177,12 +228,15 @@ fn apply_set_flags<'a>(shell: &mut Shell, args: &'a [&'a str]) -> Result<(&'a [&
                 .iter()
                 .find(|o| o.name == name)
                 .ok_or_else(|| anyhow::anyhow!("set: {name}: invalid option name"))?;
-            set_option(shell, option.letter, enable);
+            match option.letter {
+                Some(letter) => set_option(shell, letter, enable),
+                None => set_named_option(shell, name, enable),
+            }
             i += 1;
             continue;
         }
         for c in rest.chars() {
-            if !OPTIONS.iter().any(|o| o.letter == c) {
+            if !OPTIONS.iter().any(|o| o.letter == Some(c)) {
                 anyhow::bail!(
                     "set: {arg}: invalid option\nset: usage: set [-abCefHmnuvx] [-o option] [--] [arg ...]"
                 );
@@ -195,55 +249,84 @@ fn apply_set_flags<'a>(shell: &mut Shell, args: &'a [&'a str]) -> Result<(&'a [&
 }
 
 struct ShellOption {
-    letter: char,
+    /// `None` for an option with only a long name (`pipefail`).
+    letter: Option<char>,
     name: &'static str,
+    /// What it does, for `help set`.
+    what: &'static str,
 }
 
 /// Every `set` option this shell implements, in `set -o` listing order.
 const OPTIONS: &[ShellOption] = &[
     ShellOption {
-        letter: 'a',
+        letter: Some('a'),
         name: "allexport",
+        what: "Export every variable that is assigned",
     },
     ShellOption {
-        letter: 'e',
+        letter: None,
+        name: "emacs",
+        what: "Emacs keys at the prompt (the opposite of `vi`)",
+    },
+    ShellOption {
+        letter: Some('e'),
         name: "errexit",
+        what: "Exit when a command fails",
     },
     ShellOption {
-        letter: 'H',
+        letter: Some('H'),
         name: "histexpand",
+        what: "Expand `!` history references at the prompt",
     },
     ShellOption {
-        letter: 'm',
+        letter: Some('m'),
         name: "monitor",
+        what: "Job control: run jobs in their own process groups",
     },
     ShellOption {
-        letter: 'C',
+        letter: Some('C'),
         name: "noclobber",
+        what: "Don't let `>` overwrite an existing file",
     },
     ShellOption {
-        letter: 'n',
+        letter: Some('n'),
         name: "noexec",
+        what: "Read commands without running them",
     },
     ShellOption {
-        letter: 'f',
+        letter: Some('f'),
         name: "noglob",
+        what: "Don't expand pathname patterns",
     },
     ShellOption {
-        letter: 'b',
+        letter: Some('b'),
         name: "notify",
+        what: "Report finished jobs at once, not at the next prompt",
     },
     ShellOption {
-        letter: 'u',
+        letter: Some('u'),
         name: "nounset",
+        what: "Treat expanding an unset variable as an error",
     },
     ShellOption {
-        letter: 'v',
+        letter: None,
+        name: "pipefail",
+        what: "A pipeline fails when any of its commands fails",
+    },
+    ShellOption {
+        letter: Some('v'),
         name: "verbose",
+        what: "Print each command as it is read",
     },
     ShellOption {
-        letter: 'x',
+        letter: None,
+        name: "vi",
+        what: "Vi keys at the prompt",
+    },
+    ShellOption {
+        letter: Some('x'),
         name: "xtrace",
+        what: "Print each command, expanded, before running it",
     },
 ];
 
@@ -264,26 +347,53 @@ fn set_option(shell: &mut Shell, letter: char, enable: bool) {
     }
 }
 
+/// Sets an option that has only a long name.
+fn set_named_option(shell: &mut Shell, name: &str, enable: bool) {
+    match name {
+        "pipefail" => shell.pipefail = enable,
+        "vi" => shell.vi = Some(enable),
+        "emacs" => shell.vi = Some(!enable),
+        _ => {}
+    }
+}
+
+/// Turns each `set` option on or off as `flags` (as in `$-`) says, for
+/// `local -` when its function returns.
+pub fn restore_options(shell: &mut Shell, flags: &str) {
+    let current = shell.option_flags();
+    for letter in OPTIONS.iter().filter_map(|o| o.letter) {
+        let enable = flags.contains(letter);
+        if current.contains(letter) != enable {
+            set_option(shell, letter, enable);
+        }
+    }
+}
+
 /// Whether the `set -o` option named `name` is on (`test -o name`).
 pub(super) fn option_is_on(shell: &Shell, name: &str) -> bool {
     OPTIONS
         .iter()
         .find(|o| o.name == name)
-        .is_some_and(|o| option_enabled(shell, o.letter))
+        .is_some_and(|o| option_enabled(shell, o))
 }
 
-fn option_enabled(shell: &Shell, letter: char) -> bool {
-    shell.option_flags().contains(letter)
+fn option_enabled(shell: &Shell, option: &ShellOption) -> bool {
+    match (option.letter, option.name) {
+        (Some(letter), _) => shell.option_flags().contains(letter),
+        (None, "vi") => shell.vi == Some(true),
+        (None, "emacs") => shell.vi != Some(true),
+        (None, _) => shell.pipefail,
+    }
 }
 
 /// `set -o` lists every option and whether it is on; `set +o` prints the
 /// `set` commands that would restore the current settings.
 fn print_set_o_status(shell: &mut Shell, human: bool) -> Result<()> {
     for option in OPTIONS {
-        let on = option_enabled(shell, option.letter);
+        let on = option_enabled(shell, option);
         if human {
             shell.outln(&format!(
-                "{:<15}{}",
+                "{:<15}\t{}",
                 option.name,
                 if on { "on" } else { "off" }
             ))?;
@@ -323,6 +433,7 @@ impl Builtin for SetOperandsBuiltin {
     allow_negative_numbers = true
 )]
 pub struct ShiftBuiltin {
+    /// How many positional parameters to drop (1 when left out)
     count: Option<i64>,
 }
 

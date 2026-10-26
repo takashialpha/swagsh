@@ -12,6 +12,7 @@ use std::fmt::Write as _;
 use anyhow::{Result, anyhow, bail};
 use clap::Parser;
 
+use super::help::{Example, HandParsed, Help, HelpPage};
 use super::{Builtin, BuiltinFailed};
 use crate::env::{Attrs, double_quote};
 use crate::errfmt::emit;
@@ -128,37 +129,158 @@ fn parse_flags<'a>(
     Ok((flags, &args[i..]))
 }
 
+/// The attributes `declare` and `local` give, for their help pages.
+const ATTRIBUTES: &[(&str, &str)] = &[
+    ("-a", "Make each NAME an indexed array"),
+    ("-A", "Make each NAME an associative array"),
+    ("-i", "Integer: assignments are evaluated as arithmetic"),
+    ("-l", "Lowercase the value on assignment"),
+    ("-u", "Uppercase the value on assignment"),
+    (
+        "-n",
+        "Make NAME a reference to the variable its value names",
+    ),
+    ("-r", "Make NAME readonly"),
+    ("-x", "Export NAME to commands"),
+];
+
+/// The page of `declare`, `local` or another declaration command:
+/// `ATTRIBUTES` plus `extra` options.
+fn declaration_page(
+    summary: &str,
+    usage: &str,
+    extra: &[(&str, &str)],
+    examples: &'static [Example],
+    notes: &'static [&'static str],
+) -> HelpPage {
+    let options: Vec<(&str, &str)> = ATTRIBUTES.iter().chain(extra).copied().collect();
+    HelpPage::manual(summary, usage, &options, examples, notes)
+}
+
 /// `declare [-aAfFgilnprux] [name[=value] ...]`, and `typeset`.
-///
-/// # Errors
-///
-/// Returns an error for a bad option or a failed write.
-pub fn builtin_declare(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+pub struct Declare;
+
+impl Help for Declare {
+    fn help() -> HelpPage {
+        declaration_page(
+            "Set the values and attributes of variables",
+            "declare [-aAfFgilnprux] [NAME[=VALUE]...]",
+            &[
+                (
+                    "-p",
+                    "Print the declarations of NAMEs, or of every variable",
+                ),
+                ("-f", "Print the definitions of functions"),
+                ("-F", "Print only the names of functions"),
+                ("-g", "In a function, make NAMEs global rather than local"),
+            ],
+            &[
+                Example {
+                    command: "declare -A ages=([ann]=31)",
+                    meaning: "Make ages an associative array",
+                },
+                Example {
+                    command: "declare -p PATH",
+                    meaning: "Show how PATH is declared",
+                },
+            ],
+            &[
+                "`+` instead of `-` takes an attribute away.",
+                "In a function, NAMEs are local unless -g; `typeset` is the same.",
+            ],
+        )
+    }
+}
+
+impl HandParsed for Declare {
+    fn run(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+        builtin_declare(shell, args)
+    }
+}
+
+fn builtin_declare(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     let (flags, operands) = parse_flags("declare", args, "aAfFgilnprux")?;
     declare(shell, "declare", &flags, operands, Scope::Auto)
 }
 
 /// `local [-aAilnrux] [name[=value] ...]`: `declare` for the running
 /// function only. A name given without a value keeps the value it had
-/// outside until assigned.
-///
-/// # Errors
-///
-/// Returns an error outside a function, or for a bad option.
-pub fn builtin_local(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+/// outside until assigned. A `-` operand makes the function's changes to
+/// the shell options last only until it returns.
+pub struct Local;
+
+impl Help for Local {
+    fn help() -> HelpPage {
+        declaration_page(
+            "Make variables that belong to the running function",
+            "local [-aAilnrux] [NAME[=VALUE]...] [-]",
+            &[(
+                "-",
+                "Undo the function's changes to `set` options when it returns",
+            )],
+            &[Example {
+                command: "local i count=0",
+                meaning: "Make i and count the function's own",
+            }],
+            &[
+                "Functions it calls see its variables too.",
+                "A NAME without a value keeps the value it had until assigned.",
+            ],
+        )
+    }
+}
+
+impl HandParsed for Local {
+    fn run(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+        builtin_local(shell, args)
+    }
+}
+
+fn builtin_local(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     let (flags, operands) = parse_flags("local", args, "aAilnrux")?;
     if !shell.env.in_function() {
         bail!("local: can only be used in a function");
+    }
+    if operands.contains(&"-") {
+        shell.localize_options();
+        let operands: Vec<&str> = operands.iter().copied().filter(|&o| o != "-").collect();
+        if operands.is_empty() {
+            return Ok(ExitStatus::SUCCESS);
+        }
+        return declare(shell, "local", &flags, &operands, Scope::Local);
     }
     declare(shell, "local", &flags, operands, Scope::Local)
 }
 
 /// `readonly [-aAp] [name[=value] ...]`.
-///
-/// # Errors
-///
-/// Returns an error for a bad option or a failed write.
-pub fn builtin_readonly(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+pub struct Readonly;
+
+impl Help for Readonly {
+    fn help() -> HelpPage {
+        HelpPage::manual(
+            "Make variables unchangeable",
+            "readonly [-aAp] [NAME[=VALUE]...]",
+            &[
+                ("-a", "Make each NAME an indexed array"),
+                ("-A", "Make each NAME an associative array"),
+                ("-p", "Print the readonly variables"),
+            ],
+            &[Example {
+                command: "readonly VERSION=1.2",
+                meaning: "Set VERSION for good",
+            }],
+            &["A readonly variable cannot be assigned or unset again."],
+        )
+    }
+}
+
+impl HandParsed for Readonly {
+    fn run(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+        builtin_readonly(shell, args)
+    }
+}
+
+fn builtin_readonly(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     let (mut flags, operands) = parse_flags("readonly", args, "aAp")?;
     if operands.is_empty() {
         let lines: Vec<String> = shell
@@ -178,11 +300,33 @@ pub fn builtin_readonly(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> 
 }
 
 /// `export [-np] [name[=value] ...]`. `-n` takes the export attribute away.
-///
-/// # Errors
-///
-/// Returns an error for a bad option or a failed write.
-pub fn builtin_export(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+pub struct Export;
+
+impl Help for Export {
+    fn help() -> HelpPage {
+        HelpPage::manual(
+            "Pass variables on to the commands the shell runs",
+            "export [-np] [NAME[=VALUE]...]",
+            &[
+                ("-n", "Stop exporting each NAME"),
+                ("-p", "Print the exported variables"),
+            ],
+            &[Example {
+                command: "export EDITOR=vim",
+                meaning: "Set EDITOR for every command run from here",
+            }],
+            &["`VAR=value command` passes VAR to that one command only."],
+        )
+    }
+}
+
+impl HandParsed for Export {
+    fn run(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+        builtin_export(shell, args)
+    }
+}
+
+fn builtin_export(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     let (mut flags, operands) = parse_flags("export", args, "np")?;
     let remove = args
         .iter()

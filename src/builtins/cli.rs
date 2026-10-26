@@ -47,7 +47,7 @@ pub fn dispatch<B: Builtin>(shell: &mut Shell, args: &[&str]) -> Result<ExitStat
     }
 }
 
-fn command_for<T: Parser>() -> Command {
+pub(super) fn command_for<T: Parser>() -> Command {
     T::command().no_binary_name(true).disable_version_flag(true)
 }
 

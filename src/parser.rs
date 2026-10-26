@@ -97,6 +97,9 @@ impl Nest<'_> {
 /// as any lookahead in the grammar reaches (`is_function_def_ahead`).
 const LOOKAHEAD: usize = 1;
 
+/// How many consumed tokens a long list keeps before dropping them.
+const DISCARD_AFTER: usize = 256;
+
 /// The commands whose `name=value` arguments are assignment words.
 const DECLARATION_COMMANDS: [&str; 5] = ["declare", "export", "local", "readonly", "typeset"];
 
@@ -160,8 +163,12 @@ impl<'src> Parser<'src> {
     /// instances: otherwise a few thousand nested `$(` would overflow the
     /// stack even though the identical depth of `{ }` is rejected cleanly.
     fn new_at_depth(src: &'src str, depth: usize, aliases: Option<Rc<Aliases>>) -> Self {
+        Self::with_lexer(Lexer::new(src), depth, aliases)
+    }
+
+    fn with_lexer(lexer: Lexer<'src>, depth: usize, aliases: Option<Rc<Aliases>>) -> Self {
         let mut parser = Self {
-            lexer: Lexer::new(src),
+            lexer,
             lexed_eof: false,
             lex_error: None,
             tokens: Vec::new(),
@@ -305,6 +312,29 @@ impl<'src> Parser<'src> {
     #[inline]
     fn peek_spanned(&self) -> &Spanned {
         &self.tokens[self.pos]
+    }
+
+    /// Moves past the current token, handing it over rather than a copy:
+    /// a token behind `pos` is never looked at again. The end of input stays
+    /// where it is, for every later look at it.
+    fn take(&mut self) -> Token {
+        let slot = &mut self.tokens[self.pos].token;
+        if matches!(slot, Token::Eof) {
+            return Token::Eof;
+        }
+        let token = std::mem::replace(slot, Token::Newline);
+        self.advance();
+        token
+    }
+
+    /// [`Parser::take`] for a word: its text, if the current token is one.
+    fn take_word(&mut self) -> Option<String> {
+        let Token::Word(word) = &mut self.tokens[self.pos].token else {
+            return None;
+        };
+        let word = std::mem::take(word);
+        self.advance();
+        Some(word)
     }
 
     /// Moves past the current token, returning it. Every way `pos` moves
@@ -457,6 +487,8 @@ impl<'src> Parser<'src> {
     /// without bound.
     fn discard_consumed(&mut self) {
         let n = self.pos.saturating_sub(1);
+        // A here-doc still waiting for its body keeps its place.
+        let n = self.unfilled_heredocs.iter().copied().fold(n, usize::min);
         if n == 0 {
             return;
         }
@@ -491,6 +523,11 @@ impl<'src> Parser<'src> {
             let aol = self.parse_and_or()?;
             list.push(aol);
             self.skip_newlines();
+            // A long compound command would otherwise keep every token it
+            // was made of until it ends.
+            if self.pos > DISCARD_AFTER {
+                self.discard_consumed();
+            }
         }
 
         Ok(list)
@@ -595,7 +632,15 @@ impl<'src> Parser<'src> {
 
         commands.push(self.parse_command()?);
 
-        while self.eat(&Token::Pipe) {
+        loop {
+            if self.eat(&Token::PipeAnd) {
+                // `a |& b` is `a 2>&1 | b`.
+                if let Some(last) = commands.pop() {
+                    commands.push(with_stderr_to_stdout(last));
+                }
+            } else if !self.eat(&Token::Pipe) {
+                break;
+            }
             self.skip_newlines();
             commands.push(self.parse_command()?);
         }
@@ -703,8 +748,7 @@ impl<'src> Parser<'src> {
                     continue;
                 }
             }
-            if let Token::Word(w) = self.peek().clone() {
-                self.advance();
+            if let Some(w) = self.take_word() {
                 let w = if assigning && w.contains('=') {
                     match self.parse_assign_word(w)? {
                         Ok(assign) => {
@@ -727,7 +771,7 @@ impl<'src> Parser<'src> {
                 if !assigning {
                     return Err(self.err("unexpected `(`"));
                 }
-                let Token::ArrayAssign(literal) = self.advance().clone() else {
+                let Token::ArrayAssign(literal) = self.take() else {
                     continue;
                 };
                 let ArrayLiteral { head, items } = *literal;
@@ -911,21 +955,16 @@ impl<'src> Parser<'src> {
 
     fn parse_redirect(&mut self) -> ParseResult<Redirect> {
         self.read_heredoc_body_at(self.pos);
-        match self.advance().clone() {
+        match self.take() {
             Token::Redir(RedirToken { kind, fd, fd_var }) => {
-                let target_tok = self.peek().clone();
-                let target = match target_tok {
-                    Token::Word(w) => {
-                        let word = self.parse_word_str(w)?;
-                        self.advance();
-                        word
-                    }
-                    ref tok if let Some(text) = keyword_text(tok) => {
-                        let word = self.parse_word_str(text.to_owned())?;
-                        self.advance();
-                        word
-                    }
-                    _ => return Err(self.err("expected filename after redirection")),
+                let target = if let Some(w) = self.take_word() {
+                    self.parse_word_str(w)?
+                } else if let Some(text) = keyword_text(self.peek()) {
+                    let word = self.parse_word_str(text.to_owned())?;
+                    self.advance();
+                    word
+                } else {
+                    return Err(self.err("expected filename after redirection"));
                 };
 
                 let (rk, default_fd) = match kind {
@@ -973,26 +1012,45 @@ impl<'src> Parser<'src> {
     }
 }
 
+/// `command` with `2>&1` after its other redirections.
+fn with_stderr_to_stdout(command: Command) -> Command {
+    let redirect = Redirect {
+        kind: RedirectKind::Dup,
+        fd: 2,
+        target: Word::Literal("1".to_owned()),
+        fd_var: None,
+    };
+    match command {
+        Command::Simple(mut sc) => {
+            sc.redirects.push(redirect);
+            Command::Simple(sc)
+        }
+        Command::Redirected(inner, mut redirects) => {
+            redirects.push(redirect);
+            Command::Redirected(inner, redirects)
+        }
+        other => Command::Redirected(Box::new(other), vec![redirect]),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Word decomposition
 // ---------------------------------------------------------------------------
 
 fn parse_dollar(
+    raw: &str,
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+    in_dquotes: bool,
     nest: Nest<'_>,
 ) -> ParseResult<Option<Word>> {
     match chars.peek().map(|(_, c)| *c) {
         Some('(') => {
-            if chars.clone().nth(1).map(|(_, c)| c) == Some('(') {
-                let fragment = collect_balanced(chars, '(', ')')?;
-                let expr = fragment
-                    .strip_prefix("$((")
-                    .and_then(|s| s.strip_suffix("))"))
-                    .unwrap_or("")
-                    .to_owned();
-                return Ok(Some(Word::Arith(expr)));
+            let fragment = collect_balanced(raw, chars, in_dquotes)?;
+            if let Some(rest) = fragment.strip_prefix("$((")
+                && crate::lexer::is_arith(rest.as_bytes())
+            {
+                return Ok(Some(Word::Arith(rest[..rest.len() - 2].to_owned())));
             }
-            let fragment = collect_balanced(chars, '(', ')')?;
             let inner = &fragment[2..fragment.len() - 1];
             let prog = Parser::new_at_depth(inner, nest.depth + 1, nest.aliases.cloned())
                 .parse()
@@ -1003,7 +1061,7 @@ fn parse_dollar(
             Ok(Some(Word::CmdSub(Box::new(prog.into_command()))))
         }
         Some('{') => {
-            let fragment = collect_balanced(chars, '{', '}')?;
+            let fragment = collect_balanced(raw, chars, in_dquotes)?;
             Ok(Some(Word::Var(fragment[2..fragment.len() - 1].to_owned())))
         }
         _ => {
@@ -1114,7 +1172,7 @@ fn decompose_word(raw: &str, nest: Nest<'_>, in_dquotes: bool) -> ParseResult<Ve
 
     while let Some((_, ch)) = chars.next() {
         match ch {
-            '$' => match parse_dollar(&mut chars, nest)? {
+            '$' => match parse_dollar(raw, &mut chars, in_dquotes, nest)? {
                 Some(word) => {
                     flush_lit!();
                     parts.push(word);
@@ -1126,7 +1184,7 @@ fn decompose_word(raw: &str, nest: Nest<'_>, in_dquotes: bool) -> ParseResult<Ve
                 flush_lit!();
                 let output = chars.next().is_some_and(|(_, c)| c == '>');
                 chars.next_if(|&(_, c)| c == '$');
-                if let Some(Word::CmdSub(cmd)) = parse_dollar(&mut chars, nest)? {
+                if let Some(Word::CmdSub(cmd)) = parse_dollar(raw, &mut chars, in_dquotes, nest)? {
                     parts.push(Word::ProcSub { cmd, output });
                 }
             }
@@ -1140,12 +1198,12 @@ fn decompose_word(raw: &str, nest: Nest<'_>, in_dquotes: bool) -> ParseResult<Ve
                     }
                     inner.push(c);
                 }
-                parts.push(Word::Quoted(Box::new(Word::Literal(inner))));
+                push_quoted(&mut parts, &inner);
             }
 
             '"' => {
                 flush_lit!();
-                parts.push(read_double_quoted(&mut chars, nest)?);
+                parts.push(read_double_quoted(raw, &mut chars, nest)?);
             }
 
             '`' => {
@@ -1154,7 +1212,7 @@ fn decompose_word(raw: &str, nest: Nest<'_>, in_dquotes: bool) -> ParseResult<Ve
             }
 
             '\\' if in_dquotes => match chars.peek().map(|&(_, c)| c) {
-                Some('$' | '`' | '"' | '\\') => {
+                Some('$' | '`' | '"' | '\\' | QUOTE_START | QUOTE_END | PROC_SUB) => {
                     if let Some((_, c)) = chars.next() {
                         lit.push(c);
                     }
@@ -1168,7 +1226,7 @@ fn decompose_word(raw: &str, nest: Nest<'_>, in_dquotes: bool) -> ParseResult<Ve
             '\\' => {
                 if let Some((_, next)) = chars.next() {
                     flush_lit!();
-                    parts.push(Word::Quoted(Box::new(Word::Literal(next.to_string()))));
+                    push_quoted(&mut parts, next.encode_utf8(&mut [0; 4]));
                 }
             }
 
@@ -1185,9 +1243,22 @@ fn decompose_word(raw: &str, nest: Nest<'_>, in_dquotes: bool) -> ParseResult<Ve
     Ok(parts)
 }
 
+/// Adds quoted text `text` to `parts`, joined to the quoted text before it
+/// if any, so that `'a'\b'c'` is one part.
+fn push_quoted(parts: &mut Vec<Word>, text: &str) {
+    if let Some(Word::Quoted(prev)) = parts.last_mut()
+        && let Word::Literal(prev) = prev.as_mut()
+    {
+        prev.push_str(text);
+    } else {
+        parts.push(Word::Quoted(Box::new(Word::Literal(text.to_owned()))));
+    }
+}
+
 /// Reads a `"..."` region, starting just past the opening quote, and returns
 /// it as a single [`Word::Quoted`].
 fn read_double_quoted(
+    raw: &str,
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
     nest: Nest<'_>,
 ) -> ParseResult<Word> {
@@ -1210,10 +1281,10 @@ fn read_double_quoted(
             // closing quote. The `decompose_word` call below re-parses it
             // properly once `inner` is correctly bounded.
             '$' if chars.peek().map(|&(_, c)| c) == Some('(') => {
-                inner.push_str(&collect_balanced(chars, '(', ')')?);
+                inner.push_str(&collect_balanced(raw, chars, true)?);
             }
             '$' if chars.peek().map(|&(_, c)| c) == Some('{') => {
-                inner.push_str(&collect_balanced(chars, '{', '}')?);
+                inner.push_str(&collect_balanced(raw, chars, true)?);
             }
             _ => inner.push(c),
         }
@@ -1255,42 +1326,33 @@ fn read_backtick(
     Ok(Word::CmdSub(Box::new(program.into_command())))
 }
 
+/// Reads a `$(...)`, `$((...))` or `${...}` of word `raw`, from the `(` or
+/// `{` that `chars` is at, and returns it whole, with its `$`. `in_dquotes`
+/// says whether it is inside double quotes.
 fn collect_balanced(
+    raw: &str,
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
-    open: char,
-    close: char,
+    in_dquotes: bool,
 ) -> ParseResult<String> {
-    let mut buf = String::from('$');
-    let mut depth = 0usize;
-
-    for (_, c) in chars.by_ref() {
-        buf.push(c);
-        if c == open {
-            depth += 1;
-        } else if c == close {
-            // Saturating, not `-= 1`: every current call site peeks the
-            // opening delimiter before calling, so `depth` is at least 1
-            // here, but that is a convention among callers rather than
-            // anything this function enforces. An underflow would panic in
-            // debug and wrap to `usize::MAX` in release.
-            depth = depth.saturating_sub(1);
-            if depth == 0 {
-                break;
-            }
-        }
+    let unterminated = || ParseError {
+        line: 0,
+        col: 0,
+        msg: "unterminated `$(...)` or `${...}` in word".to_owned(),
+        incomplete: true,
+        in_heredoc: false,
+    };
+    let &(open, _) = chars.peek().ok_or_else(unterminated)?;
+    let start = open + 1;
+    let rest = &raw.as_bytes()[start..];
+    let len = if raw.as_bytes()[open] == b'{' {
+        crate::lexer::param_len(rest, in_dquotes)
+    } else {
+        crate::lexer::cmd_sub_len(rest)
     }
-
-    if depth != 0 {
-        return Err(ParseError {
-            line: 0,
-            col: 0,
-            msg: format!("unterminated `{open}...{close}` in word"),
-            incomplete: true,
-            in_heredoc: false,
-        });
-    }
-
-    Ok(buf)
+    .ok_or_else(unterminated)?;
+    let close = start + len;
+    while chars.next_if(|&(i, _)| i <= close).is_some() {}
+    Ok(format!("${}", &raw[open..=close]))
 }
 
 // ---------------------------------------------------------------------------
@@ -1389,6 +1451,19 @@ pub fn parse(src: &str) -> ParseResult<Program> {
 /// Returns an error if `src` fails to lex or parse.
 pub fn parse_with_aliases(src: &str, aliases: Rc<Aliases>) -> ParseResult<Program> {
     let mut parser = Parser::with_aliases(src, Some(aliases));
+    parser.lexer.hold_unterminated_heredocs();
+    parser.parse()
+}
+
+/// [`parse_with_aliases`] for text that starts on line `line` of its
+/// input, rather than line 1.
+///
+/// # Errors
+///
+/// Returns the first syntax error.
+pub fn parse_with_aliases_at(src: &str, aliases: Rc<Aliases>, line: usize) -> ParseResult<Program> {
+    let lexer = Lexer::new(src).starting_at_line(line);
+    let mut parser = Parser::with_lexer(lexer, 0, Some(aliases));
     parser.lexer.hold_unterminated_heredocs();
     parser.parse()
 }

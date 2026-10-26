@@ -94,6 +94,7 @@ impl Builtin for JobsBuiltin {
 #[derive(Parser)]
 #[command(name = "fg", about = "Move a job to the foreground")]
 pub struct FgBuiltin {
+    /// The job, as %N, %name or a pid; the current one when left out
     job: Option<String>,
 }
 
@@ -135,6 +136,7 @@ impl Builtin for FgBuiltin {
 #[derive(Parser)]
 #[command(name = "bg", about = "Move a job to the background")]
 pub struct BgBuiltin {
+    /// The job, as %N, %name or a pid; the current one when left out
     job: Option<String>,
 }
 
@@ -163,6 +165,7 @@ pub struct DisownBuiltin {
     /// Remove every job
     #[arg(short = 'a')]
     all: bool,
+    /// The jobs to forget; the current one when none
     jobs: Vec<String>,
 }
 

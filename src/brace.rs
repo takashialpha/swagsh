@@ -6,7 +6,7 @@
 //! expansions (`${...}`, `$(...)`) are left alone, and what comes out is
 //! parsed as words in the usual way.
 
-use crate::lexer::{QUOTE_END, QUOTE_START};
+use crate::lexer::{QUOTE_END, QUOTE_START, quoted_end};
 
 /// The most words, and bytes in them, one word may expand to. Brace
 /// expansion grows as the product of a word's brace expressions, so a short
@@ -102,43 +102,9 @@ fn skip_opaque(bytes: &[u8], i: usize) -> Option<usize> {
             }
             Some((j + 1).min(bytes.len()))
         }
-        b'"' => {
-            j += 1;
-            while j < bytes.len() && bytes[j] != b'"' {
-                j += if bytes[j] == b'\\' { 2 } else { 1 };
-            }
-            Some((j + 1).min(bytes.len()))
-        }
-        b'`' => {
-            j += 1;
-            while j < bytes.len() && bytes[j] != b'`' {
-                j += if bytes[j] == b'\\' { 2 } else { 1 };
-            }
-            Some((j + 1).min(bytes.len()))
-        }
+        b'"' | b'`' => Some(quoted_end(bytes, i).unwrap_or(bytes.len())),
         b'$' if matches!(bytes.get(i + 1), Some(b'{' | b'(')) => {
-            let (open, close) = if bytes[i + 1] == b'{' {
-                (b'{', b'}')
-            } else {
-                (b'(', b')')
-            };
-            let mut depth = 0usize;
-            j = i + 1;
-            while j < bytes.len() {
-                match bytes[j] {
-                    b if b == open => depth += 1,
-                    b if b == close => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return Some(j + 1);
-                        }
-                    }
-                    b'\\' => j += 1,
-                    _ => {}
-                }
-                j += 1;
-            }
-            Some(bytes.len())
+            Some(quoted_end(bytes, i).unwrap_or(bytes.len()))
         }
         _ => None,
     }

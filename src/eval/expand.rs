@@ -458,12 +458,12 @@ impl Shell {
     /// Returns an error if expanding `text`'s embedded references fails.
     pub fn expand_raw_text(&mut self, text: &str) -> Result<String> {
         let mut result = String::with_capacity(text.len());
-        let mut chars = text.chars().peekable();
-        while let Some(c) = chars.next() {
+        let mut chars = text.char_indices().peekable();
+        while let Some((_, c)) = chars.next() {
             if c == '\\' {
-                match chars.next_if(|n| matches!(n, '$' | '`' | '\\' | '\n')) {
-                    Some('\n') => {}
-                    Some(escaped) => result.push(escaped),
+                match chars.next_if(|&(_, n)| matches!(n, '$' | '`' | '\\' | '\n')) {
+                    Some((_, '\n')) => {}
+                    Some((_, escaped)) => result.push(escaped),
                     None => result.push('\\'),
                 }
                 continue;
@@ -472,57 +472,43 @@ impl Shell {
                 result.push(c);
                 continue;
             }
-            let mut var = String::new();
             match chars.peek().copied() {
-                Some('{') => {
-                    chars.next();
-                    let mut depth = 0usize;
-                    for ch in chars.by_ref() {
-                        match ch {
-                            '{' => depth += 1,
-                            '}' if depth == 0 => break,
-                            '}' => depth -= 1,
-                            _ => {}
-                        }
-                        var.push(ch);
-                    }
-                    result.push_str(&self.expand_var_in(&var, true)?);
-                }
-                Some('(') => {
-                    chars.next();
-                    let arith = chars.next_if_eq(&'(').is_some();
-                    let mut depth = if arith { 2usize } else { 1 };
-                    let mut cmd_src = String::new();
-                    for ch in chars.by_ref() {
-                        if ch == '(' {
-                            depth += 1;
-                        } else if ch == ')' {
-                            depth -= 1;
-                            if depth == 0 {
-                                break;
-                            }
-                        }
-                        cmd_src.push(ch);
-                    }
-                    if arith {
-                        if cmd_src.ends_with(')') {
-                            cmd_src.pop();
-                        }
-                        result.push_str(&self.eval_arith_expr(&cmd_src)?);
-                    } else if let Ok(program) = parse(&cmd_src)
+                Some((open, brace @ ('{' | '('))) => {
+                    let start = open + 1;
+                    let rest = &text.as_bytes()[start..];
+                    let len = if brace == '{' {
+                        crate::lexer::param_len(rest, true)
+                    } else {
+                        crate::lexer::cmd_sub_len(rest)
+                    };
+                    let end = start + len.unwrap_or(rest.len());
+                    while chars.next_if(|&(i, _)| i <= end).is_some() {}
+                    let inner = &text[start..end];
+                    if brace == '{' {
+                        result.push_str(&self.expand_var_in(inner, true)?);
+                    } else if inner.starts_with('(')
+                        && end < text.len()
+                        && crate::lexer::is_arith(&text.as_bytes()[start + 1..=end])
+                    {
+                        result.push_str(&self.eval_arith_expr(&inner[1..inner.len() - 1])?);
+                    } else if let Ok(program) = parse(inner)
                         && let Ok(s) = self.expand_cmd_sub(&program.into_command())
                     {
                         result.push_str(&s);
                     }
                 }
-                Some(c2) if c2.is_ascii_alphanumeric() || c2 == '_' || "@*#?-$!".contains(c2) => {
-                    if "@*#?-$!".contains(c2) {
-                        chars.next();
-                        result.push_str(&self.expand_var_in(&c2.to_string(), true)?);
-                    } else {
-                        var.push_str(&take_identifier(&mut chars));
-                        result.push_str(&self.expand_var_in(&var, true)?);
+                Some((at, c2)) if "@*#?-$!".contains(c2) => {
+                    chars.next();
+                    result.push_str(&self.expand_var_in(&text[at..=at], true)?);
+                }
+                Some((at, c2)) if c2.is_ascii_alphanumeric() || c2 == '_' => {
+                    let mut end = at;
+                    while let Some((i, c)) =
+                        chars.next_if(|&(_, c)| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        end = i + c.len_utf8();
                     }
+                    result.push_str(&self.expand_var_in(&text[at..end], true)?);
                 }
                 _ => result.push('$'),
             }
@@ -715,17 +701,4 @@ fn contains_at(word: &Word) -> bool {
         Word::Quoted(inner) => contains_at(inner),
         _ => false,
     }
-}
-
-/// Consumes a run of identifier characters (`[A-Za-z0-9_]`) from `chars`.
-/// Used wherever a bare variable name needs to be read out of already-
-/// expanded text (arithmetic expressions, here-doc bodies): the lexer
-/// handles this for source text, but these two run over materialized
-/// strings at execution time, after lexing is long done.
-fn take_identifier(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
-    let mut ident = String::new();
-    while let Some(c) = chars.next_if(|c| c.is_ascii_alphanumeric() || *c == '_') {
-        ident.push(c);
-    }
-    ident
 }

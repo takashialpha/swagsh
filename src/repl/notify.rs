@@ -18,7 +18,9 @@ use rustix::fd::{AsFd, OwnedFd};
 use rustix::io::Errno;
 use rustix::pipe::{PipeFlags, pipe_with};
 use rustix::process::{Pid, PidfdFlags, WaitId, WaitIdOptions, pidfd_open, waitid};
-use rustyline::{DefaultEditor, ExternalPrinter};
+use rustyline::ExternalPrinter;
+
+use super::LineEditor;
 
 use crate::eval::Shell;
 use crate::jobs::{ExitStatus, JobState, done_text, job_line};
@@ -60,7 +62,7 @@ pub struct Announced {
 
 impl Watcher {
     /// Starts watching the running jobs, if `set -b` is on and there are any.
-    pub fn start(shell: &Shell, rl: &mut DefaultEditor) -> Option<Self> {
+    pub fn start(shell: &Shell, rl: &mut LineEditor) -> Option<Self> {
         if !shell.notify {
             return None;
         }

@@ -71,9 +71,18 @@ Background jobs, `fg`/`bg`, signals and completion notices.
 </td>
 <td>
 
-💬 **Prompt and history**
+💬 **Interactive**
 
-Custom `$PS1` and persistent history.
+Syntax highlighting, Tab completion that falls back to ignoring case, suggestions from history, vi or emacs keys, Ctrl-X Ctrl-E to edit the line in your editor, a custom `$PS1`, and persistent history.
+
+</td>
+</tr>
+<tr>
+<td colspan="2">
+
+📖 **Built-in help**
+
+`help` lists every builtin; `help NAME` (or `NAME --help`) shows its options, with examples.
 
 </td>
 </tr>
@@ -145,36 +154,118 @@ Build with the latest stable Rust: swagsh tracks the stable channel rather than 
 
 ## Compatibility notes
 
-swagsh runs POSIX sh scripts, and most bash scripts. Where it differs from
-bash, it is on purpose:
+swagsh runs POSIX sh scripts, and most bash scripts.
+
+### Beyond POSIX
+
+Most of the bash extensions (`[[ ]]`, arrays, `$'...'`, `<(...)`, `local`)
+use syntax that POSIX leaves unspecified or rejects, so they cannot change
+what a POSIX script does. These few can:
+
+- Brace expansion: `{a,b}` and `{1..3}` expand, as in bash, where POSIX
+  keeps them as they are. Quote a brace to keep it.
+- `cmd &>file` sends output and errors to `file`, and `a |& b` pipes both;
+  in POSIX, `&>` is `&` followed by `>`. Write `cmd & >file` for that.
+- History expansion (`!!`, `!$`) happens at an interactive prompt, inside
+  double quotes too, as in bash; `set +H` turns it off. Never in scripts.
+- At an interactive prompt, `fc` without `-e` or `$FCEDIT` opens the
+  config file's `editor.command`, else `$VISUAL`, `$EDITOR` or `vi`, much
+  as bash does. POSIX says `ed`, which scripts still get.
+
+### Where POSIX leaves the choice
+
+- `echo` is bash's: it takes `-n`, `-e` and `-E`, and expands backslash
+  escapes only with `-e`. Use `printf` for portable output.
+- Every command of a pipeline runs in a subshell, the last one too, unless
+  `shopt -s lastpipe`.
+- Arithmetic is on 64-bit signed integers, which wrap around on overflow.
+  Division by zero is an error.
+- `local`, and `declare` in a function, scope variables dynamically, as in
+  bash: a function sees the variables of the functions that called it.
+- `~user` for an unknown user stays as written.
+- In a pattern, `[^...]` is `[!...]`.
+- An expansion error (`${x?}`, an unset variable under `set -u`) ends a
+  non-interactive shell; under `set -u`, with status 127, or 1 with `set -e`,
+  as bash does.
+- A script that does not exist exits with 127; one that cannot be read,
+  with 126.
+- A here-document that runs into the end of input ends there, with a
+  warning.
+- A `'` inside a double-quoted `${...}`, as in `"${x:-it's}"`, is an
+  ordinary character, as in dash.
+- A function name can have characters beyond a POSIX name (`a-b`, `a.b`),
+  as in bash, but no quoting or expansions.
+- Aliases expand in scripts too, as POSIX says. bash expands them only in
+  its POSIX mode or with `shopt -s expand_aliases`.
+- Commands read from a pipe on standard input are read a byte at a time,
+  so that the commands they run can read the rest of it.
+- `set`, `export -p`, `readonly -p`, `alias` and `trap` print text that
+  reads back as the same settings. `set -o`, `shopt` and `kill -l` print
+  bash's layout.
+
+### Where it differs from bash, on purpose
 
 - `.*` never matches `.` or `..` (as in bash 5.2 and later).
 - Associative arrays list their keys in sorted order.
 - `BASH_VERSION` is unset; scripts can check `SWAGSH_VERSION` instead.
 - `shopt` takes the options `shopt` lists, and rejects the rest by name.
+- `$-` lists only the options swagsh has, so never bash's `h` or `B`.
+- `printf '%a'` prints the same number in a different hexadecimal form:
+  `0x1p+0` for 1, as C's `printf` does, where bash prints `0x8p-3`.
+- `declare -f` and `type` print functions in swagsh's own style (`${name}`
+  for `$name`, single quotes where nothing expands). It reads back as the
+  same function.
 
 ---
 
-## TODO
+## Configuration
 
-### Planned
+An interactive shell reads `~/.config/swagsh/config.toml`
+(`$XDG_CONFIG_HOME/swagsh/config.toml` if that is set). The first one to
+start writes it, with every setting at its default and a comment on what
+each does. Any section or key can be deleted to go back to its default. A
+mistake in the file is reported at startup, and the defaults are used
+instead. Scripts never read it.
 
-- `help`: a shared `Help` trait for every builtin, by default derived from
-  its `clap` command.
+```toml
+[banner]
+enabled = true       # the logo and version at startup
+tips = true          # and a tip under them
 
-### Planned interactive work
+[editor]
+keys = "emacs"       # or "vi"; `set -o vi` and `set -o emacs` switch too
+command = ""         # the editor for Ctrl-X Ctrl-E (`v` with vi keys) and fc,
+                     # such as "nvim" or "code --wait"; empty for $VISUAL,
+                     # then $EDITOR, then vi
+suggestions = true   # the rest of a line from history, in grey; → takes it
 
-All of this has to stay strictly on the interactive side: none of it may
-change script execution or its performance. That separation holds today by
-construction, since `repl.rs` and `prompt.rs` are reachable only from
-`main`'s interactive branch and the only ANSI escapes outside `prompt.rs`
-are `echo -e`'s own, but nothing enforces it at the type level.
+[highlight]
+enabled = true
+command = "green"    # a command that exists
+unknown = "red"      # one that does not
+keyword = "magenta"
+string = "yellow"
+variable = "cyan"
+operator = "bold"
+option = "blue"
+comment = "dim"
+path = "underline"   # an argument naming a file that exists
+error = "bold red"   # an unclosed quote, and the like
+bracket = "bold reverse"
+suggestion = "dim"
 
-- A startup banner when launched interactively.
-- Completion and syntax highlighting, through rustyline's `Completer` and
-  `Highlighter`.
-- A configuration file, beyond the `~/.swagshrc`, `~/.swagsh_profile` and
-  `$ENV` script sourcing that already exists.
+[history]
+size = 1000          # $HISTSIZE overrides it
+ignore_dups = true
+ignore_space = true  # a command starting with a space is not kept
+```
+
+A color is any mix of names (`red`, `bright-blue`), attributes (`bold`,
+`dim`, `italic`, `underline`, `reverse`), a 256-color number, and
+`#rrggbb`, separated by spaces.
+
+Startup files are still sourced as before: `~/.swagsh_profile` for a login
+shell, then `$ENV` and `~/.swagshrc` for an interactive one.
 
 ---
 
@@ -192,6 +283,15 @@ just check        # fmt + lint + test + boundaries + deps + fuzz-build
 just fuzz parse   # fuzz one target (needs nightly and cargo-fuzz)
 just clean        # target/, and the corpus/artifacts cargo does not own
 ```
+
+### Interactive features stay interactive
+
+Highlighting, completion, the banner and the configuration file must never
+change how a script runs, or how fast. They live in `src/repl/` and
+`src/prompt.rs`, which only an interactive shell reaches (apart from
+sourcing the startup files), and the only ANSI escapes outside them are
+`echo -e`'s and `printf`'s own. Nothing enforces this at the type level,
+so keep it in mind when touching those modules.
 
 ### Two modules own the unsafe
 

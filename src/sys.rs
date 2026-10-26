@@ -424,15 +424,27 @@ fn regex_groups(pattern: &str) -> usize {
 /// prompt's `\d`, `\t` and `\D{...}`.
 #[must_use]
 pub fn strftime_now(format: &str) -> String {
+    strftime_at(format, epoch_seconds())
+}
+
+/// The time now, in seconds since the epoch.
+#[must_use]
+pub fn epoch_seconds() -> i64 {
+    // SAFETY: a null argument asks `time` only for its return value.
+    unsafe { libc::time(core::ptr::null_mut()) }
+}
+
+/// Seconds-since-the-epoch `time` in local time, formatted by
+/// `strftime(3)` with `format` (`printf '%(fmt)T'`).
+#[must_use]
+pub fn strftime_at(format: &str, time: i64) -> String {
     let Ok(format) = std::ffi::CString::new(format) else {
         return String::new();
     };
-    // SAFETY: a null argument asks `time` only for its return value.
-    let now = unsafe { libc::time(core::ptr::null_mut()) };
     // SAFETY: `tm` is a plain C struct, for which all-zero is valid.
     let mut tm: libc::tm = unsafe { core::mem::zeroed() };
     // SAFETY: both pointers are valid for the call.
-    if unsafe { libc::localtime_r(&raw const now, &raw mut tm) }.is_null() {
+    if unsafe { libc::localtime_r(&raw const time, &raw mut tm) }.is_null() {
         return String::new();
     }
     let mut buf = [0u8; 256];
@@ -447,4 +459,32 @@ pub fn strftime_now(format: &str) -> String {
         )
     };
     String::from_utf8_lossy(&buf[..len]).into_owned()
+}
+
+/// `value` formatted by C's `snprintf(3)` with `spec`, a single floating
+/// point conversion such as `%-10.3e` (`printf`'s `%e`, `%g`, `%a` and
+/// `%f`). `None` if `spec` is not one.
+#[must_use]
+pub fn format_float(spec: &str, value: f64) -> Option<String> {
+    let conv = spec.chars().last()?;
+    let valid = spec.starts_with('%')
+        && "eEfFgGaA".contains(conv)
+        && spec[1..spec.len() - 1]
+            .chars()
+            .all(|c| c.is_ascii_digit() || "-+ #0.".contains(c));
+    if !valid {
+        return None;
+    }
+    let spec = std::ffi::CString::new(spec).ok()?;
+    let mut buf = vec![0u8; 512];
+    loop {
+        // SAFETY: `buf` is writable for its length, and `spec` is one
+        // floating point conversion, checked above, taking the one double.
+        let n = unsafe { libc::snprintf(buf.as_mut_ptr().cast(), buf.len(), spec.as_ptr(), value) };
+        let n = usize::try_from(n).ok()?;
+        if n < buf.len() {
+            return Some(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+        buf.resize(n + 1, 0);
+    }
 }

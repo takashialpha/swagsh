@@ -1,16 +1,21 @@
-use anyhow::{Result, anyhow};
+use std::io::IsTerminal;
+
+use anyhow::Result;
 use clap::Parser as _;
 
-use swagsh::cli::Cli;
+use swagsh::cli::{Cli, split_set_options};
 use swagsh::env::Env;
 use swagsh::errfmt::{emit, strerror};
 use swagsh::eval::{Shell, SyntaxError};
-use swagsh::{parser, repl, signal};
+use swagsh::expand::shell_quote_always;
+use swagsh::{parser, repl, signal, stdin_script};
 
 fn main() -> Result<()> {
     signal::reset_sigpipe();
-    let argv0 = std::env::args().next().unwrap_or_default();
-    let cli = Cli::parse();
+    let mut process_args = std::env::args();
+    let argv0 = process_args.next().unwrap_or_default();
+    let (cli_args, set_options) = split_set_options(process_args);
+    let cli = Cli::parse_from(std::iter::once(argv0.clone()).chain(cli_args));
 
     let (script, mut args) = cli.split_positionals();
     let dollar_zero = match (&cli.command, &script) {
@@ -46,6 +51,7 @@ fn main() -> Result<()> {
         let mut shell = Shell::new(env, false);
         shell.arg0 = dollar_zero.unwrap_or(shell.arg0);
         shell.command_string = Some(cmd.clone());
+        apply_set_options(&mut shell, &set_options);
         return run_and_exit(&mut shell, cmd, &cli);
     }
 
@@ -54,19 +60,50 @@ fn main() -> Result<()> {
         shell.arg0 = dollar_zero.unwrap_or(shell.arg0);
         shell.script = true;
         shell.sources.push(path.to_string_lossy().into());
-        let src = std::fs::read_to_string(path)
-            .map_err(|e| anyhow!("{}: {}", path.display(), strerror(e)))?;
+        let src = match std::fs::read_to_string(path) {
+            Ok(src) => src,
+            Err(e) => {
+                let status = if e.kind() == std::io::ErrorKind::NotFound {
+                    127
+                } else {
+                    126
+                };
+                emit(format!("{}: {}", path.display(), strerror(e)));
+                std::process::exit(status);
+            }
+        };
+        apply_set_options(&mut shell, &set_options);
         return run_and_exit(&mut shell, &src, &cli);
     }
 
+    // POSIX: interactive when standard input and error are terminals.
+    let interactive =
+        cli.interactive || (std::io::stdin().is_terminal() && std::io::stderr().is_terminal());
     let is_login = cli.login || Cli::is_login_shell(&argv0);
-    let mut shell = Shell::new(env, true);
+    let mut shell = Shell::new(env, interactive);
     shell.login = is_login;
+    apply_set_options(&mut shell, &set_options);
     if !cli.no_rc {
         repl::source_startup_files(&mut shell, is_login);
     }
+    if !interactive {
+        stdin_script::run(&mut shell);
+    }
     repl::run_interactive(shell, &cli)?;
     Ok(())
+}
+
+/// Turns on and off the `set` options given on the command line, exiting
+/// as `set` does on a bad one.
+fn apply_set_options(shell: &mut Shell, options: &[String]) {
+    if options.is_empty() {
+        return;
+    }
+    let args: Vec<String> = options.iter().map(|o| shell_quote_always(o)).collect();
+    if let Err(e) = shell.run_source(&format!("set {}", args.join(" ")), "") {
+        emit(e);
+        std::process::exit(2);
+    }
 }
 
 /// Parses and (unless `--dry-run`) runs `src`, exiting with the program's

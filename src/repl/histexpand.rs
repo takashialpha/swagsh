@@ -1,5 +1,6 @@
-//! History expansion at the prompt, as in bash (`set -H`): `!!`, `!n`,
-//! `!-n`, `!text`, `!?text?`, with word designators (`:0`, `:n`, `^`, `$`,
+//! History expansion at the prompt, as in bash (`set -H`).
+//!
+//! `!!`, `!n`, `!-n`, `!text`, `!?text?`, with word designators (`:0`, `:n`, `^`, `$`,
 //! `*`, `x-y`) and modifiers (`:h`, `:t`, `:r`, `:e`, `:p`, `:q`, `:x`,
 //! `:s/old/new/`, `:gs/old/new/`, `:&`), and the `^old^new` shorthand.
 
@@ -349,8 +350,8 @@ fn select(words: &[String], spec: &str) -> Result<String, String> {
         let i = index(spec)?;
         (i, i)
     };
-    if from > to || to > last {
-        return Err(format!(":{spec}: bad word specifier"));
+    match words.get(from..=to) {
+        Some(selected) if from <= to => Ok(selected.join(" ")),
+        _ => Err(format!(":{spec}: bad word specifier")),
     }
-    Ok(words[from..=to].join(" "))
 }

@@ -26,8 +26,10 @@ use super::Builtin;
     trailing_var_arg = true
 )]
 pub struct GetoptsBuiltin {
+    /// The option letters, each followed by `:` if it takes an argument
     #[arg(allow_hyphen_values = true)]
     optstring: String,
+    /// The variable to put the option found in
     #[arg(allow_hyphen_values = true)]
     name: String,
     /// Parse these instead of the positional parameters, if given

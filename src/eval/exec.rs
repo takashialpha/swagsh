@@ -91,6 +91,7 @@ impl Shell {
             last_status = self.wait_for_pid(*child)?;
             statuses.push(last_status.0);
         }
+        last_status = self.pipeline_status(&statuses, last_status);
         self.pipestatus = statuses;
 
         if self.monitor {
@@ -246,6 +247,19 @@ impl Shell {
         Ok((pgid, pids, prev_read))
     }
 
+    /// A pipeline's status from its commands': the last one's, or under
+    /// `set -o pipefail`, the last failure's.
+    fn pipeline_status(&self, statuses: &[i32], last: ExitStatus) -> ExitStatus {
+        if !self.pipefail {
+            return last;
+        }
+        statuses
+            .iter()
+            .rev()
+            .find(|&&s| s != 0)
+            .map_or(ExitStatus::SUCCESS, |&s| ExitStatus(s))
+    }
+
     /// `shopt lastpipe`: the pipeline's last command runs in this shell, its
     /// input the pipe from the stages before it, so it can set variables.
     fn run_pipeline_lastpipe(&mut self, pipeline: &Pipeline) -> Result<ExitStatus> {
@@ -264,6 +278,7 @@ impl Shell {
         }
         let mut status = result?;
         statuses.push(status.0);
+        status = self.pipeline_status(&statuses, status);
         self.pipestatus = statuses;
         if pipeline.negated {
             status = status.negated();
@@ -1004,9 +1019,8 @@ fn exec_failure_status(e: &anyhow::Error) -> i32 {
 ///
 /// The `fd == target` guard is the whole point: the kernel hands out the
 /// lowest free descriptor, so `exec 3>file` in a shell holding only 0-2 gets
-/// exactly fd 3 back. `dup2(3, 3)` is a documented no-op, and the `close(3)`
-/// that used to follow it then shut the redirection down again, so
-/// `exec 3>file; echo x >&3` reported EBADF while fd 4 and up worked.
+/// exactly fd 3 back. `dup2(3, 3)` is a documented no-op, and closing the
+/// original afterwards would then close the redirection itself.
 fn move_fd(fd: RawFd, target: RawFd) -> Result<()> {
     if fd == target {
         return Ok(());

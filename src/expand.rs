@@ -455,6 +455,18 @@ fn take_hex(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, max: usize) ->
 /// insert.
 #[must_use]
 pub fn unescape(s: &str) -> (String, bool) {
+    unescape_with(s, false)
+}
+
+/// Expands the backslash escapes of a `printf` format: those of
+/// [`unescape`], except that an octal escape is `\NNN` with no leading `0`,
+/// `\c` is left as it is, and `\"`, `\'` and `\?` are added.
+#[must_use]
+pub fn unescape_format(s: &str) -> String {
+    unescape_with(s, true).0
+}
+
+fn unescape_with(s: &str, format: bool) -> (String, bool) {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -499,14 +511,20 @@ pub fn unescape(s: &str) -> (String, bool) {
                 chars.next();
                 out.push('\\');
             }
-            Some('c') => {
+            Some('c') if !format => {
                 chars.next();
                 return (out, true);
             }
-            Some('0') => {
+            Some(q @ ('"' | '\'' | '?')) if format => {
                 chars.next();
+                out.push(q);
+            }
+            Some(d @ '0'..='7') if format || d == '0' => {
                 let mut value: u32 = 0;
                 let mut digits = 0;
+                if !format {
+                    chars.next();
+                }
                 while digits < 3
                     && let Some(d) = chars.peek().and_then(|c| c.to_digit(8))
                 {
@@ -699,12 +717,13 @@ pub enum ParamOp<'a> {
     /// assignment, `K`/`k` as key and value pairs, `a` its attributes, `U`,
     /// `u`, `L` uppercased, first character uppercased, lowercased.
     Transform { var: Param<'a>, op: char },
-    /// `${var^pat}`, `${var^^pat}` (`upper`), `${var,pat}`, `${var,,pat}`:
-    /// changes the case of the first character, or with `all`, every one,
-    /// that matches `pat` (any character when empty).
+    /// `${var^pat}`, `${var^^pat}`, `${var,pat}`, `${var,,pat}`,
+    /// `${var~pat}`, `${var~~pat}`: changes the case of the first
+    /// character, or with `all`, every one, that matches `pat` (any
+    /// character when empty).
     Case {
         var: Param<'a>,
-        upper: bool,
+        to: CaseChange,
         all: bool,
         pat: &'a str,
     },
@@ -918,19 +937,16 @@ fn param_operator<'a>(var: Param<'a>, rest: &'a str) -> Option<ParamOp<'a>> {
             anchor,
         });
     }
-    for (op, upper, all) in [
-        ("^^", true, true),
-        ("^", true, false),
-        (",,", false, true),
-        (",", false, false),
+    for (op, to, all) in [
+        ("^^", CaseChange::Upper, true),
+        ("^", CaseChange::Upper, false),
+        (",,", CaseChange::Lower, true),
+        (",", CaseChange::Lower, false),
+        ("~~", CaseChange::Toggle, true),
+        ("~", CaseChange::Toggle, false),
     ] {
         if let Some(pat) = rest.strip_prefix(op) {
-            return Some(ParamOp::Case {
-                var,
-                upper,
-                all,
-                pat,
-            });
+            return Some(ParamOp::Case { var, to, all, pat });
         }
     }
     None
@@ -1027,14 +1043,28 @@ pub fn replace_matches(
     }
 }
 
+/// The case a character is changed to by [`ParamOp::Case`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseChange {
+    Upper,
+    Lower,
+    /// Upper case to lower, and lower to upper.
+    Toggle,
+}
+
 /// `${val^pat}` and friends; see [`ParamOp::Case`].
 #[must_use]
-pub fn change_case(val: &str, upper: bool, all: bool, pat: &str) -> String {
+pub fn change_case(val: &str, to: CaseChange, all: bool, pat: &str) -> String {
     let mut out = String::with_capacity(val.len());
     let mut buf = [0u8; 4];
     for (i, c) in val.chars().enumerate() {
         let applies =
             (all || i == 0) && (pat.is_empty() || glob_match(pat, c.encode_utf8(&mut buf)));
+        let upper = match to {
+            CaseChange::Upper => true,
+            CaseChange::Lower => false,
+            CaseChange::Toggle => c.is_lowercase(),
+        };
         if !applies {
             out.push(c);
         } else if upper {
@@ -1108,10 +1138,10 @@ pub fn strip_suffix(val: &str, pat: &str, greedy: bool) -> String {
 
 // ---------------------------------------------------------------------------
 // Arithmetic expansion: $(( expr ))
-// C-style integer arithmetic on `i64`: decimal, octal (`010`) and hex
-// (`0x10`) constants, variables and array elements by name, and every C
-// operator but `sizeof`, `++`, `--` and `,` included. Overflow wraps. `$`
-// references have already been expanded by the caller.
+// C-style integer arithmetic on `i64`: decimal, octal (`010`), hex (`0x10`)
+// and `base#digits` constants, variables and array elements by name, every
+// C operator but `sizeof` (`++`, `--` and `,` included), and bash's `**`.
+// Overflow wraps. `$` references have already been expanded by the caller.
 // ---------------------------------------------------------------------------
 
 /// Why an arithmetic expression could not be evaluated.
@@ -1252,8 +1282,37 @@ fn parse_arith_number(s: &str) -> Option<i64> {
     Some(if negative { n.wrapping_neg() } else { n })
 }
 
+/// `digits` in `base`, from 2 to 64: past 36, lowercase letters are 10 to
+/// 35, uppercase ones 36 to 61, then `@` and `_`; up to 36, a letter's case
+/// does not matter.
+fn parse_based_number(base: &str, digits: &str) -> Option<i64> {
+    let base: u32 = base.parse().ok().filter(|b| (2..=64).contains(b))?;
+    if digits.is_empty() {
+        return None;
+    }
+    let mut n: i64 = 0;
+    for c in digits.chars() {
+        let d = match c {
+            '0'..='9' => u32::from(c) - u32::from('0'),
+            'a'..='z' => u32::from(c) - u32::from('a') + 10,
+            'A'..='Z' if base <= 36 => u32::from(c) - u32::from('A') + 10,
+            'A'..='Z' => u32::from(c) - u32::from('A') + 36,
+            '@' => 62,
+            '_' => 63,
+            _ => return None,
+        };
+        if d >= base {
+            return None;
+        }
+        n = n.wrapping_mul(i64::from(base)).wrapping_add(i64::from(d));
+    }
+    Some(n)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BinOp {
+    /// `**`, exponentiation.
+    Pow,
     Mul,
     Div,
     Rem,
@@ -1278,6 +1337,7 @@ impl BinOp {
     /// Binding strength; higher binds tighter.
     const fn precedence(self) -> u8 {
         match self {
+            Self::Pow => 11,
             Self::Mul | Self::Div | Self::Rem => 10,
             Self::Add | Self::Sub => 9,
             Self::Shl | Self::Shr => 8,
@@ -1294,6 +1354,11 @@ impl BinOp {
     fn apply(self, a: i64, b: i64) -> Result<i64, ArithError> {
         let shift = || u32::try_from(b & 63).unwrap_or(0);
         Ok(match self {
+            Self::Pow => {
+                let exp =
+                    u32::try_from(b).map_err(|_| ArithError("exponent less than 0".to_owned()))?;
+                a.wrapping_pow(exp)
+            }
             Self::Mul => a.wrapping_mul(b),
             Self::Div | Self::Rem if b == 0 => {
                 return Err(ArithError("division by zero".to_owned()));
@@ -1348,9 +1413,23 @@ fn arith_tokenize(s: &str) -> Result<Vec<Tok<'_>>, ArithError> {
             ' ' | '\t' | '\n' => continue,
             '0'..='9' => {
                 let end = take_while_end(&mut chars, s.len(), |c| c.is_ascii_alphanumeric());
+                // `base#digits`, as in bash: `2#1010`, `16#ff`.
+                let based = chars.next_if(|&(_, c)| c == '#').is_some();
+                let end = if based {
+                    take_while_end(&mut chars, s.len(), |c| {
+                        c.is_ascii_alphanumeric() || c == '@' || c == '_'
+                    })
+                } else {
+                    end
+                };
                 let text = &s[start..end];
-                let n = parse_arith_number(text)
-                    .ok_or_else(|| ArithError(format!("invalid number `{text}`")))?;
+                let n = if based {
+                    text.split_once('#')
+                        .and_then(|(base, digits)| parse_based_number(base, digits))
+                } else {
+                    parse_arith_number(text)
+                }
+                .ok_or_else(|| ArithError(format!("invalid number `{text}`")))?;
                 toks.push(Tok::Num(n));
                 continue;
             }
@@ -1389,6 +1468,7 @@ fn arith_tokenize(s: &str) -> Result<Vec<Tok<'_>>, ArithError> {
             '>' if chars.next_if(|&(_, c)| c == '=').is_some() => Tok::Bin(BinOp::Ge),
             '<' => Tok::Bin(BinOp::Lt),
             '>' => Tok::Bin(BinOp::Gt),
+            '*' if chars.next_if(|&(_, c)| c == '*').is_some() => Tok::Bin(BinOp::Pow),
             '*' => Tok::Bin(BinOp::Mul),
             '/' => Tok::Bin(BinOp::Div),
             '%' => Tok::Bin(BinOp::Rem),
@@ -1597,7 +1677,13 @@ impl<'t> ArithParser<'t, '_> {
                 BinOp::Or => eval && lhs == 0,
                 _ => eval,
             };
-            let rhs = self.binary(op.precedence() + 1, rhs_eval)?;
+            // `**` groups to the right, the rest to the left.
+            let next_prec = if op == BinOp::Pow {
+                op.precedence()
+            } else {
+                op.precedence() + 1
+            };
+            let rhs = self.binary(next_prec, rhs_eval)?;
             lhs = if eval { op.apply(lhs, rhs)? } else { 0 };
         }
         Ok(lhs)

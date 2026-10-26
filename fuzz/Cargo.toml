@@ -46,6 +46,27 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "brace"
+path = "fuzz_targets/brace.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "histexpand"
+path = "fuzz_targets/histexpand.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unparse"
+path = "fuzz_targets/unparse.rs"
+test = false
+doc = false
+bench = false
+
 [lints.rust]
 unsafe_code = "forbid"
 warnings = "deny"

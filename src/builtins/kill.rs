@@ -185,6 +185,7 @@ pub struct KillBuiltin {
     /// Same as -l
     #[arg(short = 'L')]
     list_alt: bool,
+    /// The pids or jobs (%N) to signal
     #[arg(allow_hyphen_values = true)]
     targets: Vec<String>,
 }

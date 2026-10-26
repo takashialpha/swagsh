@@ -3,27 +3,46 @@
 use anyhow::Result;
 
 use super::BuiltinFailed;
+use super::help::{Example, HandParsed, Help, HelpPage};
 use crate::errfmt::emit;
 use crate::eval::Shell;
 use crate::jobs::ExitStatus;
 
-/// Every option `shopt` knows, in the order it lists them.
-const NAMES: &[&str] = &[
-    "autocd",
-    "dotglob",
-    "expand_aliases",
-    "extglob",
-    "failglob",
-    "globstar",
-    "histappend",
-    "inherit_errexit",
-    "lastpipe",
-    "login_shell",
-    "nocaseglob",
-    "nocasematch",
-    "nullglob",
-    "sourcepath",
-    "xpg_echo",
+/// Every option `shopt` knows, in the order it lists them, and what it does.
+const OPTIONS: &[(&str, &str)] = &[
+    (
+        "autocd",
+        "Typing a directory's name at the prompt changes to it",
+    ),
+    ("dotglob", "Patterns match names starting with `.` too"),
+    ("expand_aliases", "Expand aliases (always on)"),
+    (
+        "extglob",
+        "Extended patterns: ?(...), *(...), +(...), @(...), !(...)",
+    ),
+    ("failglob", "A pattern that matches no file is an error"),
+    ("globstar", "`**` matches any depth of directories"),
+    (
+        "histappend",
+        "Append to the history file on exit, not replace it",
+    ),
+    ("inherit_errexit", "Command substitutions keep `set -e`"),
+    (
+        "lastpipe",
+        "Run a pipeline's last command in the shell, so `| read x` sets x",
+    ),
+    ("login_shell", "The shell is a login shell (read-only)"),
+    ("nocaseglob", "Patterns ignore case when matching files"),
+    ("nocasematch", "`case` and `[[ ]]` patterns ignore case"),
+    (
+        "nullglob",
+        "A pattern that matches no file expands to nothing",
+    ),
+    (
+        "sourcepath",
+        "`.` and `source` look on $PATH for a name without `/`",
+    ),
+    ("xpg_echo", "`echo` expands backslash escapes without -e"),
 ];
 
 /// A `bool` of the shell's that an option name stands for.
@@ -73,9 +92,9 @@ fn value(shell: &Shell, name: &str) -> Option<bool> {
 /// The names of the options that are on, for `BASHOPTS`.
 #[must_use]
 pub fn on(shell: &Shell) -> Vec<&'static str> {
-    NAMES
+    OPTIONS
         .iter()
-        .copied()
+        .map(|&(name, _)| name)
         .filter(|name| value(shell, name) == Some(true))
         .collect()
 }
@@ -93,11 +112,40 @@ fn set(shell: &mut Shell, name: &str, on: bool) -> bool {
 }
 
 /// `shopt [-pqsu] [-o] [optname ...]`.
-///
-/// # Errors
-///
-/// Returns an error for a bad option or a failed write.
-pub fn builtin_shopt(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+pub struct ShoptCmd;
+
+impl Help for ShoptCmd {
+    fn help() -> HelpPage {
+        let mut page = HelpPage::manual(
+            "Turn the shell's optional behaviors on and off",
+            "shopt [-pqsu] [-o] [OPTNAME...]",
+            &[
+                ("-s", "Turn each OPTNAME on"),
+                ("-u", "Turn each OPTNAME off"),
+                ("-q", "Print nothing; succeed if every OPTNAME is on"),
+                ("-p", "Print as commands that restore the settings"),
+                ("-o", "OPTNAMEs are `set -o` options instead"),
+            ],
+            &[Example {
+                command: "shopt -s globstar nullglob",
+                meaning: "Let ** recurse, and empty patterns vanish",
+            }],
+            &["With no OPTNAME, prints every option and whether it is on."],
+        );
+        page.body.push('\n');
+        page.body
+            .push_str(&super::help::section("Option names", OPTIONS));
+        page
+    }
+}
+
+impl HandParsed for ShoptCmd {
+    fn run(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+        builtin_shopt(shell, args)
+    }
+}
+
+fn builtin_shopt(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     let (mut on, mut off, mut quiet, mut print, mut set_o) = (false, false, false, false, false);
     let mut names = args;
     while let Some((&first, rest)) = names.split_first() {
@@ -139,11 +187,11 @@ pub fn builtin_shopt(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
             args.push("+o".to_owned());
         }
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        return super::env::builtin_set(shell, &refs);
+        return super::env::Set::run(shell, &refs);
     }
 
     let listed: Vec<&str> = if names.is_empty() {
-        NAMES.to_vec()
+        OPTIONS.iter().map(|&(name, _)| name).collect()
     } else {
         names.to_vec()
     };
@@ -173,7 +221,7 @@ pub fn builtin_shopt(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
         if print {
             shell.outln(&format!("shopt {} {name}", if value { "-s" } else { "-u" }))?;
         } else {
-            shell.outln(&format!("{name:<15}\t{}", if value { "on" } else { "off" }))?;
+            shell.outln(&format!("{name:<20}\t{}", if value { "on" } else { "off" }))?;
         }
     }
     // Listing every option is not a question about any one of them.

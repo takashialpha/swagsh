@@ -93,45 +93,69 @@ pub(super) fn read_until_delim(
     }
 }
 
-/// Splits `line` into exactly `n_vars` fields on `ifs`, the way `read`
-/// assigns its trailing variable everything left over (IFS included) rather
-/// than continuing to split; with `None`, into as many fields as there are
-/// (`read -a`). In non-raw mode a backslash makes the next character
-/// literal, both stripped from the output and exempted from acting as a
-/// field separator.
+/// Splits `line` into exactly `n_vars` fields on `ifs`, as `read` does:
+/// a run of IFS whitespace, or one other IFS character with whitespace
+/// around it, ends a field, and the last variable takes the rest of the
+/// line (less trailing IFS whitespace, and less a lone trailing delimiter
+/// when the rest is a single field). With `None`, into as many fields as
+/// there are (`read -a`). In non-raw mode a backslash makes the next
+/// character literal: kept, without the backslash, and never a delimiter.
 fn split_fields(line: &str, ifs: &str, n_vars: Option<usize>, raw: bool) -> Vec<String> {
-    let is_ifs = |c: char| ifs.contains(c);
-    let all = n_vars.is_none();
-    let n_vars = n_vars.unwrap_or(usize::MAX);
+    // Each character, and whether a backslash made it literal.
+    let mut chars: Vec<(char, bool)> = Vec::with_capacity(line.len());
+    let mut it = line.chars();
+    while let Some(c) = it.next() {
+        match (raw, c) {
+            (false, '\\') => {
+                if let Some(next) = it.next() {
+                    chars.push((next, true));
+                }
+            }
+            _ => chars.push((c, false)),
+        }
+    }
+    let is_ws = |&(c, literal): &(char, bool)| {
+        !literal && matches!(c, ' ' | '\t' | '\n') && ifs.contains(c)
+    };
+    let is_delim = |&(c, literal): &(char, bool)| {
+        !literal && !matches!(c, ' ' | '\t' | '\n') && ifs.contains(c)
+    };
+    let text = |part: &[(char, bool)]| part.iter().map(|&(c, _)| c).collect::<String>();
+    let limit = n_vars.unwrap_or(usize::MAX);
     let mut fields = Vec::new();
-    let mut cur = String::new();
-    let mut chars = line.chars().peekable();
-    while chars.peek().is_some_and(|&c| is_ifs(c)) {
-        chars.next();
-    }
-    while let Some(c) = chars.next() {
-        if !raw && c == '\\' {
-            if let Some(next) = chars.next() {
-                cur.push(next);
+    let mut i = chars.iter().take_while(|c| is_ws(c)).count();
+    while i < chars.len() && limit > 0 {
+        if fields.len() + 1 == limit {
+            let mut rest = &chars[i..];
+            while rest.last().is_some_and(is_ws) {
+                rest = &rest[..rest.len() - 1];
             }
-            continue;
-        }
-        if is_ifs(c) && fields.len() + 1 < n_vars {
-            fields.push(std::mem::take(&mut cur));
-            while chars.peek().is_some_and(|&c| is_ifs(c)) {
-                chars.next();
+            if let Some((last, body)) = rest.split_last()
+                && is_delim(last)
+                && !body.iter().any(|c| is_ws(c) || is_delim(c))
+            {
+                rest = body;
             }
-            continue;
+            fields.push(text(rest));
+            break;
         }
-        cur.push(c);
+        let start = i;
+        while i < chars.len() && !is_ws(&chars[i]) && !is_delim(&chars[i]) {
+            i += 1;
+        }
+        fields.push(text(&chars[start..i]));
+        while i < chars.len() && is_ws(&chars[i]) {
+            i += 1;
+        }
+        if i < chars.len() && is_delim(&chars[i]) {
+            i += 1;
+            while i < chars.len() && is_ws(&chars[i]) {
+                i += 1;
+            }
+        }
     }
-    let trimmed = cur.trim_end_matches(is_ifs).len();
-    cur.truncate(trimmed);
-    if !(all && cur.is_empty()) {
-        fields.push(cur);
-    }
-    if !all {
-        fields.resize(n_vars, String::new());
+    if let Some(n) = n_vars {
+        fields.resize(n, String::new());
     }
     fields
 }
@@ -157,6 +181,7 @@ pub struct ReadBuiltin {
     /// Assign the words read to the indexed array ARRAY, one per element
     #[arg(short = 'a', value_name = "ARRAY")]
     array: Option<String>,
+    /// The variables to assign the fields to; REPLY when none
     names: Vec<String>,
 }
 

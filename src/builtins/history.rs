@@ -133,9 +133,9 @@ impl Builtin for FcBuiltin {
         let editor = self
             .editor
             .or_else(|| shell.env.get("FCEDIT"))
-            .unwrap_or_else(|| "ed".to_owned());
+            .unwrap_or_else(|| default_editor(shell));
         let commands: Vec<String> = range.into_iter().map(|(_, c)| c).collect();
-        let edited = edit_in(shell, &editor, &(commands.join("\n") + "\n"))?;
+        let edited = edit_in(shell, "fc", &editor, &(commands.join("\n") + "\n"))?;
         rerun(shell, edited.trim_end())
     }
 }
@@ -175,20 +175,40 @@ fn rerun(shell: &mut Shell, command: &str) -> Result<ExitStatus> {
     shell.run_source(command, "fc: ")
 }
 
+/// The editor to open when none is given: at the prompt, the config
+/// file's, then `$VISUAL`, `$EDITOR` and `vi`; in a script, `ed`, as POSIX
+/// has it.
+pub fn default_editor(shell: &Shell) -> String {
+    if !shell.interactive {
+        return "ed".to_owned();
+    }
+    shell
+        .editor
+        .clone()
+        .or_else(|| shell.env.get("VISUAL").filter(|e| !e.is_empty()))
+        .or_else(|| shell.env.get("EDITOR").filter(|e| !e.is_empty()))
+        .unwrap_or_else(|| "vi".to_owned())
+}
+
 /// Writes `text` to a temporary file, runs `editor` on it, and returns what
-/// the file holds afterwards.
-fn edit_in(shell: &mut Shell, editor: &str, text: &str) -> Result<String> {
-    let path = std::env::temp_dir().join(format!("swagsh-fc-{}", std::process::id()));
-    std::fs::write(&path, text).map_err(|e| anyhow!("fc: {}: {e}", path.display()))?;
+/// the file holds afterwards. `who` names the caller in messages.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be written or read, or the editor
+/// fails.
+pub fn edit_in(shell: &mut Shell, who: &str, editor: &str, text: &str) -> Result<String> {
+    let path = std::env::temp_dir().join(format!("swagsh-{who}-{}.sh", std::process::id()));
+    std::fs::write(&path, text).map_err(|e| anyhow!("{who}: {}: {e}", path.display()))?;
     let command = format!(
         "{editor} {}",
         crate::expand::shell_quote(&path.to_string_lossy())
     );
-    let status = shell.run_source(&command, "fc: ");
+    let status = shell.run_source(&command, &format!("{who}: "));
     let edited = std::fs::read_to_string(&path);
     let _ = std::fs::remove_file(&path);
     if !status?.is_success() {
-        bail!("fc: {editor} failed");
+        bail!("{who}: {editor} failed");
     }
-    edited.map_err(|e| anyhow!("fc: {e}"))
+    edited.map_err(|e| anyhow!("{who}: {e}"))
 }

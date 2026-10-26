@@ -12,36 +12,70 @@ use crate::eval::{LoopSignal, ReturnSignal, Shell};
 use crate::jobs::ExitStatus;
 
 use super::Builtin;
+use super::help::{Example, HandParsed, Help, HelpPage};
 
-// `:`/`true`/`false` stay plain functions, not clap: they ignore every
-// argument unconditionally, `--help` included (`true --help` exits 0
-// silently, and `false --help` exits 1: a clap wrapper's generic `--help`
-// handling always returns 0, which would be a real, wrong exit code for
-// `false`, not just different text). Their entire job is to do nothing
-// with whatever they're given.
+// `:`/`true`/`false` are hand-parsed, not clap: they ignore every argument
+// unconditionally, `--help` included (`true --help` exits 0 silently, and
+// `false --help` exits 1: a clap wrapper's generic `--help` handling always
+// returns 0, which would be a real, wrong exit code for `false`, not just
+// different text). Their entire job is to do nothing with whatever they're
+// given.
 
-/// # Errors
-///
-/// Never fails; the `Result` is required by [`super::BuiltinFn`]'s signature.
-#[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
-pub const fn builtin_colon(_: &mut Shell, _: &[&str]) -> Result<ExitStatus> {
-    Ok(ExitStatus::SUCCESS)
+pub struct Colon;
+
+impl Help for Colon {
+    fn help() -> HelpPage {
+        HelpPage::manual(
+            "Do nothing, successfully",
+            ": [ARG...]",
+            &[],
+            &[Example {
+                command: ": \"${dir:=/tmp}\"",
+                meaning: "Set dir to /tmp unless it is set already",
+            }],
+            &["Its arguments are still expanded, which is what makes it useful."],
+        )
+    }
 }
 
-/// # Errors
-///
-/// Never fails; the `Result` is required by [`super::BuiltinFn`]'s signature.
-#[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
-pub const fn builtin_true(_: &mut Shell, _: &[&str]) -> Result<ExitStatus> {
-    Ok(ExitStatus::SUCCESS)
+impl HandParsed for Colon {
+    const HELP_FLAG: bool = false;
+
+    fn run(_: &mut Shell, _: &[&str]) -> Result<ExitStatus> {
+        Ok(ExitStatus::SUCCESS)
+    }
 }
 
-/// # Errors
-///
-/// Never fails; the `Result` is required by [`super::BuiltinFn`]'s signature.
-#[allow(clippy::unnecessary_wraps)] // required by BuiltinFn signature
-pub const fn builtin_false(_: &mut Shell, _: &[&str]) -> Result<ExitStatus> {
-    Ok(ExitStatus::FAILURE)
+pub struct True;
+
+impl Help for True {
+    fn help() -> HelpPage {
+        HelpPage::manual("Do nothing, successfully", "true", &[], &[], &[])
+    }
+}
+
+impl HandParsed for True {
+    const HELP_FLAG: bool = false;
+
+    fn run(_: &mut Shell, _: &[&str]) -> Result<ExitStatus> {
+        Ok(ExitStatus::SUCCESS)
+    }
+}
+
+pub struct False;
+
+impl Help for False {
+    fn help() -> HelpPage {
+        HelpPage::manual("Do nothing, unsuccessfully", "false", &[], &[], &[])
+    }
+}
+
+impl HandParsed for False {
+    const HELP_FLAG: bool = false;
+
+    fn run(_: &mut Shell, _: &[&str]) -> Result<ExitStatus> {
+        Ok(ExitStatus::FAILURE)
+    }
 }
 
 /// Not inside any loop (of the current function call) is only a warning,
@@ -67,9 +101,11 @@ fn not_in_loop(name: &str) -> ExitStatus {
 #[command(
     name = "break",
     about = "Exit from an enclosing for, while, or until loop",
+    long_about = None,
     allow_negative_numbers = true
 )]
 pub struct BreakBuiltin {
+    /// How many enclosing loops to leave (1 when left out)
     #[arg(value_parser = clap::value_parser!(u32).range(1..))]
     level: Option<u32>,
 }
@@ -91,6 +127,7 @@ impl Builtin for BreakBuiltin {
     allow_negative_numbers = true
 )]
 pub struct ContinueBuiltin {
+    /// Which enclosing loop to continue (1, the innermost, when left out)
     #[arg(value_parser = clap::value_parser!(u32).range(1..))]
     level: Option<u32>,
 }
@@ -112,6 +149,7 @@ impl Builtin for ContinueBuiltin {
     allow_negative_numbers = true
 )]
 pub struct ReturnBuiltin {
+    /// The exit status ($? when left out)
     code: Option<i32>,
 }
 
@@ -125,6 +163,7 @@ impl Builtin for ReturnBuiltin {
 #[derive(Parser)]
 #[command(name = "exit", about = "Exit the shell", allow_negative_numbers = true)]
 pub struct ExitBuiltin {
+    /// The exit status ($? when left out)
     code: Option<i32>,
 }
 
@@ -153,11 +192,30 @@ impl std::error::Error for ExitRequest {}
 
 /// `builtin NAME [ARG...]`: runs the builtin NAME even when a function of
 /// the same name would otherwise be found first.
-///
-/// # Errors
-///
-/// Returns an error if NAME is not a builtin, or whatever the builtin does.
-pub fn builtin_builtin(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+pub struct BuiltinCmd;
+
+impl Help for BuiltinCmd {
+    fn help() -> HelpPage {
+        HelpPage::manual(
+            "Run a builtin, even where a function has its name",
+            "builtin NAME [ARG...]",
+            &[],
+            &[Example {
+                command: "cd() { builtin cd \"$@\" && ls; }",
+                meaning: "A cd that lists the new directory",
+            }],
+            &[],
+        )
+    }
+}
+
+impl HandParsed for BuiltinCmd {
+    fn run(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+        builtin_builtin(shell, args)
+    }
+}
+
+fn builtin_builtin(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     let Some((&name, rest)) = args.split_first() else {
         return Ok(ExitStatus::SUCCESS);
     };
@@ -170,11 +228,33 @@ pub fn builtin_builtin(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
 
 /// `let EXPR...`: evaluates each argument as `$(( ))` would, succeeding when
 /// the last one is non-zero.
-///
-/// # Errors
-///
-/// Returns an error if an expression is malformed.
-pub fn builtin_let(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+pub struct Let;
+
+impl Help for Let {
+    fn help() -> HelpPage {
+        HelpPage::manual(
+            "Evaluate arithmetic expressions",
+            "let EXPRESSION...",
+            &[],
+            &[Example {
+                command: "let 'n = n * 2' i++",
+                meaning: "Double n, and add one to i",
+            }],
+            &[
+                "Succeeds when the last expression is not zero.",
+                "Each argument is one expression; quote one that has spaces.",
+            ],
+        )
+    }
+}
+
+impl HandParsed for Let {
+    fn run(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+        builtin_let(shell, args)
+    }
+}
+
+fn builtin_let(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     if args.is_empty() {
         anyhow::bail!("let: expression expected");
     }

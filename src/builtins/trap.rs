@@ -3,6 +3,7 @@
 use anyhow::{Result, anyhow, bail};
 use rustix::process::Signal;
 
+use super::help::{Example, HandParsed, Help, HelpPage};
 use super::kill::{all_signals, signal_name_by_raw, signal_number_by_name};
 use crate::errfmt::emit;
 use crate::eval::Shell;
@@ -17,10 +18,46 @@ use crate::sys::{SigHandler, sigaction_raw};
 /// meanings (an action, or with an unsigned integer first, a condition to
 /// reset), and `-` as an action is an operand, not a flag.
 ///
-/// # Errors
-///
-/// Returns an error for an unknown or untrappable condition.
-pub fn builtin_trap(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+pub struct Trap;
+
+impl Help for Trap {
+    fn help() -> HelpPage {
+        HelpPage::manual(
+            "Run a command when the shell gets a signal or exits",
+            "trap [-lp] [[ACTION] CONDITION...]",
+            &[
+                ("-l", "List the signal names and numbers"),
+                ("-p", "Print the traps set, as commands"),
+            ],
+            &[
+                Example {
+                    command: "trap 'rm -f \"$tmp\"' EXIT",
+                    meaning: "Remove a temporary file however the script ends",
+                },
+                Example {
+                    command: "trap '' INT",
+                    meaning: "Ignore Ctrl-C",
+                },
+                Example {
+                    command: "trap - INT",
+                    meaning: "Handle Ctrl-C as usual again",
+                },
+            ],
+            &[
+                "A CONDITION is a signal (INT, SIGINT, 2), EXIT, ERR, DEBUG or RETURN.",
+                "ERR runs after a failed command, DEBUG before each command.",
+            ],
+        )
+    }
+}
+
+impl HandParsed for Trap {
+    fn run(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
+        builtin_trap(shell, args)
+    }
+}
+
+fn builtin_trap(shell: &mut Shell, args: &[&str]) -> Result<ExitStatus> {
     let args = match args.first() {
         Some(&"--") => &args[1..],
         _ => args,

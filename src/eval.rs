@@ -151,6 +151,11 @@ pub struct Shell {
     /// `$0`: the shell's name, the script's path, or the name given after a
     /// `-c` command string.
     pub arg0: String,
+    /// Commands are read from standard input (`$-` has `s`).
+    pub stdin_input: bool,
+    /// When the shell started, in seconds since the epoch (`printf
+    /// '%(fmt)T' -2`).
+    pub started_at: i64,
     sane_termios: Option<Termios>,
     /// Whether the cursor is at the start of a fresh terminal line, i.e.
     /// the last thing a builtin wrote to stdout ended in `\n`. Builtins
@@ -202,9 +207,17 @@ pub struct Shell {
     pub login: bool,
     /// Commands read at the prompt so far, for the prompt's `\#`.
     pub command_number: usize,
+    /// `set -o pipefail`: a pipeline's status is that of its last command
+    /// to fail, rather than of its last command.
+    pub pipefail: bool,
     /// `set -H`: history expansion (`!!`) at the prompt. On by default in an
     /// interactive shell.
     pub histexpand: bool,
+    /// `set -o vi` (`Some(true)`) or `set -o emacs`: the prompt's key
+    /// bindings. `None` until set, for the config file to choose.
+    pub vi: Option<bool>,
+    /// The `editor.command` of the config file, when it names one.
+    pub editor: Option<String>,
     /// `set -b`: announce a background job's completion or stop as soon as
     /// it happens, not before the next prompt.
     pub notify: bool,
@@ -290,6 +303,9 @@ struct Frame {
     file: Rc<str>,
     /// The line it was called from.
     line: usize,
+    /// The options as `local -` found them (`$-`, and `pipefail`), put
+    /// back when the function returns.
+    options: Option<(String, bool)>,
 }
 
 /// The options `shopt` sets. Those not here are not supported, and
@@ -400,6 +416,8 @@ impl Shell {
             last_status: ExitStatus::SUCCESS,
             interactive,
             arg0: std::env::args().next().unwrap_or_default(),
+            stdin_input: false,
+            started_at: crate::sys::epoch_seconds(),
             sane_termios,
             at_line_start: true,
             last_bg_pid: None,
@@ -417,6 +435,9 @@ impl Shell {
             command_number: 1,
             notify: false,
             histexpand: interactive,
+            vi: None,
+            editor: None,
+            pipefail: false,
             monitor: interactive,
             history: Vec::new(),
             history_changed: false,
@@ -618,6 +639,15 @@ impl Shell {
         self.subshell += 1;
     }
 
+    /// `local -`: the running function's changes to the shell options are
+    /// undone when it returns.
+    pub fn localize_options(&mut self) {
+        let saved = (self.option_flags(), self.pipefail);
+        if let Some(frame) = self.frames.last_mut() {
+            frame.options.get_or_insert(saved);
+        }
+    }
+
     /// `$-`: the letters of the options currently on.
     #[must_use]
     pub fn option_flags(&self) -> String {
@@ -631,6 +661,7 @@ impl Shell {
             ('i', self.interactive),
             ('m', self.monitor),
             ('n', self.noexec),
+            ('s', self.stdin_input),
             ('u', self.nounset),
             ('v', self.verbose),
             ('x', self.xtrace),
@@ -809,7 +840,7 @@ impl Shell {
             Command::FunctionDef(fd) => {
                 let source = self.sources.last().cloned().unwrap_or_else(|| Rc::from(""));
                 self.env
-                    .define_function(fd.name.clone(), *fd.body.clone(), source);
+                    .define_function(fd.name.clone(), Rc::clone(&fd.body), source);
                 Ok(ExitStatus::SUCCESS)
             }
             Command::Redirected(inner, redirects) => {
@@ -1090,9 +1121,17 @@ impl Shell {
             name,
             file,
             line: sc.line,
+            options: None,
         });
         let result = self.with_redirects(&sc.redirects, false, |shell| shell.run_command(body));
-        self.frames.pop();
+        if let Some(Frame {
+            options: Some((flags, pipefail)),
+            ..
+        }) = self.frames.pop()
+        {
+            builtins::restore_options(self, &flags);
+            self.pipefail = pipefail;
+        }
         self.run_trap(TRAP_RETURN);
         self.env.pop_scope();
         self.loop_depth = outer_loop_depth;
@@ -1126,11 +1165,9 @@ impl Shell {
     /// Skips the save/restore dance entirely when there are no redirects to
     /// apply: `run_builtin`/`run_function` call this unconditionally for
     /// every invocation, and the no-redirect case (`f() { ...; }`, `[ ... ]`,
-    /// `:`, ...) is by far the common one in loops and functions. Each
+    /// `:`, ...) is by far the common one in loops and functions, and each
     /// save/restore round-trip is 3 `dup`s out plus 3 `dup2`s and 3
-    /// `close`s back in, 9 syscalls that were previously paid on every
-    /// builtin and function call regardless of whether there was anything
-    /// to restore.
+    /// `close`s back in: 9 syscalls for nothing to restore.
     ///
     /// A redirect that fails is reported and gives status 1 without running
     /// `f`, except for a `special` builtin, where POSIX makes it fatal and the
@@ -1186,23 +1223,9 @@ pub(crate) const fn is_assignment_word(word: &Word) -> bool {
     matches!(word, Word::Assign(_))
 }
 
-#[must_use]
-pub fn is_assignment(word: &str) -> bool {
-    let Some(eq) = word.find('=') else {
-        return false;
-    };
-    let name = &word[..eq];
-    !name.is_empty()
-        && name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// Splits a word already validated by `is_assignment` into `(name, value)`.
-/// Falls back to treating the whole word as the name if that invariant is
-/// ever violated, rather than panicking a live shell over an internal bug.
+/// Splits `NAME=VALUE` text from an expanded assignment into its name and
+/// value. Text without an `=` is all name, rather than a panic over an
+/// internal bug.
 fn split_assignment(word: &str) -> (&str, &str) {
     word.split_once('=').unwrap_or((word, ""))
 }
