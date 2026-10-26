@@ -1,6 +1,6 @@
 [package]
 name = "swagsh"
-version = "0.8.0"
+version = "1.0.0"
 edition = "2024"
 # The current stable at the time of release, not a support floor: swagsh tracks
 # the stable channel (see rust-toolchain.toml). Raise this to the new stable
