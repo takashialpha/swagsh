@@ -10,7 +10,7 @@ use crate::ast::{
     AndOrList, AndOrOp, AssignValue, CaseClause, CaseEnd, Command, CondExpr, IfClause, Pipeline,
     Redirect, RedirectKind, SimpleCmd, TimeFormat, Word,
 };
-use crate::expand::shell_quote_always;
+use crate::expand::{is_name, shell_quote_always};
 
 /// The definition of function `name`, laid out as bash prints it.
 #[must_use]
@@ -311,10 +311,79 @@ fn heredoc_delimiter(body: &str) -> String {
 
 /// A word as source text.
 fn word(w: &Word) -> String {
-    let mut out = WordPrinter::default();
-    out.word(w);
-    out.flush();
-    out.out
+    let text = WordPrinter::print(w, Extra::Nothing);
+    // `name[` with no `]` to close it reads on past the end of the word,
+    // as the subscript of an assignment if a `]=` comes later on the line.
+    // Quoting the name stops that, and changes nothing else.
+    let left_open = text
+        .split_once('[')
+        .is_some_and(|(name, rest)| is_name(name) && subscript_end(rest).is_none());
+    if left_open {
+        WordPrinter::print(w, Extra::Name)
+    } else {
+        text
+    }
+}
+
+/// An assignment's subscript as source text, `[index]`.
+fn subscript(index: &Word) -> String {
+    let text = word(index);
+    // The lexer counts only the brackets outside quotes to find where the
+    // subscript ends, and reads the word as no assignment at all if it ends
+    // anywhere else. Quoting every bracket of the index leaves none to count.
+    if subscript_end(&format!("{text}]")) == Some(text.len()) {
+        format!("[{text}]")
+    } else {
+        format!("[{}]", WordPrinter::print(index, Extra::Brackets))
+    }
+}
+
+/// Where the `]` closing a subscript is in `rest`, the text after its `[`,
+/// by the same count the lexer makes when it looks for a subscript
+/// assignment.
+fn subscript_end(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let mut depth = 1usize;
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b'\\' => i += 1,
+            b'\'' | b'"' => {
+                i += 1;
+                while let Some(&c) = bytes.get(i) {
+                    if c == b {
+                        break;
+                    }
+                    if c == b'\\' && b == b'"' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// What a word is printed with quoted beyond what its own text needs, so
+/// that the lexer reads it back as the same word.
+#[derive(Default, Clone, Copy)]
+enum Extra {
+    #[default]
+    Nothing,
+    /// The literal text before the word's first `[` (see [`word`]).
+    Name,
+    /// Every literal `[` and `]` (see [`subscript`]).
+    Brackets,
 }
 
 /// Prints a word, putting its neighbouring single-quoted parts in one pair
@@ -324,11 +393,23 @@ struct WordPrinter {
     out: String,
     /// Text waiting to be written in single quotes.
     quoted: Option<String>,
+    /// What is still to be quoted beyond what the text needs.
+    extra: Extra,
 }
 
 impl WordPrinter {
+    fn print(w: &Word, extra: Extra) -> String {
+        let mut out = Self {
+            extra,
+            ..Self::default()
+        };
+        out.word(w);
+        out.flush();
+        out.out
+    }
+
     fn word(&mut self, w: &Word) {
-        if let Some(text) = single_quoted(w) {
+        if let Some(text) = single_quoted(w, self.at_start()) {
             self.quoted.get_or_insert_default().push_str(&text);
             return;
         }
@@ -341,7 +422,7 @@ impl WordPrinter {
                         self.quoted.get_or_insert_default().push('{');
                     }
                     if !piece.is_empty() {
-                        self.bare(piece);
+                        self.literal(piece);
                     }
                 }
             }
@@ -352,6 +433,39 @@ impl WordPrinter {
                 }
             }
             other => self.bare(&expansion(other)),
+        }
+    }
+
+    /// Whether nothing of the word is printed yet.
+    const fn at_start(&self) -> bool {
+        self.out.is_empty() && self.quoted.is_none()
+    }
+
+    /// Prints literal text bare, apart from what [`Extra`] quotes of it.
+    fn literal(&mut self, piece: &str) {
+        match self.extra {
+            Extra::Nothing => self.bare(piece),
+            Extra::Name => {
+                let Some((name, rest)) = piece.split_once('[') else {
+                    return self.quoted.get_or_insert_default().push_str(piece);
+                };
+                self.extra = Extra::Nothing;
+                self.quoted.get_or_insert_default().push_str(name);
+                self.bare(&format!("[{rest}"));
+            }
+            Extra::Brackets => {
+                let mut last = 0;
+                for (i, bracket) in piece.match_indices(['[', ']']) {
+                    if i > last {
+                        self.bare(&piece[last..i]);
+                    }
+                    self.quoted.get_or_insert_default().push_str(bracket);
+                    last = i + bracket.len();
+                }
+                if last < piece.len() {
+                    self.bare(&piece[last..]);
+                }
+            }
         }
     }
 
@@ -367,11 +481,15 @@ impl WordPrinter {
     }
 }
 
-/// The text of `w`, when it is printed in single quotes.
-fn single_quoted(w: &Word) -> Option<String> {
+/// The text of `w`, when it is printed in single quotes; `at_start` says
+/// whether `w` begins the word.
+fn single_quoted(w: &Word, at_start: bool) -> Option<String> {
     match w {
+        // A `#` beginning the word is quoted so that it cannot start a
+        // comment; anywhere else it is plain text.
         Word::Literal(s)
             if s.is_empty()
+                || (at_start && s.starts_with('#'))
                 || s.contains(|c: char| " \t\r\n;&|<>()'\"\\$`\x01\x02\x03".contains(c)) =>
         {
             Some(s.clone())
@@ -393,9 +511,7 @@ fn expansion(w: &Word) -> String {
         Word::Assign(assign) => {
             let mut out = assign.name.clone();
             if let Some(index) = &assign.index {
-                out.push('[');
-                out.push_str(&word(index));
-                out.push(']');
+                out.push_str(&subscript(index));
             }
             out.push_str(if assign.append { "+=" } else { "=" });
             match &assign.value {
@@ -497,5 +613,87 @@ fn cond_operand(expr: &CondExpr) -> String {
     match expr {
         CondExpr::And(..) | CondExpr::Or(..) => format!("( {} )", cond(expr)),
         _ => cond(expr),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::{Command, Program};
+
+    /// The definition of `f` printed back, if `src` parses to it.
+    fn unparse(src: &str) -> Option<String> {
+        let Program { body } = crate::parser::parse(src).ok()?;
+        let [list] = body.as_slice() else { return None };
+        let [item] = list.items.as_slice() else {
+            return None;
+        };
+        let [Command::FunctionDef(def)] = item.command.commands.as_slice() else {
+            return None;
+        };
+        Some(super::function(&def.name, &def.body))
+    }
+
+    /// Prints `f` with `body`, and checks the printed text prints the same
+    /// once parsed again.
+    fn round_trip(body: &str) -> Option<String> {
+        let first = unparse(&format!("f() {{\n{body}\n}}\n"))?;
+        assert_eq!(unparse(&first).as_deref(), Some(first.as_str()));
+        Some(first)
+    }
+
+    // Found by the `unparse` fuzz target: brace expansion left a word
+    // starting with `#`, which printed bare read back as a comment.
+    #[test]
+    fn leading_hash_is_quoted() {
+        assert_eq!(
+            round_trip("echo {,#}x").as_deref(),
+            Some("f () \n{ \n    echo x '#x'\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target once the case above was fixed:
+    // `{#` printed as `'{'#`, which read back as two parts printed `'{#'`.
+    #[test]
+    fn hash_after_brace_stays_bare() {
+        assert_eq!(
+            round_trip("echo {#").as_deref(),
+            Some("f () \n{ \n    echo '{'#\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target: brace expansion left a word `h[`,
+    // which printed bare took the next word into an assignment subscript.
+    #[test]
+    fn open_subscript_name_is_quoted() {
+        assert_eq!(
+            round_trip("echo {h[,x]=1}").as_deref(),
+            Some("f () \n{ \n    echo 'h'[ x]=1\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target: the subscript `[\x01$]` printed
+    // its `]` in quotes, so the word read back was no assignment.
+    #[test]
+    fn subscript_brackets_are_quoted_when_unbalanced() {
+        assert_eq!(
+            round_trip("P[[\x01$]]=").as_deref(),
+            Some("f () \n{ \n    P['[\x01$]']=''\n}")
+        );
+    }
+
+    #[test]
+    fn closed_subscript_stays_bare() {
+        assert_eq!(
+            round_trip("echo a[b] h[x]=1").as_deref(),
+            Some("f () \n{ \n    echo a[b] h[x]=1\n}")
+        );
+    }
+
+    #[test]
+    fn inner_hash_stays_bare() {
+        assert_eq!(
+            round_trip("echo a#b").as_deref(),
+            Some("f () \n{ \n    echo a#b\n}")
+        );
     }
 }
