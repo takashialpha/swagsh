@@ -101,7 +101,8 @@ const LOOKAHEAD: usize = 1;
 const DISCARD_AFTER: usize = 256;
 
 /// The commands whose `name=value` arguments are assignment words.
-const DECLARATION_COMMANDS: [&str; 5] = ["declare", "export", "local", "readonly", "typeset"];
+pub(crate) const DECLARATION_COMMANDS: [&str; 5] =
+    ["declare", "export", "local", "readonly", "typeset"];
 
 /// A parser that pulls tokens from the lexer only as the grammar needs them.
 ///
@@ -1045,7 +1046,7 @@ fn parse_dollar(
 ) -> ParseResult<Option<Word>> {
     match chars.peek().map(|(_, c)| *c) {
         Some('(') => {
-            let fragment = collect_balanced(raw, chars, in_dquotes)?;
+            let fragment = expansion_source(&collect_balanced(raw, chars, in_dquotes)?);
             if let Some(rest) = fragment.strip_prefix("$((")
                 && crate::lexer::is_arith(rest.as_bytes())
             {
@@ -1061,7 +1062,7 @@ fn parse_dollar(
             Ok(Some(Word::CmdSub(Box::new(prog.into_command()))))
         }
         Some('{') => {
-            let fragment = collect_balanced(raw, chars, in_dquotes)?;
+            let fragment = expansion_source(&collect_balanced(raw, chars, in_dquotes)?);
             Ok(Some(Word::Var(fragment[2..fragment.len() - 1].to_owned())))
         }
         _ => {
@@ -1280,6 +1281,11 @@ fn read_double_quoted(
             // one unit so an inner `"` isn't mistaken for this string's
             // closing quote. The `decompose_word` call below re-parses it
             // properly once `inner` is correctly bounded.
+            // `$$` is a parameter, so a `(` after it starts nothing.
+            '$' if chars.peek().map(|&(_, c)| c) == Some('$') => {
+                chars.next();
+                inner.push_str("$$");
+            }
             '$' if chars.peek().map(|&(_, c)| c) == Some('(') => {
                 inner.push_str(&collect_balanced(raw, chars, true)?);
             }
@@ -1353,6 +1359,24 @@ fn collect_balanced(
     let close = start + len;
     while chars.next_if(|&(i, _)| i <= close).is_some() {}
     Ok(format!("${}", &raw[open..=close]))
+}
+
+/// The source text of an expansion `fragment` from a word: the lexer
+/// escaped the marker bytes in it (see `lexer::push_source`), and the
+/// source holds them bare.
+fn expansion_source(fragment: &str) -> String {
+    let mut out = String::with_capacity(fragment.len());
+    let mut chars = fragment.chars().peekable();
+    while let Some(c) = chars.next() {
+        let escapes_marker = c == '\\'
+            && chars
+                .peek()
+                .is_some_and(|&n| u8::try_from(n).is_ok_and(crate::lexer::is_marker));
+        if !escapes_marker {
+            out.push(c);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

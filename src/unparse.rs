@@ -7,10 +7,12 @@
 use std::fmt::Write as _;
 
 use crate::ast::{
-    AndOrList, AndOrOp, AssignValue, CaseClause, CaseEnd, Command, CondExpr, IfClause, Pipeline,
-    Redirect, RedirectKind, SimpleCmd, TimeFormat, Word,
+    AndOrList, AndOrOp, Assign, AssignValue, CaseClause, CaseEnd, Command, CondExpr, IfClause,
+    Pipeline, Program, Redirect, RedirectKind, SimpleCmd, TimeFormat, Word,
 };
 use crate::expand::{is_name, shell_quote_always};
+use crate::lexer::subscript_close;
+use crate::parser::DECLARATION_COMMANDS;
 
 /// The definition of function `name`, laid out as bash prints it.
 #[must_use]
@@ -242,7 +244,26 @@ impl Printer {
     }
 
     fn simple(&mut self, sc: &SimpleCmd) {
-        let mut words: Vec<String> = sc.words.iter().map(word).collect();
+        // As in the parser, assignment words are read before the command
+        // name, and after it when it is a declaration command.
+        let mut assigning = true;
+        let mut named = false;
+        let mut words = Vec::with_capacity(sc.words.len());
+        for w in &sc.words {
+            let mut text = word(w);
+            if !matches!(w, Word::Assign(_)) {
+                // A plain word shaped like an assignment, where one is read,
+                // would be read as one. Quoting its name keeps it plain.
+                if assigning && assignment_shaped(&text) {
+                    text = WordPrinter::print(w, Extra::Name);
+                }
+                if !named {
+                    named = true;
+                    assigning = assigning && DECLARATION_COMMANDS.contains(&text.as_str());
+                }
+            }
+            words.push(text);
+        }
         // A command named like a reserved word was quoted to be one.
         if let Some(first) = words.first_mut()
             && RESERVED.contains(&first.as_str())
@@ -280,6 +301,11 @@ impl Printer {
             };
             self.out.push(' ');
             self.out.push_str(&op);
+            // A process substitution right after the operator would join
+            // it: `< <(cmd)` is not `<<(cmd)`.
+            if target.starts_with(['<', '>']) {
+                self.out.push(' ');
+            }
             self.out.push_str(&target);
         }
     }
@@ -317,7 +343,7 @@ fn word(w: &Word) -> String {
     // Quoting the name stops that, and changes nothing else.
     let left_open = text
         .split_once('[')
-        .is_some_and(|(name, rest)| is_name(name) && subscript_end(rest).is_none());
+        .is_some_and(|(name, rest)| is_name(name) && subscript_close(rest.as_bytes(), 0).is_none());
     if left_open {
         WordPrinter::print(w, Extra::Name)
     } else {
@@ -325,53 +351,84 @@ fn word(w: &Word) -> String {
     }
 }
 
-/// An assignment's subscript as source text, `[index]`.
-fn subscript(index: &Word) -> String {
-    let text = word(index);
-    // The lexer counts only the brackets outside quotes to find where the
-    // subscript ends, and reads the word as no assignment at all if it ends
-    // anywhere else. Quoting every bracket of the index leaves none to count.
-    if subscript_end(&format!("{text}]")) == Some(text.len()) {
-        format!("[{text}]")
+/// Whether `text` may be read as an assignment word: a name, then `=`,
+/// `+=`, or a `[` with an `=` anywhere after it. This is looser than the
+/// parser's test, whose subscript rules quoting can change, and quoting a
+/// name that did not need it changes nothing.
+fn assignment_shaped(text: &str) -> bool {
+    let name_end = text
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(text.len());
+    let rest = &text[name_end..];
+    is_name(&text[..name_end])
+        && (rest.starts_with('=')
+            || rest.starts_with("+=")
+            || (rest.starts_with('[') && rest.contains('=')))
+}
+
+/// The subscript of an assignment to `name`, `[index]`, as source text.
+fn subscript(name: &str, index: &Word) -> String {
+    read_back_subscript(index, |text| parse_assign(&format!("{name}{text}="))?.index)
+}
+
+/// The subscript of an array item, `[index]` in `(...)`, as source text.
+fn item_subscript(index: &Word) -> String {
+    read_back_subscript(index, |text| item_index(&format!("x=({text}=)")))
+}
+
+/// `[index]` as source text, read back by `read` to the index it gives.
+fn read_back_subscript(index: &Word, read: impl Fn(&str) -> Option<Word>) -> String {
+    let text = format!("[{}]", word(index));
+    // The lexer and the parser each find the subscript's end their own way,
+    // skipping quoted text and nesting, and the word is no assignment unless
+    // both end it at its `]`. The lexer may look on past the word, so its
+    // end is checked here, and the parser's by reading the text back.
+    // Failing either, quoting every bracket and brace of the index leaves
+    // nothing to count.
+    let lexer_ends = subscript_close(&text.as_bytes()[1..], 0) == Some(text.len() - 2);
+    if lexer_ends && read(&text).is_some_and(|i| word(&i) == word(index)) {
+        text
     } else {
         format!("[{}]", WordPrinter::print(index, Extra::Brackets))
     }
 }
 
-/// Where the `]` closing a subscript is in `rest`, the text after its `[`,
-/// by the same count the lexer makes when it looks for a subscript
-/// assignment.
-fn subscript_end(rest: &str) -> Option<usize> {
-    let bytes = rest.as_bytes();
-    let mut depth = 1usize;
-    let mut i = 0;
-    while let Some(&b) = bytes.get(i) {
-        match b {
-            b'\\' => i += 1,
-            b'\'' | b'"' => {
-                i += 1;
-                while let Some(&c) = bytes.get(i) {
-                    if c == b {
-                        break;
-                    }
-                    if c == b'\\' && b == b'"' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-            }
-            b'[' => depth += 1,
-            b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
+/// An array item with no index as source text.
+fn plain_item(value: &Word) -> String {
+    let text = word(value);
+    // Text that reads as `[index]=value` would give the item an index.
+    if item_index(&format!("x=({text})")).is_some() {
+        WordPrinter::print(value, Extra::Brackets)
+    } else {
+        text
     }
-    None
+}
+
+/// The index of the one item of the array `src` assigns, if it has one.
+fn item_index(src: &str) -> Option<Word> {
+    let AssignValue::Array(items) = parse_assign(src)?.value else {
+        return None;
+    };
+    let [item] = items.as_slice() else {
+        return None;
+    };
+    item.index.clone()
+}
+
+/// The assignment `src` parses to, when it is one assignment word alone.
+fn parse_assign(src: &str) -> Option<Assign> {
+    let Program { body } = crate::parser::parse(src).ok()?;
+    let [list] = body.as_slice() else { return None };
+    let [item] = list.items.as_slice() else {
+        return None;
+    };
+    let [Command::Simple(sc)] = item.command.commands.as_slice() else {
+        return None;
+    };
+    let [Word::Assign(assign)] = sc.words.as_slice() else {
+        return None;
+    };
+    Some(Assign::clone(assign))
 }
 
 /// What a word is printed with quoted beyond what its own text needs, so
@@ -380,9 +437,11 @@ fn subscript_end(rest: &str) -> Option<usize> {
 enum Extra {
     #[default]
     Nothing,
-    /// The literal text before the word's first `[` (see [`word`]).
+    /// The name the word starts with (see [`word`] and
+    /// [`Printer::simple`]).
     Name,
-    /// Every literal `[` and `]` (see [`subscript`]).
+    /// Every literal `[`, `]` and `}`, beside the `{` always quoted (see
+    /// [`subscript`]).
     Brackets,
 }
 
@@ -446,16 +505,16 @@ impl WordPrinter {
         match self.extra {
             Extra::Nothing => self.bare(piece),
             Extra::Name => {
-                let Some((name, rest)) = piece.split_once('[') else {
+                let Some(end) = piece.find(|c: char| !c.is_ascii_alphanumeric() && c != '_') else {
                     return self.quoted.get_or_insert_default().push_str(piece);
                 };
                 self.extra = Extra::Nothing;
-                self.quoted.get_or_insert_default().push_str(name);
-                self.bare(&format!("[{rest}"));
+                self.quoted.get_or_insert_default().push_str(&piece[..end]);
+                self.bare(&piece[end..]);
             }
             Extra::Brackets => {
                 let mut last = 0;
-                for (i, bracket) in piece.match_indices(['[', ']']) {
+                for (i, bracket) in piece.match_indices(['[', ']', '}']) {
                     if i > last {
                         self.bare(&piece[last..i]);
                     }
@@ -511,7 +570,7 @@ fn expansion(w: &Word) -> String {
         Word::Assign(assign) => {
             let mut out = assign.name.clone();
             if let Some(index) = &assign.index {
-                out.push_str(&subscript(index));
+                out.push_str(&subscript(&assign.name, index));
             }
             out.push_str(if assign.append { "+=" } else { "=" });
             match &assign.value {
@@ -521,11 +580,11 @@ fn expansion(w: &Word) -> String {
                         .iter()
                         .map(|item| {
                             item.index.as_ref().map_or_else(
-                                || word(&item.value),
+                                || plain_item(&item.value),
                                 |index| {
                                     format!(
-                                        "[{}]{}{}",
-                                        word(index),
+                                        "{}{}{}",
+                                        item_subscript(index),
                                         if item.append { "+=" } else { "=" },
                                         word(&item.value)
                                     )
@@ -547,6 +606,14 @@ fn expansion(w: &Word) -> String {
 /// The inside of a `$(...)`, `<(...)` or `>(...)`: a subshell is set off
 /// by a space, so that `$( (...))` does not read as arithmetic.
 fn substitution(cmd: &Command) -> String {
+    // `$()` holds an empty subshell, which would print with a line break
+    // that ends the line under a pending here-document or a `#`.
+    if let Command::Group(group) = cmd
+        && group.subshell
+        && group.body.is_empty()
+    {
+        return String::new();
+    }
     let mut p = Printer::default();
     p.command(cmd);
     let (mut body, heredoc_end) = p.finish_with_heredoc_end();
@@ -678,6 +745,190 @@ mod tests {
         assert_eq!(
             round_trip("P[[\x01$]]=").as_deref(),
             Some("f () \n{ \n    P['[\x01$]']=''\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target: brace expansion left a word `f=`
+    // before the command name, which printed bare read back as an
+    // assignment.
+    #[test]
+    fn assignment_shaped_word_is_quoted() {
+        assert_eq!(
+            round_trip("{f=,i}").as_deref(),
+            Some("f () \n{ \n    'f'= i\n}")
+        );
+        assert_eq!(
+            round_trip("export {a=,b}").as_deref(),
+            Some("f () \n{ \n    export 'a'= b\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target: the parser reads `s[=Q{]=` as a
+    // plain word, but printed with its `{` quoted it is an assignment.
+    #[test]
+    fn subscript_shaped_word_is_quoted() {
+        assert_eq!(
+            round_trip("s[=Q{]=").as_deref(),
+            Some("f () \n{ \n    's'[=Q'{']=\n}")
+        );
+    }
+
+    #[test]
+    fn assignment_shaped_argument_stays_bare() {
+        assert_eq!(
+            round_trip("make CC=gcc").as_deref(),
+            Some("f () \n{ \n    make CC=gcc\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target: the lexer's look-ahead counted the
+    // `]` inside `$(...)` and its subscript reading did not, so the
+    // subscript ran on past the blank into the next word.
+    #[test]
+    fn bracket_in_subscript_substitution() {
+        assert_eq!(
+            round_trip("a[[$(echo ])]= x").as_deref(),
+            Some("f () \n{ \n    'a'[[$(echo ])]= x\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target: a process substitution printed
+    // right after a redirect operator made another operator.
+    #[test]
+    fn process_substitution_redirect_target() {
+        assert_eq!(
+            round_trip("cat < <(ls)").as_deref(),
+            Some("f () \n{ \n    cat < <(ls)\n}")
+        );
+        assert_eq!(
+            round_trip("cat < >(ls)").as_deref(),
+            Some("f () \n{ \n    cat < >(ls)\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target: `$()` printed as `$( (`, a line
+    // break, then `))`, and the break read as the end of a here-document
+    // line or of a comment.
+    #[test]
+    fn empty_substitution() {
+        assert_eq!(
+            round_trip("echo $()# >()#").as_deref(),
+            Some("f () \n{ \n    echo $()# >()#\n}")
+        );
+        assert_eq!(
+            round_trip("$(<<n|<())").as_deref(),
+            Some("f () \n{ \n    $( <<EOF | <()\nEOF\n)\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target: inside `$(...)`, a `#` right
+    // after a process substitution was read as a comment, though the word
+    // goes on there as it does outside.
+    #[test]
+    fn hash_after_process_substitution_in_substitution() {
+        assert_eq!(
+            round_trip("`>()#`").as_deref(),
+            Some("f () \n{ \n    $(>()#)\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target: inside `$(...)`, the here-document
+    // in a process substitution was read along with the one before it.
+    #[test]
+    fn heredoc_in_process_substitution_in_substitution() {
+        assert_eq!(
+            round_trip("$(<<n|<(n<<m))").as_deref(),
+            Some("f () \n{ \n    $( <<EOF | <(n <<EOF\nEOF\n)\nEOF\n)\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target: `{` is quoted and `}` was not, so
+    // the parser no longer found the subscript's end.
+    #[test]
+    fn braces_in_subscript() {
+        assert_eq!(
+            round_trip("t[[{}]]=").as_deref(),
+            Some("f () \n{ \n    t['[{}]']=''\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target: the parser took a marker byte
+    // inside `$(...)` in a subscript for a quote, so the word was no
+    // assignment.
+    #[test]
+    fn marker_byte_in_subscript_substitution() {
+        assert_eq!(
+            round_trip("t[$(echo \x01)]=1").as_deref(),
+            Some("f () \n{ \n    t[$(echo '\x01')]=1\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target: inside `$(...)`, the `case` of
+    // the word `case'{'in` was taken for the reserved word.
+    #[test]
+    fn quoted_keyword_in_substitution() {
+        assert_eq!(
+            round_trip("`case{in`").as_deref(),
+            Some("f () \n{ \n    $(case'{'in)\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target: in `"$$(...)"` the lexer started
+    // a command substitution at the second `$`, where the parser read `$$`.
+    #[test]
+    fn pid_before_paren_in_double_quotes() {
+        assert_eq!(
+            round_trip("echo \"$$(x)\"").as_deref(),
+            Some("f () \n{ \n    echo \"${$}(x)\"\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target: the parser reads the item `[{]=`
+    // as a plain value, but printed with its `{` quoted it had an index.
+    #[test]
+    fn index_shaped_array_item() {
+        assert_eq!(
+            round_trip("B=([{]=)").as_deref(),
+            Some("f () \n{ \n    B=('[{]'=)\n}")
+        );
+        assert_eq!(
+            round_trip("B=([[{}]=)").as_deref(),
+            Some("f () \n{ \n    B=('[[{}]'=)\n}")
+        );
+        assert_eq!(
+            round_trip("B=([k]=v x)").as_deref(),
+            Some("f () \n{ \n    B=([k]=v x)\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target: the parser ends the subscript
+    // `[[}]` at its `]`, but the lexer looked on past the word for another.
+    #[test]
+    fn subscript_the_lexer_reads_on_past() {
+        assert_eq!(
+            round_trip("t[[}]=<]=<]=").as_deref(),
+            Some("f () \n{ \n    t['[}']='<]=' <]=\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target: the parser counted the `(` inside
+    // double quotes in a subscript, so it found no end to it.
+    #[test]
+    fn paren_in_double_quoted_subscript() {
+        assert_eq!(
+            round_trip("d[\"($i\"]=1").as_deref(),
+            Some("f () \n{ \n    d[\"(${i}\"]=1\n}")
+        );
+    }
+
+    // Found by the `unparse` fuzz target: `{,$}` joined a `$` before
+    // `${...}`, which left its text plain, and a marker byte in it then read
+    // as a process substitution.
+    #[test]
+    fn marker_byte_in_expansion_left_plain_by_braces() {
+        assert_eq!(
+            round_trip("{,$}${\x03A()}").as_deref(),
+            Some("f () \n{ \n    ${\x03A()} ${$}'{\x03A()}'\n}")
         );
     }
 

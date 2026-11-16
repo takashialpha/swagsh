@@ -14,6 +14,13 @@ fuzz_target!(|data: &[u8]| {
     let Some(first) = unparse(&format!("f() {{\n{body}\n}}\n")) else {
         return;
     };
+    // Brace expansion can make a short input print as megabytes (the shell
+    // caps it at 64 MiB), and parsing that again under the sanitizer would
+    // pass libFuzzer's memory limit while testing nothing new. Text this
+    // long is no different in kind from shorter text, so it is skipped.
+    if first.len() > 1 << 20 {
+        return;
+    }
     let second = unparse(&first);
     assert_eq!(second.as_deref(), Some(first.as_str()), "printed as:\n{first}");
 });

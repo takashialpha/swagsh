@@ -85,8 +85,11 @@ fuzz target seconds="60":
     # cargo-fuzz defaults `--target` to the triple it was itself built for,
     # and prebuilt binaries (e.g. CI's install-action) are musl builds, which
     # ASan rejects. Pin the real host triple instead.
+    # libFuzzer's default memory limit is 2 GiB. Brace expansion lets a short
+    # input make a program near the shell's cap (64 MiB of words), which
+    # takes close to that under ASan, so the limit is raised to 4 GiB.
     host=$(rustc +nightly -vV | sed -n 's/^host: //p')
-    cargo +nightly fuzz run --target "$host" {{ target }} -- -max_total_time={{ seconds }}
+    cargo +nightly fuzz run --target "$host" {{ target }} -- -max_total_time={{ seconds }} -rss_limit_mb=4096
 
 # fuzz every target for SECONDS each
 fuzz-all seconds="60":
@@ -94,11 +97,12 @@ fuzz-all seconds="60":
     set -eu
     # Read from cargo-fuzz rather than a list here, so a new target is picked
     # up without editing this file.
-    # Pin the host triple for the same reason as the `fuzz` recipe.
+    # Pin the host triple and raise the memory limit for the same reasons as
+    # the `fuzz` recipe.
     host=$(rustc +nightly -vV | sed -n 's/^host: //p')
     for t in $(cargo fuzz list --fuzz-dir fuzz); do
         echo "== $t =="
-        cargo +nightly fuzz run --target "$host" "$t" -- -max_total_time={{ seconds }}
+        cargo +nightly fuzz run --target "$host" "$t" -- -max_total_time={{ seconds }} -rss_limit_mb=4096
     done
 
 # throw away everything built, including what cargo does not own

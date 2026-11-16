@@ -232,16 +232,10 @@ pub fn clap_page<T: Parser>(
                 .get_short()
                 .map(|c| format!("-{c}"))
                 .or_else(|| arg.get_long().map(|l| format!("--{l}")))?;
-            Some((
-                flag,
-                arg.get_help().map(ToString::to_string).unwrap_or_default(),
-            ))
+            Some((flag, arg.get_help().map_or_default(ToString::to_string)))
         })
         .collect();
-    let summary = command
-        .get_about()
-        .map(ToString::to_string)
-        .unwrap_or_default();
+    let summary = command.get_about().map_or_default(ToString::to_string);
     let usage = command.render_usage().to_string();
     let usage = usage.strip_prefix("Usage: ").unwrap_or(&usage).to_owned();
     let body = command.help_template("{all-args}").render_help();

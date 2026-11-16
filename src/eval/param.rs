@@ -307,9 +307,7 @@ impl Shell {
             let mut all = Vec::with_capacity(self.env.positional_args().len() + 1);
             all.push(self.arg0.clone());
             all.extend(self.env.positional_args().iter().cloned());
-            let items = slice_range(all.len(), offset, length)
-                .map(|r| all[r].to_vec())
-                .unwrap_or_default();
+            let items = slice_range(all.len(), offset, length).map_or_default(|r| all[r].to_vec());
             return Ok(Expansion::List { items, star });
         }
         if var.is_list()
@@ -338,8 +336,7 @@ impl Shell {
             Expansion::One(s) => Expansion::One(substring(&s, offset, length)),
             Expansion::List { items, star } => Expansion::List {
                 items: slice_range(items.len(), offset, length)
-                    .map(|r| items[r].to_vec())
-                    .unwrap_or_default(),
+                    .map_or_default(|r| items[r].to_vec()),
                 star,
             },
         })
@@ -538,8 +535,7 @@ impl Shell {
             "?" => self.last_status.0.to_string(),
             "!" => self
                 .last_bg_pid
-                .map(|p| p.as_raw_nonzero().to_string())
-                .unwrap_or_default(),
+                .map_or_default(|p| p.as_raw_nonzero().to_string()),
             "$" => self.shell_pid.to_string(),
             "-" => self.option_flags(),
             "0" => self.arg0.clone(),

@@ -668,12 +668,7 @@ pub(super) fn has_param_op(name: &str) -> bool {
 /// character of `$IFS`, as `"$*"` does.
 fn push_list(items: &[String], star: bool, in_quotes: bool, fields: &mut Fields<'_>) {
     if in_quotes && star {
-        let sep = fields
-            .ifs
-            .chars()
-            .next()
-            .map(String::from)
-            .unwrap_or_default();
+        let sep = fields.ifs.chars().next().map_or_default(String::from);
         fields.push_quoted(&items.join(&sep));
         return;
     }

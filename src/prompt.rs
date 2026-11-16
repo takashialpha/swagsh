@@ -209,10 +209,7 @@ fn prompt_escapes(text: &str, shell: &Shell, quote: bool, extras: &Extras) -> St
                         None => break,
                     }
                 }
-                char::from_u32(value)
-                    .map(String::from)
-                    .unwrap_or_default()
-                    .into()
+                char::from_u32(value).map_or_default(String::from).into()
             }
             Some('\\') | None => "\\".into(),
             Some(other) => format!("\\{other}").into(),

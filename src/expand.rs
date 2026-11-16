@@ -773,7 +773,7 @@ pub fn is_name(s: &str) -> bool {
 #[must_use]
 pub fn find_unnested(s: &str, stop: impl Fn(char) -> bool) -> Option<usize> {
     let mut depth = 0usize;
-    let mut chars = s.char_indices();
+    let mut chars = s.char_indices().peekable();
     let mut dquote = false;
     while let Some((i, c)) = chars.next() {
         match c {
@@ -788,7 +788,16 @@ pub fn find_unnested(s: &str, stop: impl Fn(char) -> bool) -> Option<usize> {
                 }
             }
             '"' => dquote = !dquote,
-            _ if depth == 0 && !dquote && stop(c) => return Some(i),
+            // An expansion is kept as its source text, which may hold
+            // bytes that would read as quote markers here, so it is skipped
+            // whole, as the lexer reads it.
+            '$' if s[i + 1..].starts_with(['(', '{']) => {
+                let end = crate::lexer::quoted_end(s.as_bytes(), i)?;
+                while chars.next_if(|&(j, _)| j < end).is_some() {}
+            }
+            // Quoted text neither stops the search nor nests.
+            _ if dquote => {}
+            _ if depth == 0 && stop(c) => return Some(i),
             '{' | '(' | '[' => depth += 1,
             '}' | ')' | ']' => depth = depth.saturating_sub(1),
             _ => {}
@@ -958,9 +967,7 @@ fn param_operator<'a>(var: Param<'a>, rest: &'a str) -> Option<ParamOp<'a>> {
 #[must_use]
 pub fn substring(val: &str, offset: i64, length: Option<i64>) -> String {
     let chars: Vec<char> = val.chars().collect();
-    slice_range(chars.len(), offset, length)
-        .map(|r| chars[r].iter().collect())
-        .unwrap_or_default()
+    slice_range(chars.len(), offset, length).map_or_default(|r| chars[r].iter().collect())
 }
 
 /// The index range `offset`/`length` select from `len` items, as for

@@ -19,7 +19,7 @@ pub const QUOTE_END_BYTE: u8 = QUOTE_END as u8;
 
 /// Whether source byte `b` is one of the characters a lexed word uses as a
 /// marker, and so has to be escaped to stand for itself.
-const fn is_marker(b: u8) -> bool {
+pub const fn is_marker(b: u8) -> bool {
     matches!(b, 0x01..=0x03)
 }
 
@@ -445,11 +445,17 @@ impl<'src> Lexer<'src> {
                 Some(b'$') => match self.peek() {
                     Some(b'(') => {
                         self.advance();
-                        self.lex_cmd_sub(buf)?;
+                        self.lex_cmd_sub(buf, marked)?;
                     }
                     Some(b'{') => {
                         self.advance();
-                        self.lex_param_expand(buf, true)?;
+                        self.lex_param_expand(buf, true, marked)?;
+                    }
+                    // `$$` is a parameter: the `$` after it starts nothing,
+                    // so `"$$(x)"` is the PID and then `(x)`, as in bash.
+                    Some(b'$') => {
+                        self.advance();
+                        buf.push_str("$$");
                     }
                     _ => buf.push('$'),
                 },
@@ -464,8 +470,9 @@ impl<'src> Lexer<'src> {
         Ok(())
     }
 
-    /// The rest of a `$(...)`, after its `(`.
-    fn lex_cmd_sub(&mut self, buf: &mut String) -> Result<(), LexError> {
+    /// The rest of a `$(...)`, after its `(`. In a word (`marked`), marker
+    /// bytes in it are escaped (see [`push_source`]).
+    fn lex_cmd_sub(&mut self, buf: &mut String, marked: bool) -> Result<(), LexError> {
         let Some(len) = cmd_sub_len(&self.src[self.pos..]) else {
             while self.advance().is_some() {}
             return Err(self.err_incomplete("unterminated command substitution"));
@@ -478,12 +485,19 @@ impl<'src> Lexer<'src> {
         // SAFETY: `self.src` is from a valid `&str`, and the slice starts
         // just past an ASCII `(` and ends just past an ASCII `)`, so on
         // character boundaries.
-        buf.push_str(unsafe { std::str::from_utf8_unchecked(&self.src[start..self.pos]) });
+        let text = unsafe { std::str::from_utf8_unchecked(&self.src[start..self.pos]) };
+        push_source(buf, text, marked);
         Ok(())
     }
 
-    /// The rest of a `${...}`, after its `{`, `in_dquotes` or not.
-    fn lex_param_expand(&mut self, buf: &mut String, in_dquotes: bool) -> Result<(), LexError> {
+    /// The rest of a `${...}`, after its `{`, `in_dquotes` or not. In a word
+    /// (`marked`), marker bytes in it are escaped (see [`push_source`]).
+    fn lex_param_expand(
+        &mut self,
+        buf: &mut String,
+        in_dquotes: bool,
+        marked: bool,
+    ) -> Result<(), LexError> {
         let Some(len) = param_len(&self.src[self.pos..], in_dquotes) else {
             while self.advance().is_some() {}
             return Err(self.err_incomplete("unterminated parameter expansion"));
@@ -495,7 +509,8 @@ impl<'src> Lexer<'src> {
         buf.push_str("${");
         // SAFETY: as in `lex_cmd_sub`, the slice runs from just past an
         // ASCII `{` to just past an ASCII `}`.
-        buf.push_str(unsafe { std::str::from_utf8_unchecked(&self.src[start..self.pos]) });
+        let text = unsafe { std::str::from_utf8_unchecked(&self.src[start..self.pos]) };
+        push_source(buf, text, marked);
         Ok(())
     }
 
@@ -769,7 +784,7 @@ impl<'src> Lexer<'src> {
                     buf.push(b as char);
                     self.advance();
                     self.advance();
-                    self.lex_cmd_sub(buf)?;
+                    self.lex_cmd_sub(buf, true)?;
                 }
                 None
                 | Some(
@@ -1056,11 +1071,11 @@ impl<'src> Lexer<'src> {
             }
             Some(b'(') => {
                 self.advance();
-                self.lex_cmd_sub(buf)?;
+                self.lex_cmd_sub(buf, true)?;
             }
             Some(b'{') => {
                 self.advance();
-                self.lex_param_expand(buf, false)?;
+                self.lex_param_expand(buf, false, true)?;
             }
             _ => {
                 buf.push('$');
@@ -1204,37 +1219,10 @@ impl<'src> Lexer<'src> {
     /// `+=` comes before the end of the line, making the word an
     /// assignment to an array element.
     fn subscript_assignment_ahead(&self) -> bool {
-        let mut depth = 0usize;
-        let mut i = self.pos;
-        while let Some(&b) = self.src.get(i) {
-            match b {
-                b'\n' => return false,
-                b'\\' => i += 1,
-                b'\'' | b'"' => {
-                    i += 1;
-                    while let Some(&c) = self.src.get(i) {
-                        if c == b {
-                            break;
-                        }
-                        if c == b'\\' && b == b'"' {
-                            i += 1;
-                        }
-                        i += 1;
-                    }
-                }
-                b'[' => depth += 1,
-                b']' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        let rest = &self.src[i + 1..];
-                        return rest.starts_with(b"=") || rest.starts_with(b"+=");
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        false
+        subscript_close(self.src, self.pos + 1).is_some_and(|close| {
+            let rest = &self.src[close + 1..];
+            rest.starts_with(b"=") || rest.starts_with(b"+=")
+        })
     }
 
     /// The items of an array assignment, from its `(` to its `)`. They may
@@ -1584,6 +1572,24 @@ impl CaseTracker {
     }
 }
 
+/// The length of the unquoted text at `s[i]`, told to `cases`; `word_start`
+/// says whether it starts a word.
+fn plain_text(s: &[u8], i: usize, word_start: bool, cases: &mut CaseTracker) -> usize {
+    let len = s[i..]
+        .iter()
+        .position(|c| b" \t\n;&|()<>'\"`\\$".contains(c))
+        .unwrap_or(s.len() - i);
+    // Only a whole word can be a reserved one: not `case` in `case'{'in`,
+    // which goes on past the quote.
+    let goes_on = s.get(i + len).is_some_and(|c| b"'\"`\\$".contains(c));
+    if word_start && !goes_on {
+        cases.word(&s[i..i + len]);
+    } else {
+        cases.other();
+    }
+    len
+}
+
 /// The length of the inside of a `$(...)` whose text after the `$(` is
 /// `s`: the offset of the `)` that closes it, or `None` if none does.
 ///
@@ -1643,6 +1649,14 @@ pub fn cmd_sub_len(s: &[u8]) -> Option<usize> {
                 cases.open_paren();
                 depth += 1;
             }
+            // A process substitution is read whole, here-documents and all,
+            // as the lexer reads it, and the word goes on after its `)`.
+            b'(' if i > 0 && matches!(s[i - 1], b'<' | b'>') => {
+                cases.other();
+                i += 1 + cmd_sub_len(&s[i + 1..])? + 1;
+                word_start = false;
+                continue;
+            }
             b'(' => {
                 if cases.open_paren() {
                     depth += 1;
@@ -1669,12 +1683,7 @@ pub fn cmd_sub_len(s: &[u8]) -> Option<usize> {
                 continue;
             }
             _ => {
-                let len = s[i..]
-                    .iter()
-                    .position(|c| b" \t\n;&|()<>'\"`\\$".contains(c))
-                    .unwrap_or(s.len() - i);
-                cases.word(&s[i..i + len]);
-                i += len;
+                i += plain_text(s, i, word_start, &mut cases);
                 word_start = false;
                 continue;
             }
@@ -1719,6 +1728,46 @@ fn skip_quoted(s: &[u8], i: usize, in_dquotes: bool) -> Option<usize> {
         }
         b'$' if s.get(i + 1) == Some(&b'{') => skip_braces(s, i + 2, in_dquotes),
         _ => Some(i + 1),
+    }
+}
+
+/// Pushes `text`, the source text of a `$(...)` or `${...}`, onto `buf`.
+/// In a word (`marked`), each marker byte in it is backslash-escaped, as
+/// everywhere else in a word: brace expansion can join a `$` before the
+/// expansion's `$` (`{,$}${x}` makes `$${x}`), which leaves the text plain
+/// word text, where a bare marker would read as one. The parser takes the
+/// backslashes out again when it takes the expansion's text.
+fn push_source(buf: &mut String, text: &str, marked: bool) {
+    if !marked || !text.bytes().any(is_marker) {
+        return buf.push_str(text);
+    }
+    for c in text.chars() {
+        if u8::try_from(c).is_ok_and(is_marker) {
+            buf.push('\\');
+        }
+        buf.push(c);
+    }
+}
+
+/// The offset of the `]` closing a subscript whose inside starts at
+/// `s[i]`, read as [`Lexer::lex_subscript`] reads it: quotes, escapes and
+/// `$` expansions are skipped whole, and a newline outside them ends it.
+#[must_use]
+pub fn subscript_close(s: &[u8], mut i: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    loop {
+        match *s.get(i)? {
+            b'\n' => return None,
+            b'\\' | b'\'' | b'"' | b'$' => {
+                i = skip_quoted(s, i, false)?;
+                continue;
+            }
+            b'[' => depth += 1,
+            b']' if depth == 0 => return Some(i),
+            b']' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
     }
 }
 
